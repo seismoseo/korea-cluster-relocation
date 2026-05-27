@@ -1,0 +1,3 @@
+# Strip Jupyter notebook outputs on commit (clean filter = tools/nbstrip.py).
+# Run `bash tools/setup-git-filters.sh` once per clone to enable it.
+*.ipynb filter=nbstripout

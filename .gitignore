@@ -1,0 +1,31 @@
+# =====================================================================
+# korea-cluster-relocation — tracks the reusable FRAMEWORK + docs only.
+# Per-cluster data (waveforms ~18 GB, frozen baselines, exploratory
+# notebooks) and all regenerable run outputs stay LOCAL. Point the
+# pipeline at your own cluster directories (see README "Directory
+# convention"); nothing under them is committed.
+# =====================================================================
+
+# ---- per-cluster data directories (inputs + local baselines, not tracked) ----
+/Gwangyang_sequence/
+/Kimcheon_cluster/
+/Jangsung_cluster/
+/201704_Gyeongju_swarm/
+# any future cluster dir: keep data out of git by default
+/*_cluster/
+/*_sequence/
+/*_swarm/
+
+# ---- framework run outputs (regenerable; ~1.5 GB) ----
+pipeline/runs/
+
+# ---- Python / Jupyter noise ----
+__pycache__/
+*.py[cod]
+**/.ipynb_checkpoints/
+.DS_Store
+.virtual_documents/
+*.egg-info/
+
+# ---- scratch / smoke artifacts ----
+pipeline/notebooks/_smoke_*.ipynb
