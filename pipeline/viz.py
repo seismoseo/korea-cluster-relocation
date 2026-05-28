@@ -4,6 +4,8 @@ Lightweight matplotlib plots for monitoring the pipeline from JupyterLab.
 Every function takes a ClusterConfig and returns a matplotlib Figure, so the same
 calls work in a notebook (inline) and in scripts. Kept dependency-light (matplotlib
 + obspy only; no PyGMT) so the monitoring notebooks run anywhere the pipeline does.
+`plot_3d_plane` is the one exception: it returns an interactive plotly Figure and
+imports plotly lazily, so plotly stays an optional dependency.
 """
 from __future__ import annotations
 
@@ -23,7 +25,12 @@ from pipeline.core import sumio, waveforms
 def _use_helvetica():
     """Use Helvetica for every plot's text if the fonts are available (`config.HELVETICA_DIR`,
     env-overridable via $HELVETICA_DIR); otherwise leave the matplotlib default in place so a
-    public clone without the fonts still renders. Runs once at import."""
+    public clone without the fonts still renders. Runs once at import.
+
+    Helvetica lacks some glyphs we annotate with (the up/down arrows ↑/↓, etc.), so we set a font
+    *fallback chain* `["Helvetica", "DejaVu Sans"]`: text renders in Helvetica, and any glyph it is
+    missing falls back to DejaVu Sans (matplotlib does per-glyph fallback across the family list).
+    This fixes the 'Glyph missing from font' warnings at the source — no glyph is left unrenderable."""
     import matplotlib.font_manager as fm
     font_dir = getattr(config, "HELVETICA_DIR", None)
     try:
@@ -32,7 +39,7 @@ def _use_helvetica():
                 fm.fontManager.addfont(fpath)
         names = {f.name for f in fm.fontManager.ttflist}
         if "Helvetica" in names:
-            mpl.rcParams["font.family"] = "Helvetica"
+            mpl.rcParams["font.family"] = ["Helvetica", "DejaVu Sans"]   # primary + glyph fallback
     except Exception:
         pass                                   # never let font setup break plotting
     mpl.rcParams["axes.unicode_minus"] = False
@@ -48,6 +55,19 @@ def _reloc_path(cfg):
     if os.path.exists(cc):
         return cc, "dt.cc"
     return os.path.join(config.dtct_dir(cfg), "hypoDD.reloc"), "dt.ct"
+
+
+def _format_lonlat(ax):
+    """Plain decimal-degree tick labels on a lon/lat axis — no offset / exponential notation
+    (matplotlib's default for tight ~0.05° ranges shows an ugly '+1.28e2' offset)."""
+    from matplotlib.ticker import ScalarFormatter
+    for axis in (ax.xaxis, ax.yaxis):
+        fmt = ScalarFormatter(useOffset=False)
+        fmt.set_scientific(False)
+        axis.set_major_formatter(fmt)
+    ax.ticklabel_format(useOffset=False, style="plain", axis="both")
+    for lab in ax.get_xticklabels():
+        lab.set_rotation(30); lab.set_ha("right")
 
 
 def map_catalog(cfg, velmodel="kim1983", source="sum", ax=None):
@@ -72,6 +92,7 @@ def map_catalog(cfg, velmodel="kim1983", source="sum", ax=None):
     ax.set(xlabel="Longitude", ylabel="Latitude",
            title=f"{cfg.region} — {len(df)} events ({source}:{branch})")
     ax.legend(loc="best", fontsize=8); ax.set_aspect("equal", "datalim")
+    _format_lonlat(ax)
     return ax.figure
 
 
@@ -348,6 +369,7 @@ def map_mechanisms(cfg, velmodel=None, quality_keep=("A", "B"), ax=None):
            title=f"{cfg.region} — locations + focal mechanisms "
                  f"({len(keep)} high-confidence [{'/'.join(quality_keep)}] / {len(m)} events, {velmodel})")
     ax.legend(loc="best", fontsize=8)
+    _format_lonlat(ax)
     return ax.figure
 
 
@@ -544,6 +566,7 @@ def compare_epicenters(cfg, velmodel="kim1983", variant="default"):
             plt.colorbar(sc, ax=ax, label="Depth (km)", shrink=0.8)
         ax.set(xlabel="Longitude", ylabel="Latitude", title=f"{cfg.region} — {lab} ({len(df)} ev)")
         ax.set_aspect("equal", "datalim")
+        _format_lonlat(ax)
     fig.tight_layout()
     return fig
 
@@ -568,3 +591,192 @@ def relocation_counts(cfg, velmodel="kim1983"):
         ("dt.cc (cross-corr, high-end)", _n(os.path.join(config.dtcc_dir(cfg), "hypoDD.reloc"), "reloc")),
     ]
     return pd.DataFrame([{"stage": s, "events": n} for s, n in rows])
+
+
+def plot_3d_plane(cfg, velmodel=None, color_by="time"):
+    """Interactive 3-D view (**plotly**) of the dt.cc-relocated hypocentres with the SVD best-fit fault
+    plane overlaid as a translucent patch — rotate/zoom in a notebook. Returns a plotly Figure.
+
+    Hypocentres: relative E–N–depth (km) about the cloud centroid, coloured by origin time (default;
+    `color_by="depth"`), sized by magnitude. Plane: the relocation cloud's best-fit plane
+    (`_best_fit_plane`) through the centroid, drawn over the cloud extent. Depth axis points down.
+    Reads the headline dt.cc reloc (dt.ct fallback). plotly is imported lazily (optional dependency)."""
+    import plotly.graph_objects as go
+    import matplotlib.dates as mdates
+    velmodel = velmodel or cfg.fm_velmodel
+    reloc, branch = _reloc_path(cfg)
+    d = sumio.read_reloc(reloc) if os.path.exists(reloc) else pd.DataFrame()
+    if not len(d):
+        return go.Figure().update_layout(
+            title=f"{cfg.region}: no HypoDD reloc (run ph2dt→dtcc first)")
+
+    x0, y0, z0 = float(d.x.mean()), float(d.y.mean()), float(d.z.mean())
+    E = (d.x - x0).to_numpy() / 1000.0
+    N = (d.y - y0).to_numpy() / 1000.0
+    dep = -(d.z - z0).to_numpy() / 1000.0                       # km, +down
+    mag = np.nan_to_num(d.mag.to_numpy(), nan=0.0)
+    size = np.clip(4 + 3 * mag, 3, 18)
+
+    if color_by == "time" and "time" in d and d.time.notna().any():
+        cvals = np.array(mdates.date2num([t.datetime for t in d.time]))
+        tv = np.linspace(cvals.min(), cvals.max(), 5)
+        cbar = dict(title="Origin time", tickvals=list(tv),
+                    ticktext=[mdates.num2date(v).strftime("%Y-%m-%d") for v in tv])
+        cscale = "RdBu_r"
+    else:
+        cvals, cbar, cscale = d.depth.to_numpy(), dict(title="Depth (km)"), "Viridis_r"
+
+    data = [go.Scatter3d(x=E, y=N, z=dep, mode="markers", name="Hypocentres",
+                         marker=dict(size=size, color=cvals, colorscale=cscale, colorbar=cbar,
+                                     line=dict(width=0.5, color="black"), opacity=0.95),
+                         text=[f"{int(i)}  M{m:.1f}" for i, m in zip(d.id, mag)])]
+    title = f"{cfg.region} — 3-D relocated seismicity ({branch})"
+    if len(d) >= 3:
+        strike, dip = _best_fit_plane(d.x, d.y, d.z)
+        phi, delta = np.deg2rad(strike), np.deg2rad(dip)
+        s_hat = np.array([np.sin(phi), np.cos(phi), 0.0])                          # along-strike (E,N,up)
+        d_hat = np.array([np.cos(delta) * np.sin(phi + np.pi / 2),
+                          np.cos(delta) * np.cos(phi + np.pi / 2), -np.sin(delta)])  # down-dip (E,N,up)
+        L = (max(np.ptp(E), np.ptp(N), np.ptp(dep)) / 2.0) or 0.2
+        corners = [a * s_hat + b * d_hat for a in (-L, L) for b in (-L, L)]   # idx 0,1,2,3
+        cx = [c[0] for c in corners]; cy = [c[1] for c in corners]; cz = [-c[2] for c in corners]
+        data.append(go.Mesh3d(x=cx, y=cy, z=cz, i=[0, 0], j=[1, 3], k=[3, 2],
+                              opacity=0.3, color="gray", hoverinfo="name",
+                              name=f"Best-fit plane {strike:.0f}/{dip:.0f}", showscale=False))
+        title += f"  +  best-fit plane (strike {strike:.0f}°, dip {dip:.0f}°)"
+    fig = go.Figure(data=data)
+    fig.update_layout(title=title, height=700, margin=dict(l=0, r=0, t=40, b=0),
+                      scene=dict(xaxis_title="E (km)", yaxis_title="N (km)",
+                                 zaxis=dict(title="Depth (km)", autorange="reversed"),
+                                 aspectmode="data"))
+    return fig
+
+
+def _first_motion_sign(tr, ptime, noise=(0.5, 0.05), win=0.3, k=3.0):
+    """Analyst-style first-motion sign at a P pick: sign of the first post-P sample whose |amplitude|
+    exceeds `k` × the pre-P noise std (fallback: the first sample after P). +1 up / −1 down / 0 unread."""
+    s = tr.copy().detrend("demean")
+    n0 = s.slice(ptime - noise[0], ptime - noise[1])
+    nstd = float(np.std(n0.data)) if len(n0.data) > 3 else 0.0
+    w = s.slice(ptime, ptime + win)
+    if len(w.data) < 2:
+        return 0
+    dd = w.data.astype(float)
+    if nstd > 0 and np.any(np.abs(dd) > k * nstd):
+        idx = int(np.argmax(np.abs(dd) > k * nstd))
+    else:
+        idx = 1
+    return int(np.sign(dd[min(idx, len(dd) - 1)]))
+
+
+def polarity_quality(cfg, velmodel=None):
+    """PhaseNet+ P first-motion polarity quality: (1) confidence |polarity| distribution, (2) pick
+    probability distribution, (3) SKHASH `polarity_misfit` per event vs # P polarities, coloured by
+    mechanism quality (lower misfit = polarities more self-consistent with a double-couple). Reads the
+    run's `picks/*_picks.csv` + `mechanisms.csv`. A first-order, ground-truth-free quality check."""
+    import glob as _glob
+    velmodel = velmodel or cfg.fm_velmodel
+    pol, prob = [], []
+    for pf in sorted(_glob.glob(os.path.join(config.picks_dir(cfg), "*_picks.csv"))):
+        df = pd.read_csv(pf)
+        if "Polarity" not in df.columns:
+            continue
+        P = df[(df.Phase == "P") & df.Polarity.notna()]
+        pol += list(P.Polarity.astype(float))
+        if "Probability" in P.columns:
+            prob += list(pd.to_numeric(P.Probability, errors="coerce").dropna())
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.3), dpi=120)
+    if pol:
+        ap = np.abs(np.array(pol, float))
+        axes[0].hist(ap, bins=20, range=(0, 1), color="steelblue", edgecolor="k")
+        frac_lo = float((ap < 0.5).mean())
+        axes[0].axvline(0.5, color="r", ls="--")
+        axes[0].text(0.5, axes[0].get_ylim()[1] * 0.92, f"  {frac_lo * 100:.0f}% < 0.5", color="r")
+        axes[0].set(xlabel="PhaseNet+ confidence |polarity|", ylabel="P picks",
+                    title=f"Polarity confidence (n={len(ap)})")
+    if prob:
+        axes[1].hist(np.array(prob, float), bins=20, range=(0, 1), color="seagreen", edgecolor="k")
+    axes[1].set(xlabel="Pick probability", ylabel="P picks", title="Pick probability")
+
+    mp = config.fm_mech_csv(cfg, velmodel)
+    if os.path.exists(mp):
+        m = _load_mechanisms(mp)
+        colq = {"A": "tab:green", "B": "tab:olive", "C": "tab:orange", "D": "tab:red"}
+        for q, g in m.groupby("quality"):
+            axes[2].scatter(g.num_p_pol, g.polarity_misfit, c=colq.get(q, "gray"),
+                            label=q, s=55, edgecolor="k")
+        axes[2].axhline(20, color="0.5", ls=":")
+        axes[2].legend(title="Quality", fontsize=8)
+    axes[2].set(xlabel="P polarities used", ylabel="SKHASH polarity misfit (%)",
+                title="Mechanism polarity misfit")
+    fig.suptitle(f"{cfg.region} — PhaseNet+ polarity quality", fontsize=13)
+    fig.tight_layout()
+    return fig
+
+
+def polarity_vs_manual(cfg, win=0.3, k=3.0, conf_bins=(0.0, 0.3, 0.6, 1.01)):
+    """Quasi-ground-truth check where manual picks exist (e.g. Gwangyang `manual_picks/`): compare the
+    PhaseNet+ polarity SIGN to the first-motion sign read at the **manual** P pick (SAC header `a`) on
+    the vertical. Plots overall agreement + agreement vs PhaseNet+ confidence. The manual first motion
+    is a proxy (an analyst reads the raw first swing). Returns a Figure (graceful note if unavailable)."""
+    import glob as _glob
+    mroot = os.path.join(getattr(cfg, "src_root", "") or "", "manual_picks")
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.3), dpi=120)
+    if not os.path.isdir(mroot):
+        for a in axes:
+            a.axis("off")
+        axes[0].set_title(f"{cfg.region}: no manual_picks/ — manual proxy not available")
+        return fig
+    recs = []                                                # (|polarity|, agree 0/1)
+    for evdir in sorted(_glob.glob(os.path.join(mroot, "20*"))):
+        eid = os.path.basename(evdir)
+        pc = config.picks_csv(cfg, eid)
+        if not os.path.exists(pc):
+            continue
+        pk = pd.read_csv(pc)
+        if "Polarity" not in pk.columns:
+            continue
+        pk = pk[(pk.Phase == "P") & pk.Polarity.notna()]
+        pmap = {str(r.Station): float(r.Polarity) for r in pk.itertuples()}
+        for z in _glob.glob(os.path.join(evdir, "*Z.sac")):
+            sta = os.path.basename(z).split(".")[2]
+            if sta not in pmap:
+                continue
+            try:
+                tr = read(z)[0]
+                a = tr.stats.sac.get("a", -12345.0)
+                if a == -12345.0:
+                    continue
+                ptime = tr.stats.starttime - tr.stats.sac.b + a
+                ms = _first_motion_sign(tr, ptime, win=win, k=k)
+            except Exception:                                # noqa: BLE001
+                continue
+            if ms == 0:
+                continue
+            ppol = pmap[sta]
+            recs.append((abs(ppol), int(np.sign(ppol) == ms)))
+    if not recs:
+        for a in axes:
+            a.axis("off")
+        axes[0].set_title(f"{cfg.region}: no matched manual/PhaseNet+ first motions")
+        return fig
+    conf = np.array([r[0] for r in recs]); agree = np.array([r[1] for r in recs])
+    axes[0].bar([0, 1], [int((agree == 1).sum()), int((agree == 0).sum())],
+                color=["tab:green", "tab:red"], edgecolor="k")
+    axes[0].set_xticks([0, 1]); axes[0].set_xticklabels(["Agree", "Disagree"])
+    axes[0].set(ylabel="P picks",
+                title=f"{cfg.region} — PhaseNet+ vs manual first motion\n"
+                      f"overall agreement {agree.mean() * 100:.0f}% (n={len(recs)})")
+    centers, rates, ns = [], [], []
+    for lo, hi in zip(conf_bins[:-1], conf_bins[1:]):
+        sel = (conf >= lo) & (conf < hi)
+        if sel.sum():
+            centers.append((lo + hi) / 2); rates.append(float(agree[sel].mean())); ns.append(int(sel.sum()))
+    axes[1].bar(centers, rates, width=0.22, color="steelblue", edgecolor="k")
+    for c, rt, n in zip(centers, rates, ns):
+        axes[1].text(c, min(rt + 0.03, 1.02), f"n={n}", ha="center", fontsize=8)
+    axes[1].set(xlabel="PhaseNet+ confidence |polarity|", ylabel="Agreement with manual first motion",
+                ylim=(0, 1.08), title="Agreement vs confidence")
+    fig.tight_layout()
+    return fig

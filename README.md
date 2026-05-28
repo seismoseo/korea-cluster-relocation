@@ -27,7 +27,8 @@ cd korea-cluster-relocation
 bash tools/setup-git-filters.sh          # once: strips notebook outputs on commit
 export PYTHONPATH=$(pwd)                  # so `import pipeline` works
 ```
-- **Python** (miniforge): `obspy`, `seisbench` (+ `torch`), `pandas`, `numpy`, `matplotlib`.
+- **Python** (miniforge): `obspy`, `seisbench` (+ `torch`), `pandas`, `numpy`, `matplotlib`. *Optional:*
+  `plotly` for the interactive 3-D view (`viz.plot_3d_plane`), `kaleido` to export it to a static PNG.
 - **External binaries on `PATH`** (not pip-installable): `hyp1.40` (HYPOINVERSE), `ncsn2pha`,
   `ph2dt`, `hypoDD`.
 - `config.PROJECT_ROOT` auto-derives from the repo location (`pipeline/config.py`'s parent), so a
@@ -162,6 +163,25 @@ absolutely; **dt.ct** keeps only events with enough catalog differential-time li
 drop); **dt.cc** re-clusters on waveform cross-correlation and keeps only well-correlating events.
 **dt.cc is the high-end product** (location errors of metres vs tens of metres for dt.ct) — it is the
 headline relocation in the notebooks.
+
+**Adaptive LSQR dt.cc tuning (automatic & reproducible).** When a cluster's dt set is too large for
+HypoDD's compiled SVD array (`MAXDATA0`), the dt.cc run must use **LSQR** (`isolv=2`). LSQR then needs
+the damping and inter-event distance cutoffs chosen well, or poorly-linked events destabilise the
+solution. The `dtcc` stage does this automatically, with no manual tuning:
+
+1. **Distance cutoffs scaled to cluster size** — `WDCC`/`WDCT` are scaled by the dt.ct cluster diameter
+   (`core/hypodd._scale_distance_cutoffs`, ref 1.5 km), so a compact cluster cuts long-distance pairs and
+   spatially peripheral / zero-cross-correlation events drop out of the relocation.
+2. **Per-set DAMP auto-tuned to a well-conditioned solution** — `core/hypodd._exec_hypodd` reads the
+   per-iteration condition number from `hypoDD.log` and re-runs, nudging each weighting set's `DAMP` until
+   the condition number lands in HypoDD's recommended **~40–80** band (the search is logged to
+   `damping_calibration.txt`).
+
+This is *code*, run on every pipeline invocation, and **deterministic** — re-running from scratch yields a
+byte-identical `hypoDD.reloc` and the same chosen DAMP. (Example: Kimcheon's condition number dropped from
+~196 to ~60, three uncorrelated fliers — one at 8 km depth — were removed, and the best-fit fault plane
+went from a corrupted 322° to 40°, matching the focal mechanisms.) Only LSQR dt.cc runs are affected; SVD
+runs and the dt.ct baselines are untouched.
 
 **Other clusters.** All four clusters relocate (locations + dt.cc), but only **Gwangyang** has the
 focal-sphere coverage for *well-constrained* mechanisms. Jangsung/Kimcheon events are shallow (~0.3–6 km),

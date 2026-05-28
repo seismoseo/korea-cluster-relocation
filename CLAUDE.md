@@ -79,6 +79,11 @@ falling back to the matplotlib default otherwise.
   weighting set so the condition number lands in ~40–80** (`_exec_hypodd` parses per-iteration CND from
   `hypoDD.log`, re-runs until in band; writes `damping_calibration.txt`). E.g. Kimcheon: CND 196→~60, the
   3 zero-CC fliers (one at 8 km depth) removed, dt.cc SVD fault plane 322°→40° (matching its mechanisms).
+  **Reproducible & automatic:** the tuning is *code*, run by the `dtcc` stage every time — no manual
+  intervention. The search is deterministic (HypoDD + xcorr are deterministic), so a from-scratch re-run
+  yields byte-identical `hypoDD.reloc` and the same chosen DAMP. Reproduce end-to-end with
+  `run_pipeline --cluster kimcheon --picker phasenet_plus --through dtcc`; `damping_calibration.txt` is the
+  audit trail of the per-set DAMP / CND.
 - **Run things politely** on the shared box (taskset + bounded cores). Verify no baseline drift with
   `python -m pipeline.regression.freeze_baseline verify`.
 - Adding a cluster: see README "Adding a cluster" (`_base.kma_cluster` factory or a bespoke `stp_sac`
