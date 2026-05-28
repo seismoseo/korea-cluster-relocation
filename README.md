@@ -66,11 +66,22 @@ $PY -m pipeline.cli.run_pipeline --cluster kimcheon --stage-from picking --throu
 # dt.cc branch (rereference -> xcorr -> dtcc) is HEAVY — PIN CORES on a shared box:
 taskset -c 0-9 $PY -m pipeline.cli.run_pipeline --cluster gwangyang --through dtcc --cores 10
 
+# focal mechanisms: pick with PhaseNet+ (emits polarity + S/P amplitude), then SKHASH:
+$PY -m pipeline.cli.run_pipeline --cluster gwangyang --picker phasenet_plus --through hypoinverse
+$PY -m pipeline.cli.run_pipeline --cluster gwangyang --picker phasenet_plus \
+    --stage-from focal_mechanism --through focal_mechanism
+
 # regression vs your frozen baselines:
 $PY -m pipeline.cli.compare --cluster gwangyang
 ```
-Stages: `stations waveforms picking hypoinverse ph2dt dtct rereference xcorr dtcc`. The default
-`--through dtct` runs the catalog chain; the dt.cc branch is appended only when requested.
+Stages: `stations waveforms picking hypoinverse ph2dt dtct rereference xcorr dtcc` (+ opt-in
+`focal_mechanism`). The default `--through dtct` runs the catalog chain; the dt.cc branch is appended
+only when requested.
+
+**Picker / focal mechanisms.** `--picker` (or `cfg.picker_weights`) selects `stead` (default, SeisBench
+PhaseNet) or `phasenet_plus` (EQNet PhaseNet+), the latter additionally emitting first-motion polarity +
+amplitude. The opt-in `focal_mechanism` stage feeds those into **SKHASH** (double-couple inversion; keeps
+quality A/B). EQNet and SKHASH are external tools — set `$EQNET_DIR` / `$SKHASH_DIR` (see `pipeline/config.py`).
 
 ## Controlled, stage-by-stage workflow (recommended)
 
