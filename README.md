@@ -124,15 +124,15 @@ $PY -m pipeline.cli.run_pipeline --cluster gwangyang --picker phasenet_plus \
 ```
 
 The PhaseNet+ HypoDD relocation agrees with the trusted `stead` baseline to ≈100 m (depth within
-≈0.3 km). Of the 11 events, **4 are well constrained (quality A/B)** and agree closely — near-vertical,
-roughly N-striking strike-slip — consistent with a coherent fault source:
+≈0.3 km). Polarities are used only from P picks with probability ≥ `fm_min_pick_prob` (0.5), and S/P
+ratios only where the P and S SNR ≥ `fm_sp_min_snr` (3). Of the 11 events, **3 are well constrained
+(quality A/B)** and agree closely — near-vertical, roughly N-striking strike-slip — a coherent fault source:
 
 | Event | Quality | Strike | Dip | Rake | Fault-plane uncert. | P polarities | S/P ratios |
 |---|---|---|---|---|---|---|---|
-| 20210827220322 | A | 22 | 78 | −178 | 19° | 47 | 50 |
-| 20210827002315 | B | 30 | 76 | 170 | 17° | 33 | 50 |
-| 20210720161418 | B | 35 | 74 | 163 | 32° | 14 | 26 |
-| 20260202194119 | B | 33 | 78 | 166 | 26° | 14 | 32 |
+| 20210827220322 | A | 23 | 77 | −179 | 18° | 46 | 49 |
+| 20210827002315 | B | 34 | 80 | −180 | 12° | 33 | 43 |
+| 20210720161418 | B | 38 | 76 | 169 | 27° | 14 | 16 |
 
 ![Gwangyang locations and focal mechanisms](docs/figs/gwangyang_focal_mechanisms.png)
 
@@ -142,7 +142,16 @@ secondary enhancement. The lower-quality (C/D) solutions are kept only for conte
 
 `03_results.ipynb` shows all the key figures together: locations (absolute `.sum` + dt.ct/dt.cc
 relocation), **picks with first-motion polarity** (`viz.plot_3c` + `viz.plot_polarities`, a P-aligned
-record section sorted by azimuth), and the focal mechanisms above.
+record section sorted by azimuth), the focal mechanisms above, and **`viz.fault_sections`** — the
+relocated catalog rotated into the fault frame (map view with nodal planes + along-/across-strike
+sections) using the largest-magnitude mechanism's strike.
+
+**Other clusters.** All four clusters relocate (locations + dt.cc), but only **Gwangyang** has the
+focal-sphere coverage for *well-constrained* mechanisms. Jangsung/Kimcheon events are shallow (~0.3–6 km),
+so the steep takeoffs are unsampled (takeoff gap > 60°); Gyeongju's stations are one-sided (azimuthal
+gap > 90°). With the SKIP thresholds relaxed (`fm_max_agap`/`fm_max_pgap`) those clusters still get
+mechanisms, but SKHASH grades them **D** (under-constrained) — a magnitude-2.4 event is no exception, as
+mechanism resolvability depends on focal-sphere coverage, not magnitude.
 
 ## Adding a new cluster
 

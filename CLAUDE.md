@@ -33,13 +33,22 @@ hypoinverse run; SKHASH ray-traces takeoff angles from the cluster velocity mode
 from the station geometry (no `.arc` parsing). Writes `runs/<cluster>/3.FocalMech/<vm>/{IN,OUT,
 mechanisms.csv}` + beachballs; keeps quality **A/B** (`cfg.fm_quality_keep`). Polarity is the robust
 signal (vertical first motion); the vertical-component S/P ratio is a secondary enhancement
-(`cfg.fm_use_sp_ratio`). Validated on Gwangyang: 4/11 events A/B, all consistent ~N-striking strike-slip.
+(`cfg.fm_use_sp_ratio`). **Data-quality gates:** polarities only from P picks with prob ≥
+`fm_min_pick_prob` (0.5); S/P ratios only where P & S SNR ≥ `fm_sp_min_snr` (3, vs a pre-P noise window).
+**Coverage:** mechanism quality is set by focal-sphere coverage, NOT magnitude — SKHASH skips/floors-to-D
+when azimuthal gap > 90° or takeoff gap > 60° (the grade thresholds are hardcoded in SKHASH). `fm_max_agap`
+/`fm_max_pgap` (relaxed to 180/90) are the *skip* thresholds so coverage-limited clusters still get a
+graded (often D) solution. Validated: **Gwangyang 3/11 events A/B** (deep ~14 km, all-around stations),
+consistent ~N-striking strike-slip; **Jangsung/Kimcheon** (shallow ~0.3–6 km → takeoff gap) and
+**Gyeongju** (one-sided stations → azimuthal gap) relocate fine but yield only **D** mechanisms.
 **Results viewer:** `notebooks/03_results.ipynb` (cluster-parameterized) shows the key figures together —
 locations (`viz.map_catalog` .sum + dt.ct/dt.cc reloc, `depth_sections`, `compare_epicenters`), **picks +
 first-motion polarity** (`viz.plot_3c` marks the P polarity; `viz.plot_polarities` is a P-aligned record
 section sorted by azimuth, red=up/blue=down), and focal mechanisms (`viz.map_mechanisms` beachballs on a
-leader-line ring + `viz.mechanism_table` + the SKHASH gallery). The phasenet_plus run goes through the full
-relocation chain; its HypoDD reloc matches the stead baseline to ≈100 m.
+leader-line ring + `viz.mechanism_table` + the SKHASH gallery), and **`viz.fault_sections`** (relocated
+catalog rotated into the fault frame — map view + along/across-strike depth sections — using the
+largest-magnitude mechanism's strike). The phasenet_plus run goes through the full relocation chain; its
+HypoDD reloc matches the stead baseline to ≈100 m.
 
 **External (NOT vendored, like the binaries; env-overridable in `config.py`):** EQNet clone `$EQNET_DIR`
 (+ `$EQNET_WEIGHTS`) for phasenet_plus; SKHASH `$SKHASH_DIR` for focal mechanisms.

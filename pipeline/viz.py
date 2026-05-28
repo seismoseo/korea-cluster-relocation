@@ -275,31 +275,132 @@ def map_mechanisms(cfg, velmodel=None, quality_keep=("A", "B"), ax=None):
                     s=55, edgecolor="k", lw=0.5, zorder=4, label=f"Located events ({len(m)})")
     plt.colorbar(sc, ax=ax, label="Depth (km)", shrink=0.8)
 
-    hi = m[m.quality.isin(list(quality_keep))].reset_index(drop=True)
+    keep = m[m.quality.isin(list(quality_keep))]
+    disp = m.reset_index(drop=True)                     # all mechanisms; A/B bold, C/D faint
     clon, clat = float(m.origin_lon.mean()), float(m.origin_lat.mean())
     ext = max(m.origin_lon.max() - m.origin_lon.min(),
               m.origin_lat.max() - m.origin_lat.min(), 0.012)
     R = ext * 1.7                                       # ring radius from centroid
-    n = max(len(hi), 1)
-    bwidth = min(ext * 0.8, 2 * np.pi * R / n * 0.55)   # diameter; shrink if ring is crowded
-    for i, r in hi.iterrows():
+    n = max(len(disp), 1)
+    bwidth = min(ext * 0.8, 2 * np.pi * R / n * 0.6)    # diameter; shrink if ring is crowded
+    for i, r in disp.iterrows():
+        is_hi = r.quality in quality_keep
         ang = 2 * np.pi * i / n + np.pi / 2
         bx, by = clon + R * np.cos(ang), clat + R * np.sin(ang)
-        ax.plot([r.origin_lon, bx], [r.origin_lat, by], "-", color="0.55", lw=0.6, zorder=3)
+        ax.plot([r.origin_lon, bx], [r.origin_lat, by], "-", color="0.6", lw=0.5, zorder=3)
         ax.add_collection(beach((r.strike, r.dip, r.rake), xy=(bx, by), width=bwidth,
                                 facecolor=cmap(norm(r.origin_depth_km)), edgecolor="k",
-                                linewidth=0.7, zorder=5))
-        ax.text(bx, by + bwidth * 0.62, f"{r.quality}", ha="center", va="bottom",
-                fontsize=8, zorder=6)
+                                linewidth=0.7 if is_hi else 0.4,
+                                alpha=0.95 if is_hi else 0.45, zorder=5 if is_hi else 4))
+        ax.text(bx, by + bwidth * 0.6, r.quality, ha="center", va="bottom", fontsize=8,
+                fontweight="bold" if is_hi else "normal", zorder=6)
     pad = R + bwidth * 0.7 + ext * 0.15            # zoom to the cluster + beachball ring
     ax.set_xlim(clon - pad, clon + pad)
     ax.set_ylim(clat - pad, clat + pad)
     ax.set_aspect("equal", "box")
     ax.set(xlabel="Longitude", ylabel="Latitude",
            title=f"{cfg.region} — locations + focal mechanisms "
-                 f"({len(hi)} high-confidence [{'/'.join(quality_keep)}] / {len(m)} events, {velmodel})")
+                 f"({len(keep)} high-confidence [{'/'.join(quality_keep)}] / {len(m)} events, {velmodel})")
     ax.legend(loc="best", fontsize=8)
     return ax.figure
+
+
+def _fault_ref(cfg, velmodel=None):
+    """Reference (strike, dip, rake, cuspid, magnitude) for the fault sections = the
+    largest-magnitude high-confidence (A/B) mechanism; fallback = best-quality available.
+    None if there are no mechanisms."""
+    velmodel = velmodel or cfg.fm_velmodel
+    path = config.fm_mech_csv(cfg, velmodel)
+    if not os.path.exists(path):
+        return None
+    m = pd.read_csv(path).sort_values("quality").drop_duplicates("event_id", keep="first")
+    hi = m[m.quality.isin(list(cfg.fm_quality_keep))]
+    pool = hi if len(hi) else m
+    if not len(pool):
+        return None
+    if "magnitude" in pool.columns and pool["magnitude"].notna().any() and pool["magnitude"].max() > 0:
+        r = pool.sort_values("magnitude", ascending=False).iloc[0]
+    else:
+        r = pool.iloc[0]                                    # best quality (already sorted)
+    return dict(strike=float(r.strike), dip=float(r.dip), rake=float(r.rake),
+                cuspid=int(r.cuspid), quality=str(r.quality),
+                mag=float(r.magnitude) if "magnitude" in r and pd.notna(r.magnitude) else float("nan"),
+                event_id=str(r.event_id))
+
+
+def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="depth"):
+    """Strike-parallel + strike-perpendicular depth sections and a fault-plane map view of the
+    HypoDD-relocated catalog, centred on a reference event. Strike/dip default to the
+    largest-magnitude high-confidence focal mechanism (override with `strike`/`dip`).
+
+    Map view: relative E–N km with the two nodal-plane lines + the reference beachball. Sections:
+    along-strike and across-strike (the latter with the dashed fault line at the reference dip).
+    Needs a HypoDD `.reloc` (run ph2dt→dtcc) and, for the default strike, a focal-mechanism run."""
+    from obspy.imaging.beachball import beach
+    velmodel = velmodel or cfg.fm_velmodel
+    reloc = os.path.join(config.dtcc_dir(cfg), "hypoDD.reloc")
+    if not os.path.exists(reloc):
+        reloc = os.path.join(config.dtct_dir(cfg), "hypoDD.reloc")
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.4), dpi=120)
+    if not os.path.exists(reloc):
+        axes[1].set_title(f"{cfg.region}: no HypoDD reloc (run ph2dt→dtcc first)"); return fig
+    d = sumio.read_reloc(reloc)
+    if not len(d):
+        axes[1].set_title(f"{cfg.region}: empty reloc"); return fig
+    ref = _fault_ref(cfg, velmodel)
+    if strike is None:
+        strike = ref["strike"] if ref else None
+    if dip is None:
+        dip = ref["dip"] if ref else 90.0
+    if strike is None:
+        axes[1].set_title(f"{cfg.region}: no focal mechanism — pass strike=/dip=")
+        return fig
+
+    refrow = d[d.id == ref["cuspid"]] if ref else d.iloc[0:0]
+    x0, y0, z0 = (float(refrow.iloc[0].x), float(refrow.iloc[0].y), float(refrow.iloc[0].z)) \
+        if len(refrow) else (float(d.x.mean()), float(d.y.mean()), float(d.z.mean()))
+    rx, ry = (d.x - x0).to_numpy(), (d.y - y0).to_numpy()        # metres, relative to ref
+    th = np.deg2rad(90.0 - strike)
+    along = (rx * np.cos(th) + ry * np.sin(th)) / 1000.0         # km
+    across = (-rx * np.sin(th) + ry * np.cos(th)) / 1000.0
+    dep = -(d.z.to_numpy() - z0) / 1000.0                        # km, +down, relative to ref
+    cvals = d.depth.to_numpy() if color_by == "depth" else d.mag.to_numpy()
+    mag = d.mag.to_numpy()
+    sz = 25 + 12 * np.clip(mag, 0, None) ** 2 if np.nanmax(mag) > 0 else np.full(len(d), 45.0)
+    cmap = plt.get_cmap("viridis_r")
+    L = max(np.ptp(rx), np.ptp(ry)) / 1000.0 or 0.5             # map half-extent scale (km)
+
+    # panel 1 — fault-plane map view (relative E–N km)
+    ax = axes[0]
+    for s_az, ls in ((strike, "-"), (strike + 90, "--")):
+        dx, dy = np.sin(np.deg2rad(s_az)), np.cos(np.deg2rad(s_az))
+        ax.plot([-L * dx, L * dx], [-L * dy, L * dy], color="0.4", lw=0.9, ls=ls, zorder=1)
+    ax.scatter(rx / 1000.0, ry / 1000.0, c=cvals, cmap=cmap, s=sz, edgecolor="k", lw=0.4, zorder=3)
+    if ref and not np.isnan(ref["rake"]):
+        ax.add_collection(beach((strike, dip, ref["rake"]), xy=(-0.8 * L, 0.8 * L),
+                                width=0.5 * L, facecolor="0.5", edgecolor="k", linewidth=0.6, zorder=4))
+    ax.set(xlabel="E (km)", ylabel="N (km)", xlim=(-1.1 * L, 1.1 * L), ylim=(-1.1 * L, 1.1 * L),
+           title=f"Fault-plane map view (strike {strike:.0f}°)")
+    ax.set_aspect("equal", "box")
+
+    # panels 2,3 — along- and across-strike depth sections
+    for ax, dist, lab in ((axes[1], along, "Along-strike"), (axes[2], across, "Across-strike")):
+        sc = ax.scatter(dist, dep, c=cvals, cmap=cmap, s=sz, edgecolor="k", lw=0.4, zorder=3)
+        ax.invert_yaxis()
+        ax.set(xlabel="Distance (km)", ylabel="Depth rel. to reference (km)", title=lab)
+        ax.set_aspect("equal", "box")
+    # dashed fault line at the reference dip on the across-strike panel (clipped to the data
+    # depth range so a near-vertical dip doesn't blow up the axis)
+    xl, yl = axes[2].get_xlim(), axes[1].get_ylim()
+    xx = np.linspace(xl[0], xl[1], 50)
+    axes[2].plot(xx, xx * np.tan(np.deg2rad(dip)), color="k", lw=0.9, ls="--", zorder=1)
+    axes[2].set_xlim(xl); axes[2].set_ylim(yl)              # share the along-strike depth range
+
+    plt.colorbar(sc, ax=axes, label="Depth (km)" if color_by == "depth" else "Magnitude", shrink=0.7)
+    rinfo = f"ref {ref['event_id']} (M{ref['mag']:.1f}, {ref['quality']})" if ref else "centroid"
+    fig.suptitle(f"{cfg.region} — relocated seismicity in fault coordinates "
+                 f"[strike {strike:.0f}°, dip {dip:.0f}°; {rinfo}]", fontsize=12)
+    return fig
 
 
 def compare_epicenters(cfg, velmodel="kim1983", variant="default"):

@@ -161,10 +161,17 @@ class ClusterConfig:
     # focal mechanisms (SKHASH; only meaningful for a phasenet_plus picker run)
     fm_velmodel: str = "kim1983"             # which .sum/.arc + crustal model feeds SKHASH
     fm_min_polarity_weight: float = 0.3      # drop |phase_polarity| below this (ambiguous first motion)
+    fm_min_pick_prob: float = 0.5            # drop polarities from P picks with probability below this
     fm_quality_keep: tuple = ("A", "B")      # SKHASH quality grades kept as "high confidence"
     fm_use_sp_ratio: bool = True             # also feed S/P amplitude ratios (combined inversion)
+    fm_sp_min_snr: float = 3.0               # drop S/P ratios where P or S SNR < this (pre-P noise)
     fm_npolmin: int = 8                      # SKHASH minimum number of polarities
     fm_delmax_km: float = 120.0              # SKHASH max source-receiver distance
+    # SKHASH SKIP thresholds (relaxed so shallow / one-sided clusters still get a graded solution;
+    # NOTE SKHASH still hard-floors the quality GRADE to D when azimuthal_gap>90° or takeoff_gap>60°,
+    # so under-covered mechanisms are honestly flagged D). max_pgap is capped at 90 by SKHASH.
+    fm_max_agap: float = 180.0               # max azimuthal gap to attempt a solution
+    fm_max_pgap: float = 90.0                # max takeoff-angle gap to attempt a solution (<=90)
 
     # HYPOINVERSE
     hyp_control: HypControl = field(default_factory=HypControl)
