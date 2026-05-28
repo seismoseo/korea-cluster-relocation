@@ -158,6 +158,71 @@ def cc_histogram(cfg, threshold=0.7):
     return fig
 
 
+def mechanism_table(cfg, velmodel=None):
+    """Tidy focal-mechanism table (one row per event, best quality kept) for notebook display."""
+    velmodel = velmodel or cfg.fm_velmodel
+    path = config.fm_mech_csv(cfg, velmodel)
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    m = pd.read_csv(path).sort_values("quality").drop_duplicates("event_id", keep="first")
+    cols = ["event_id", "quality", "strike", "dip", "rake", "fault_plane_uncertainty",
+            "num_p_pol", "num_sp_ratios", "azimuthal_gap", "sta_distribution_ratio",
+            "origin_depth_km"]
+    return m[[c for c in cols if c in m.columns]].reset_index(drop=True)
+
+
+def map_mechanisms(cfg, velmodel=None, quality_keep=("A", "B"), ax=None):
+    """Locations + focal mechanisms together: located epicenters as depth-coloured dots, with the
+    high-confidence (quality in `quality_keep`) beachballs offset on a ring around the cluster
+    centroid (leader line to the true epicenter) so a tight cluster stays legible. obspy `beach()`.
+
+    Reads `config.fm_mech_csv(cfg, velmodel)`; needs a phasenet_plus focal_mechanism run."""
+    import matplotlib as mpl
+    velmodel = velmodel or cfg.fm_velmodel
+    path = config.fm_mech_csv(cfg, velmodel)
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7.5, 7.5), dpi=120)
+    if not os.path.exists(path):
+        ax.set_title(f"{cfg.region} — no mechanisms.csv\n(run focal_mechanism with "
+                     f"picker_weights='phasenet_plus')", fontsize=10)
+        return ax.figure
+    from obspy.imaging.beachball import beach
+    m = pd.read_csv(path).sort_values("quality").drop_duplicates("event_id", keep="first")
+
+    norm = mpl.colors.Normalize(vmin=float(m.origin_depth_km.min()),
+                                vmax=float(m.origin_depth_km.max()))
+    cmap = plt.get_cmap("viridis_r")
+    sc = ax.scatter(m.origin_lon, m.origin_lat, c=m.origin_depth_km, cmap=cmap, norm=norm,
+                    s=55, edgecolor="k", lw=0.5, zorder=4, label=f"Located events ({len(m)})")
+    plt.colorbar(sc, ax=ax, label="Depth (km)", shrink=0.8)
+
+    hi = m[m.quality.isin(list(quality_keep))].reset_index(drop=True)
+    clon, clat = float(m.origin_lon.mean()), float(m.origin_lat.mean())
+    ext = max(m.origin_lon.max() - m.origin_lon.min(),
+              m.origin_lat.max() - m.origin_lat.min(), 0.012)
+    R = ext * 1.7                                       # ring radius from centroid
+    n = max(len(hi), 1)
+    bwidth = min(ext * 0.8, 2 * np.pi * R / n * 0.55)   # diameter; shrink if ring is crowded
+    for i, r in hi.iterrows():
+        ang = 2 * np.pi * i / n + np.pi / 2
+        bx, by = clon + R * np.cos(ang), clat + R * np.sin(ang)
+        ax.plot([r.origin_lon, bx], [r.origin_lat, by], "-", color="0.55", lw=0.6, zorder=3)
+        ax.add_collection(beach((r.strike, r.dip, r.rake), xy=(bx, by), width=bwidth,
+                                facecolor=cmap(norm(r.origin_depth_km)), edgecolor="k",
+                                linewidth=0.7, zorder=5))
+        ax.text(bx, by + bwidth * 0.62, f"{r.quality}", ha="center", va="bottom",
+                fontsize=8, zorder=6)
+    pad = R + bwidth * 0.7 + ext * 0.15            # zoom to the cluster + beachball ring
+    ax.set_xlim(clon - pad, clon + pad)
+    ax.set_ylim(clat - pad, clat + pad)
+    ax.set_aspect("equal", "box")
+    ax.set(xlabel="Longitude", ylabel="Latitude",
+           title=f"{cfg.region} — locations + focal mechanisms "
+                 f"({len(hi)} high-confidence [{'/'.join(quality_keep)}] / {len(m)} events, {velmodel})")
+    ax.legend(loc="best", fontsize=8)
+    return ax.figure
+
+
 def compare_epicenters(cfg, velmodel="kim1983", variant="default"):
     """Side-by-side epicenter maps: dt.ct (left) vs dt.cc (right) HypoDD relocations."""
     ct = sumio.read_reloc(os.path.join(config.dtct_dir(cfg), "hypoDD.reloc"))

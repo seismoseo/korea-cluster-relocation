@@ -34,6 +34,9 @@ from the station geometry (no `.arc` parsing). Writes `runs/<cluster>/3.FocalMec
 mechanisms.csv}` + beachballs; keeps quality **A/B** (`cfg.fm_quality_keep`). Polarity is the robust
 signal (vertical first motion); the vertical-component S/P ratio is a secondary enhancement
 (`cfg.fm_use_sp_ratio`). Validated on Gwangyang: 4/11 events A/B, all consistent ~N-striking strike-slip.
+**Results viewer:** `notebooks/03_results.ipynb` (cluster-parameterized) shows locations + focal mechanisms
+together — `viz.map_catalog`/`depth_sections` + `viz.map_mechanisms` (obspy beachballs on a leader-line ring)
++ `viz.mechanism_table` + the SKHASH beachball gallery.
 
 **External (NOT vendored, like the binaries; env-overridable in `config.py`):** EQNet clone `$EQNET_DIR`
 (+ `$EQNET_WEIGHTS`) for phasenet_plus; SKHASH `$SKHASH_DIR` for focal mechanisms.

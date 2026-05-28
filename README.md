@@ -105,6 +105,36 @@ cross-correlates **all** event pairs — keep iterations cheap with a small `SUB
 
 Auxiliary QC (station misorientation, ZRT rotation, waveform similarity) is in
 `pipeline/notebooks/01_qc.ipynb`; a quick run-all + regression dashboard is `00_run_and_inspect.ipynb`.
+**Results presentation** — locations and focal mechanisms together — is `03_results.ipynb`
+(set `CLUSTER` / `RUN_SUFFIX`).
+
+## Example — Gwangyang focal mechanisms
+
+Pick with PhaseNet+ (emits polarity + S/P amplitude), locate, then invert with SKHASH:
+
+```bash
+PY=python
+$PY -m pipeline.cli.run_pipeline --cluster gwangyang --picker phasenet_plus --through hypoinverse
+$PY -m pipeline.cli.run_pipeline --cluster gwangyang --picker phasenet_plus \
+    --stage-from focal_mechanism --through focal_mechanism
+# then view: pipeline/notebooks/03_results.ipynb  (CLUSTER="gwangyang", RUN_SUFFIX="_pnplus")
+```
+
+Of the 11 events, **4 are well constrained (quality A/B)** and agree closely — near-vertical,
+roughly N-striking strike-slip — consistent with a coherent fault source:
+
+| Event | Quality | Strike | Dip | Rake | Fault-plane uncert. | P polarities | S/P ratios |
+|---|---|---|---|---|---|---|---|
+| 20210827220322 | A | 22 | 78 | −178 | 19° | 47 | 50 |
+| 20210827002315 | B | 30 | 76 | 170 | 17° | 33 | 50 |
+| 20210720161418 | B | 35 | 74 | 163 | 32° | 14 | 26 |
+| 20260202194119 | B | 33 | 78 | 166 | 26° | 14 | 32 |
+
+![Gwangyang locations and focal mechanisms](docs/figs/gwangyang_focal_mechanisms.png)
+
+*Located epicenters (depth-coloured dots) with the high-confidence beachballs offset on a ring
+(leader line to each epicenter); polarity is the primary signal, the vertical-component S/P ratio a
+secondary enhancement. The lower-quality (C/D) solutions are kept only for context.*
 
 ## Adding a new cluster
 
