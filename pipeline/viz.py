@@ -271,13 +271,25 @@ def cc_histogram(cfg, threshold=0.7):
     return fig
 
 
+def _load_mechanisms(path):
+    """Read mechanisms.csv and keep ONE row per event — SKHASH's **preferred** solution. A
+    multi-solution event has several rows of the same quality; SKHASH plots (and we should report)
+    the one with the highest `prob_mech`. Sorting by quality (A→D) then prob_mech (high→low) before
+    `drop_duplicates` keeps that row, so the table, the obspy beachballs, and the reference plane all
+    match the SKHASH beachball PNG. (Plain `drop_duplicates` kept an arbitrary solution.)"""
+    m = pd.read_csv(path)
+    by = ["quality"] + (["prob_mech"] if "prob_mech" in m.columns else [])
+    asc = [True] + ([False] if "prob_mech" in m.columns else [])
+    return m.sort_values(by, ascending=asc, kind="mergesort").drop_duplicates("event_id", keep="first")
+
+
 def mechanism_table(cfg, velmodel=None):
-    """Tidy focal-mechanism table (one row per event, best quality kept) for notebook display."""
+    """Tidy focal-mechanism table (one row per event, preferred solution) for notebook display."""
     velmodel = velmodel or cfg.fm_velmodel
     path = config.fm_mech_csv(cfg, velmodel)
     if not os.path.exists(path):
         return pd.DataFrame()
-    m = pd.read_csv(path).sort_values("quality").drop_duplicates("event_id", keep="first")
+    m = _load_mechanisms(path)
     cols = ["event_id", "quality", "strike", "dip", "rake", "fault_plane_uncertainty",
             "num_p_pol", "num_sp_ratios", "azimuthal_gap", "sta_distribution_ratio",
             "origin_depth_km"]
@@ -300,7 +312,7 @@ def map_mechanisms(cfg, velmodel=None, quality_keep=("A", "B"), ax=None):
                      f"picker_weights='phasenet_plus')", fontsize=10)
         return ax.figure
     from obspy.imaging.beachball import beach
-    m = pd.read_csv(path).sort_values("quality").drop_duplicates("event_id", keep="first")
+    m = _load_mechanisms(path)
 
     norm = mpl.colors.Normalize(vmin=float(m.origin_depth_km.min()),
                                 vmax=float(m.origin_depth_km.max()))
@@ -347,7 +359,7 @@ def _fault_ref(cfg, velmodel=None):
     path = config.fm_mech_csv(cfg, velmodel)
     if not os.path.exists(path):
         return None
-    m = pd.read_csv(path).sort_values("quality").drop_duplicates("event_id", keep="first")
+    m = _load_mechanisms(path)
     hi = m[m.quality.isin(list(cfg.fm_quality_keep))]
     pool = hi if len(hi) else m
     if not len(pool):
