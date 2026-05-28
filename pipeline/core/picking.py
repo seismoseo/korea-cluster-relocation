@@ -30,6 +30,9 @@ def _get_prob(p):  return p.peak_value if hasattr(p, "peak_value") else p.probab
 
 
 def load_model(weights="stead", device="cpu"):
+    if weights in config.EQNET_MODELS:                     # EQNet PhaseNet+ (polarity/amplitude)
+        from pipeline.core import eqnet_backend
+        return eqnet_backend.load_pnplus(device)
     import torch
     import seisbench.models as sbm
     model = sbm.PhaseNet.from_pretrained(weights)
@@ -98,6 +101,68 @@ def pick_event(cfg, model, used_table, ev) -> list[dict]:
     return results
 
 
+# --------------------------------------- per-event pick (EQNet PhaseNet+ backend)
+def pick_event_pnplus(cfg, model, used_table, ev) -> list[dict]:
+    """Same window + best-P/S-pair logic as `pick_event`, but with the EQNet PhaseNet+
+    backend (one forward pass over every station of the event). Additionally keeps the
+    chosen P's first-motion `Polarity` and each pick's `Amplitude` (for the focal-mechanism
+    stage). P+polarity and S both come from the 3-component station record."""
+    from pipeline.core import eqnet_backend
+    pw = cfg.pick_window
+    evdp, vp, vs = pw["evdp"], pw["vp"], pw["vs"]
+    win_p_off, win_s_off = pw.get("p_off", -1.0), pw.get("s_off", 4.0)
+    eid = ev["event_id"]
+    wf = config.event_wf_dir(cfg, eid)
+
+    comp_files = [f"{wf}/{eid}.{r.Network}.{r.Code}.{r.Sensor}{c}.sac"
+                  for r in used_table.itertuples() for c in ("Z", "N", "E")]
+    df = eqnet_backend.pick_event_pnplus(model, comp_files, sampling_rate=cfg.target_sampling_hz)
+    if df.empty:
+        return []
+    sd = df["station_id"].str.split(".", expand=True)
+    df = df.assign(pnet=sd[0], psta=sd[1], tt=df["time"].map(UTCDateTime))
+
+    results = []
+    for r in used_table.itertuples():
+        net, sta, chan = r.Network, r.Code, r.Sensor
+        fz = f"{wf}/{eid}.{net}.{sta}.{chan}Z.sac"
+        if not os.path.exists(fz):
+            continue
+        try:
+            tr_z = read(fz)[0]
+            sac = tr_z.stats.sac
+            if not hasattr(sac, "dist") or sac.dist == -12345.0:
+                continue
+            hypo_dist = np.hypot(sac.dist, evdp)
+            origin = tr_z.stats.starttime - sac.b
+            win_start = origin + hypo_dist / vp + win_p_off
+            win_end = origin + hypo_dist / vs + win_s_off
+
+            g = df[(df.pnet == net) & (df.psta == sta)]
+            pp = [p for p in g[g.phase == "P"].itertuples() if win_start <= p.tt <= win_end]
+            ss = [s for s in g[g.phase == "S"].itertuples() if win_start <= s.tt <= win_end]
+            pairs = [(p, s) for p in pp for s in ss if 0 < (s.tt - p.tt) < cfg.sp_max_gap_s]
+            best_p, best_s = (max(pairs, key=lambda x: x[0].probability + x[1].probability)
+                              if pairs else (None, None))
+            if best_p is None and pp:
+                best_p = max(pp, key=lambda p: p.probability)
+            if best_s is None and ss:
+                cand = [s for s in ss if best_p is None or s.tt > best_p.tt]
+                best_s = (max(cand, key=lambda s: s.probability) if cand
+                          else (max(ss, key=lambda s: s.probability) if best_p is None else None))
+
+            for pk in (best_p, best_s):
+                if pk is not None:
+                    results.append(dict(
+                        Event_ID=eid, Network=net, Station=sta, Phase=pk.phase,
+                        Time=str(pk.tt), Probability=round(float(pk.probability), 3),
+                        Polarity=(round(float(pk.polarity), 3) if pk.phase == "P" else np.nan),
+                        Amplitude=float(pk.amplitude)))
+        except Exception as e:  # noqa: BLE001
+            print(f"[pick-pnplus] {eid} {sta}: {e}")
+    return results
+
+
 # ------------------------------------------------- write picks into SAC headers
 def write_sac_picks(cfg, used_table, picks_df):
     """Set sac.a (P) / sac.t0 (S) on all 3 components for each pick."""
@@ -129,6 +194,7 @@ def run_picking(cfg, events=None, device="cpu", model=None, used_table=None,
         used_table = pd.read_csv(config.used_stations_csv(cfg))
     if model is None:
         model = load_model(cfg.picker_weights, device)
+    pick_fn = pick_event_pnplus if cfg.picker_weights in config.EQNET_MODELS else pick_event
     catalog = waveforms.load_catalog(cfg)
     if events is not None:
         catalog = [e for e in catalog if e["event_id"] in set(events)]
@@ -137,7 +203,7 @@ def run_picking(cfg, events=None, device="cpu", model=None, used_table=None,
     os.makedirs(out_dir, exist_ok=True)
     counts = {}
     for ev in catalog:
-        picks = pick_event(cfg, model, used_table, ev)
+        picks = pick_fn(cfg, model, used_table, ev)
         counts[ev["event_id"]] = len(picks)
         if picks:
             df = pd.DataFrame(picks)

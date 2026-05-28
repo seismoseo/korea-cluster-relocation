@@ -39,6 +39,27 @@ CLUSTER_SRC_DIRS = (
 CLUSTER_NAMES = ("gwangyang", "kimcheon", "jangsung", "gyeongju")
 
 
+# ------------------------------------------------- picker backends (by model)
+# SeisBench PhaseNet weights run via the default backend (picking.load_model ->
+# seisbench.models.PhaseNet.from_pretrained). EQNet PhaseNet+ runs via the in-process
+# EQNet backend (core/eqnet_backend.py) and is the only picker that emits first-motion
+# POLARITY + per-pick AMPLITUDE, which the focal-mechanism (SKHASH) stage needs.
+SEISBENCH_MODELS = frozenset({"stead", "original", "instance", "ethz", "scedc", "geofon", "neic"})
+EQNET_MODELS = frozenset({"phasenet_plus"})
+
+# ---- external tools (NOT vendored — like the hyp1.40/hypoDD/ph2dt binaries). Override
+#      with environment variables so a clone on another machine stays portable. ----
+# EQNet (AI4EPS) clone providing PhaseNet+ (needed only when picker_weights="phasenet_plus").
+EQNET_DIR = os.environ.get("EQNET_DIR", "/home/msseo/works/14.EQNet/EQNet")
+EQNET_WEIGHTS = os.environ.get(
+    "EQNET_WEIGHTS", os.path.join(EQNET_DIR, "docs", "model_phasenet_plus", "model_99.pth"))
+PNPLUS_MIN_PROB = float(os.environ.get("PNPLUS_MIN_PROB", "0.3"))   # EQNet default pick threshold
+PNPLUS_HIGHPASS = float(os.environ.get("PNPLUS_HIGHPASS", "0.0"))   # Hz; 0 = raw (PhaseNet+ wants raw)
+PNPLUS_NT = int(os.environ.get("PNPLUS_NT", str(1024 * 36)))        # samples per inference patch
+# SKHASH focal-mechanism tool (needed only for the focal_mechanism stage).
+SKHASH_DIR = os.environ.get("SKHASH_DIR", "/home/msseo/works/44.SKHASH/SKHASH/SKHASH")
+
+
 # ----------------------------------------------------------- parameter blocks
 @dataclass(frozen=True)
 class VelModel:
@@ -137,6 +158,14 @@ class ClusterConfig:
         default_factory=lambda: dict(evdp=15.0, vp=5.9, vs=3.0)
     )
 
+    # focal mechanisms (SKHASH; only meaningful for a phasenet_plus picker run)
+    fm_velmodel: str = "kim1983"             # which .sum/.arc + crustal model feeds SKHASH
+    fm_min_polarity_weight: float = 0.3      # drop |phase_polarity| below this (ambiguous first motion)
+    fm_quality_keep: tuple = ("A", "B")      # SKHASH quality grades kept as "high confidence"
+    fm_use_sp_ratio: bool = True             # also feed S/P amplitude ratios (combined inversion)
+    fm_npolmin: int = 8                      # SKHASH minimum number of polarities
+    fm_delmax_km: float = 120.0              # SKHASH max source-receiver distance
+
     # HYPOINVERSE
     hyp_control: HypControl = field(default_factory=HypControl)
     velocity_models: tuple = ()             # tuple[VelModel]
@@ -228,6 +257,11 @@ def velmodel_dir(cfg, vm):      return os.path.join(hyp_dir(cfg), vm)
 def sum_file(cfg, vm):          return os.path.join(velmodel_dir(cfg, vm), f"{cfg.region}.sum")
 def arc_file(cfg, vm):          return os.path.join(velmodel_dir(cfg, vm), f"{cfg.region}.arc")
 def prt_file(cfg, vm):          return os.path.join(velmodel_dir(cfg, vm), f"{cfg.region}.prt")
+
+def fm_dir(cfg, vm):            return os.path.join(cfg.output_root, "3.FocalMech", vm)
+def fm_in_dir(cfg, vm):         return os.path.join(fm_dir(cfg, vm), "IN")
+def fm_out_dir(cfg, vm):        return os.path.join(fm_dir(cfg, vm), "OUT")
+def fm_mech_csv(cfg, vm):       return os.path.join(fm_dir(cfg, vm), "mechanisms.csv")
 
 def hypodd_dir(cfg):            return os.path.join(cfg.output_root, "2.HypoDD")
 def ph2dt_dir(cfg):             return os.path.join(hypodd_dir(cfg), "00.ph2dt")

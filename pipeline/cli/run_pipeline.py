@@ -31,15 +31,22 @@ def main():
                     help="which hypodd_dtcc_variants entry to relocate (default/no_main/...)")
     ap.add_argument("--cores", type=int, default=None,
                     help="xcorr worker cap (default cfg.num_cores; always pin with taskset)")
+    ap.add_argument("--picker", default=None,
+                    help="override cfg.picker_weights (e.g. phasenet_plus for polarity/amplitude)")
+    ap.add_argument("--fm-velmodel", default=None,
+                    help="velocity model whose .sum the focal_mechanism stage uses (default cfg.fm_velmodel)")
     args = ap.parse_args()
 
     cfg = config.load_cluster(args.cluster)
+    if args.picker:
+        cfg = config.tune(cfg, picker_weights=args.picker)
     events = args.events.split(",") if args.events else None
     velmodels = tuple(v for v in args.velmodels.split(",") if v)
     pipeline.run_cluster(cfg, stage_from=args.stage_from, through=args.through,
                          velmodels=velmodels, arc_velmodel=args.arc_velmodel,
                          device=args.device, events=events,
-                         dtcc_variant=args.dtcc_variant, cores=args.cores)
+                         dtcc_variant=args.dtcc_variant, cores=args.cores,
+                         fm_velmodel=args.fm_velmodel)
 
 
 if __name__ == "__main__":

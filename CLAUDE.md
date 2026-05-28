@@ -16,10 +16,27 @@ path/parameter from it. Full docs: top-level `README.md` + `pipeline/README.md`.
   once per clone *before* the first `git add` of a notebook.
 
 ## Pipeline
-`stations → waveforms → picking (PhaseNet) → hypoinverse → ph2dt → dtct → rereference → xcorr → dtcc`.
-Default `--through dtct` is the catalog chain; the dt.cc branch is appended only when requested.
-PhaseNet runs on CPU to match the reference run. External binaries on PATH: `hyp1.40`, `ncsn2pha`,
-`ph2dt`, `hypoDD`.
+`stations → waveforms → picking → hypoinverse → ph2dt → dtct → rereference → xcorr → dtcc`,
+plus an opt-in tail stage `focal_mechanism`. Default `--through dtct` is the catalog chain; the dt.cc
+branch is appended only when requested. PhaseNet runs on CPU to match the reference run. External
+binaries on PATH: `hyp1.40`, `ncsn2pha`, `ph2dt`, `hypoDD`.
+
+**Picker option (`cfg.picker_weights`).** Default `stead` (SeisBench PhaseNet). Set `phasenet_plus`
+(EQNet PhaseNet+, `core/eqnet_backend.py`) for an alternative picker that additionally emits per-pick
+first-motion **Polarity** and **Amplitude** (extra columns in `picks/<eid>_picks.csv`). Run-time toggle:
+`config.tune(cfg, picker_weights="phasenet_plus")` or `--picker phasenet_plus`. Use a separate
+`output_root` to keep it beside a `stead` run for comparison.
+
+**Focal mechanisms (`focal_mechanism` stage, `core/focal_mechanism.py`).** SKHASH double-couple
+inversion from the phasenet_plus polarity + S/P amplitude ratio. Needs a phasenet_plus picking +
+hypoinverse run; SKHASH ray-traces takeoff angles from the cluster velocity model and computes azimuths
+from the station geometry (no `.arc` parsing). Writes `runs/<cluster>/3.FocalMech/<vm>/{IN,OUT,
+mechanisms.csv}` + beachballs; keeps quality **A/B** (`cfg.fm_quality_keep`). Polarity is the robust
+signal (vertical first motion); the vertical-component S/P ratio is a secondary enhancement
+(`cfg.fm_use_sp_ratio`). Validated on Gwangyang: 4/11 events A/B, all consistent ~N-striking strike-slip.
+
+**External (NOT vendored, like the binaries; env-overridable in `config.py`):** EQNet clone `$EQNET_DIR`
+(+ `$EQNET_WEIGHTS`) for phasenet_plus; SKHASH `$SKHASH_DIR` for focal mechanisms.
 
 ## Working notes
 - **Parameter studies:** use `config.tune(cfg, **overrides)` (frozen-config copy; dict fields merge,
