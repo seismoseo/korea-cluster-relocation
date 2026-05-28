@@ -46,9 +46,17 @@ locations (`viz.map_catalog` .sum + dt.ct/dt.cc reloc, `depth_sections`, `compar
 first-motion polarity** (`viz.plot_3c` marks the P polarity; `viz.plot_polarities` is a P-aligned record
 section sorted by azimuth, red=up/blue=down), and focal mechanisms (`viz.map_mechanisms` beachballs on a
 leader-line ring + `viz.mechanism_table` + the SKHASH gallery), and **`viz.fault_sections`** (relocated
-catalog rotated into the fault frame — map view + along/across-strike depth sections — using the
-largest-magnitude mechanism's strike). The phasenet_plus run goes through the full relocation chain; its
-HypoDD reloc matches the stead baseline to ≈100 m.
+catalog rotated into the fault frame — a 2×2 figure: fault-plane map view + along/across-strike depth
+sections + a fault-plane along-dip view, coloured by origin time). Its orientation is the **relocation
+cloud's own best-fit plane (SVD, `_best_fit_plane`), with the focal mechanism overlaid only for comparison**
+(`strike=`/`dip=` override) — so an under-constrained mechanism (e.g. grade-D Jangsung) can't distort the
+view; the header prints both, making any disagreement explicit. The phasenet_plus run goes through the full
+relocation chain; its HypoDD reloc matches the stead baseline to ≈100 m.
+**Located counts** shrink `.sum ≥ dt.ct ≥ dt.cc` (HypoDD keeps only events with enough inter-event links;
+dt.ct drops catalog-isolated events, dt.cc further drops poorly-correlating ones). **dt.cc is the high-end
+product** (errors of metres) and is the headline relocation; `viz.relocation_counts` tabulates the stages.
+Plot text uses **Helvetica** when available (`viz._use_helvetica`, `$HELVETICA_DIR`/`config.HELVETICA_DIR`),
+falling back to the matplotlib default otherwise.
 
 **External (NOT vendored, like the binaries; env-overridable in `config.py`):** EQNet clone `$EQNET_DIR`
 (+ `$EQNET_WEIGHTS`) for phasenet_plus; SKHASH `$SKHASH_DIR` for focal mechanisms.

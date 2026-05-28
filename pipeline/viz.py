@@ -10,6 +10,7 @@ from __future__ import annotations
 import glob
 import os
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -19,38 +20,71 @@ from pipeline import config
 from pipeline.core import sumio, waveforms
 
 
+def _use_helvetica():
+    """Use Helvetica for every plot's text if the fonts are available (`config.HELVETICA_DIR`,
+    env-overridable via $HELVETICA_DIR); otherwise leave the matplotlib default in place so a
+    public clone without the fonts still renders. Runs once at import."""
+    import matplotlib.font_manager as fm
+    font_dir = getattr(config, "HELVETICA_DIR", None)
+    try:
+        if font_dir and os.path.isdir(font_dir):
+            for fpath in fm.findSystemFonts(font_dir):
+                fm.fontManager.addfont(fpath)
+        names = {f.name for f in fm.fontManager.ttflist}
+        if "Helvetica" in names:
+            mpl.rcParams["font.family"] = "Helvetica"
+    except Exception:
+        pass                                   # never let font setup break plotting
+    mpl.rcParams["axes.unicode_minus"] = False
+
+
+_use_helvetica()
+
+
+def _reloc_path(cfg):
+    """The headline HypoDD relocation: dt.cc if it exists (the high-end product — far smaller
+    errors), else the dt.ct catalog relocation. Returns (path, branch_label)."""
+    cc = os.path.join(config.dtcc_dir(cfg), "hypoDD.reloc")
+    if os.path.exists(cc):
+        return cc, "dt.cc"
+    return os.path.join(config.dtct_dir(cfg), "hypoDD.reloc"), "dt.ct"
+
+
 def map_catalog(cfg, velmodel="kim1983", source="sum", ax=None):
-    """Epicenter map coloured by depth, with the used stations. source = 'sum'|'reloc'."""
+    """Epicenter map coloured by depth, with the used stations. source = 'sum'|'reloc'.
+    For source='reloc' the headline dt.cc relocation is shown (dt.ct fallback)."""
+    branch = velmodel
     if source == "sum":
         df = sumio.read_sum(config.sum_file(cfg, velmodel))
     else:
-        df = sumio.read_reloc(config.dtct_dir(cfg) + "/hypoDD.reloc")
+        path, branch = _reloc_path(cfg)
+        df = sumio.read_reloc(path)
     sta = pd.read_csv(config.used_stations_csv(cfg))
     if ax is None:
         _, ax = plt.subplots(figsize=(6, 6), dpi=110)
     ax.scatter(sta.Longitude, sta.Latitude, marker="^", s=40, c="0.6",
-               edgecolor="k", label=f"stations ({len(sta)})", zorder=2)
+               edgecolor="k", label=f"Stations ({len(sta)})", zorder=2)
     sc = ax.scatter(df.lon, df.lat, c=df.depth, s=60, cmap="viridis_r",
                     edgecolor="k", zorder=3)
-    plt.colorbar(sc, ax=ax, label="depth (km)", shrink=0.8)
+    plt.colorbar(sc, ax=ax, label="Depth (km)", shrink=0.8)
     ax.scatter(*cfg.epicenter[::-1], marker="*", s=300, c="red",
-               edgecolor="k", zorder=4, label="cluster center")
-    ax.set(xlabel="longitude", ylabel="latitude",
-           title=f"{cfg.region} — {len(df)} events ({source}:{velmodel})")
+               edgecolor="k", zorder=4, label="Cluster center")
+    ax.set(xlabel="Longitude", ylabel="Latitude",
+           title=f"{cfg.region} — {len(df)} events ({source}:{branch})")
     ax.legend(loc="best", fontsize=8); ax.set_aspect("equal", "datalim")
     return ax.figure
 
 
 def depth_sections(cfg, velmodel="kim1983", source="sum"):
-    """Lon-depth and lat-depth cross-sections."""
+    """Lon-depth and lat-depth cross-sections (source='reloc' uses the headline dt.cc relocation)."""
     df = (sumio.read_sum(config.sum_file(cfg, velmodel)) if source == "sum"
-          else sumio.read_reloc(config.dtct_dir(cfg) + "/hypoDD.reloc"))
+          else sumio.read_reloc(_reloc_path(cfg)[0]))
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4), dpi=110)
     a1.scatter(df.lon, df.depth, s=40, c="steelblue", edgecolor="k")
-    a1.set(xlabel="longitude", ylabel="depth (km)", title=f"{cfg.region} lon-depth")
+    a1.set(xlabel="Longitude", ylabel="Depth (km)", title=f"{cfg.region} longitude-depth")
     a1.invert_yaxis()
     a2.scatter(df.lat, df.depth, s=40, c="steelblue", edgecolor="k")
-    a2.set(xlabel="latitude", ylabel="depth (km)", title="lat-depth")
+    a2.set(xlabel="Latitude", ylabel="Depth (km)", title="Latitude-depth")
     a2.invert_yaxis()
     fig.tight_layout()
     return fig
@@ -328,78 +362,160 @@ def _fault_ref(cfg, velmodel=None):
                 event_id=str(r.event_id))
 
 
-def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="depth"):
-    """Strike-parallel + strike-perpendicular depth sections and a fault-plane map view of the
-    HypoDD-relocated catalog, centred on a reference event. Strike/dip default to the
-    largest-magnitude high-confidence focal mechanism (override with `strike`/`dip`).
+def _best_fit_plane(x, y, z):
+    """Strike/dip (deg) of the best-fitting plane through points (x, y, z) via SVD — the data-driven
+    fault orientation. Ported from the original notebooks' `calculate_strike_dip_svd`: the plane
+    normal is the smallest-singular-value direction; flip it up, then dip = acos(n_up),
+    strike = atan2(n_north, -n_east) (Aki & Richards right-hand rule). x,y = HypoDD .reloc X,Y
+    (east, north), z = .reloc Z (up-positive). Needs ≥ 3 points."""
+    coords = np.column_stack((np.asarray(x, float), np.asarray(y, float), np.asarray(z, float)))
+    coords = coords - coords.mean(axis=0)
+    normal = np.linalg.svd(coords)[2][-1]
+    n_e, n_n, n_u = normal if normal[2] > 0 else -normal
+    dip = float(np.degrees(np.arccos(np.clip(n_u, -1.0, 1.0))))
+    strike = float((np.degrees(np.arctan2(n_n, -n_e)) + 360) % 360)
+    return strike, dip
 
-    Map view: relative E–N km with the two nodal-plane lines + the reference beachball. Sections:
-    along-strike and across-strike (the latter with the dashed fault line at the reference dip).
-    Needs a HypoDD `.reloc` (run ph2dt→dtcc) and, for the default strike, a focal-mechanism run."""
+
+def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
+    """Relocated seismicity in fault coordinates — a 2×2 figure styled after the original dt.cc
+    notebooks: (1) fault-plane map view, (2) along-strike depth section, (3) across-strike depth
+    section (with the dashed fault-dip line), (4) fault-plane (along-dip) view.
+
+    Orientation: explicit `strike`/`dip` win; otherwise the **best-fit plane of the relocated cloud**
+    (SVD) — the data-driven fault. The focal mechanism is only overlaid for comparison (beachball +
+    annotation), never forced as the frame, so under-constrained mechanisms can't distort the view.
+    Centred on the largest-magnitude event. Markers are coloured by origin time (`coolwarm`), sized by
+    magnitude, hollow with coloured edges. Reads the headline dt.cc relocation (dt.ct fallback)."""
+    import matplotlib.dates as mdates
+    import matplotlib.colors as mcolors
     from obspy.imaging.beachball import beach
-    velmodel = velmodel or cfg.fm_velmodel
-    reloc = os.path.join(config.dtcc_dir(cfg), "hypoDD.reloc")
-    if not os.path.exists(reloc):
-        reloc = os.path.join(config.dtct_dir(cfg), "hypoDD.reloc")
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5.4), dpi=120)
-    if not os.path.exists(reloc):
-        axes[1].set_title(f"{cfg.region}: no HypoDD reloc (run ph2dt→dtcc first)"); return fig
-    d = sumio.read_reloc(reloc)
-    if not len(d):
-        axes[1].set_title(f"{cfg.region}: empty reloc"); return fig
-    ref = _fault_ref(cfg, velmodel)
-    if strike is None:
-        strike = ref["strike"] if ref else None
-    if dip is None:
-        dip = ref["dip"] if ref else 90.0
-    if strike is None:
-        axes[1].set_title(f"{cfg.region}: no focal mechanism — pass strike=/dip=")
-        return fig
 
+    velmodel = velmodel or cfg.fm_velmodel
+    reloc, branch = _reloc_path(cfg)
+    fig, axarr = plt.subplots(2, 2, figsize=(11, 10), dpi=130, constrained_layout=True)
+    axes = axarr.ravel()
+    if not os.path.exists(reloc):
+        axes[0].set_title(f"{cfg.region}: no HypoDD reloc (run ph2dt→dtcc first)"); return fig
+    d = sumio.read_reloc(reloc).reset_index(drop=True)
+    if not len(d):
+        axes[0].set_title(f"{cfg.region}: empty reloc"); return fig
+
+    ref = _fault_ref(cfg, velmodel)          # focal mechanism — for overlay/comparison only
+
+    # --- orientation: explicit args > SVD best-fit plane of the cloud > focal mechanism ---
+    svd_strike = svd_dip = None
+    if len(d) >= 3:
+        svd_strike, svd_dip = _best_fit_plane(d.x, d.y, d.z)
+    used_strike = strike if strike is not None else (
+        svd_strike if svd_strike is not None else (ref["strike"] if ref else 0.0))
+    used_dip = dip if dip is not None else (
+        svd_dip if svd_dip is not None else (ref["dip"] if ref else 90.0))
+
+    # --- centre on the largest-magnitude event (reference); fallback = cloud centroid ---
     refrow = d[d.id == ref["cuspid"]] if ref else d.iloc[0:0]
+    if not len(refrow) and "mag" in d and d.mag.notna().any():
+        refrow = d.loc[[d.mag.idxmax()]]
     x0, y0, z0 = (float(refrow.iloc[0].x), float(refrow.iloc[0].y), float(refrow.iloc[0].z)) \
         if len(refrow) else (float(d.x.mean()), float(d.y.mean()), float(d.z.mean()))
-    rx, ry = (d.x - x0).to_numpy(), (d.y - y0).to_numpy()        # metres, relative to ref
-    th = np.deg2rad(90.0 - strike)
-    along = (rx * np.cos(th) + ry * np.sin(th)) / 1000.0         # km
-    across = (-rx * np.sin(th) + ry * np.cos(th)) / 1000.0
-    dep = -(d.z.to_numpy() - z0) / 1000.0                        # km, +down, relative to ref
-    cvals = d.depth.to_numpy() if color_by == "depth" else d.mag.to_numpy()
-    mag = d.mag.to_numpy()
-    sz = 25 + 12 * np.clip(mag, 0, None) ** 2 if np.nanmax(mag) > 0 else np.full(len(d), 45.0)
-    cmap = plt.get_cmap("viridis_r")
-    L = max(np.ptp(rx), np.ptp(ry)) / 1000.0 or 0.5             # map half-extent scale (km)
 
-    # panel 1 — fault-plane map view (relative E–N km)
+    rx, ry = (d.x - x0).to_numpy(), (d.y - y0).to_numpy()         # metres, relative to centre
+    th = np.deg2rad(90.0 - used_strike)
+    along = (rx * np.cos(th) + ry * np.sin(th)) / 1000.0          # km, +ve in strike azimuth
+    across = (-rx * np.sin(th) + ry * np.cos(th)) / 1000.0        # km
+    dep = -(d.z.to_numpy() - z0) / 1000.0                         # km, +down, rel. to centre
+    along_dip = across * np.cos(np.deg2rad(used_dip)) + dep * np.sin(np.deg2rad(used_dip))   # km
+
+    # --- colour (origin time by default, as in the originals) + magnitude-scaled hollow markers ---
+    mag = np.nan_to_num(d.mag.to_numpy(), nan=0.0)
+    sz = np.clip(5.0 * np.exp(2.0 * mag), 25, 1500)
+    if color_by == "time" and "time" in d and d.time.notna().any():
+        cv = np.array(mdates.date2num([t.datetime for t in d.time]))
+        norm = mcolors.Normalize(vmin=cv.min(), vmax=cv.max() if cv.max() > cv.min() else cv.min() + 1)
+        cmap = plt.get_cmap("coolwarm"); cbar_label = "Origin time"
+    elif color_by == "mag":
+        cv = mag; norm = mcolors.Normalize(vmin=cv.min(), vmax=max(cv.max(), cv.min() + 0.1))
+        cmap = plt.get_cmap("viridis"); cbar_label = "Magnitude"
+    else:
+        cv = d.depth.to_numpy(); norm = mcolors.Normalize(vmin=np.nanmin(cv), vmax=np.nanmax(cv))
+        cmap = plt.get_cmap("viridis_r"); cbar_label = "Depth (km)"
+    rgba = cmap(norm(cv))
+
+    def _style(ax):
+        ax.set_aspect("equal", "box"); ax.grid(True, linestyle=":", alpha=0.7)
+        ax.set_facecolor("#FAFAFA"); ax.tick_params(labelsize=11)
+
+    L = (max(np.ptp(rx), np.ptp(ry)) / 1000.0) or 0.2            # km, cloud half-extent
+    pad = 1.25 * L
+    su, du = np.sin(np.deg2rad(used_strike)), np.cos(np.deg2rad(used_strike))
+    # one symmetric square range for all section panels so equal-aspect panels pack uniformly
+    R = 1.15 * max(np.nanmax(np.abs(along)), np.nanmax(np.abs(across)),
+                   np.nanmax(np.abs(dep)), np.nanmax(np.abs(along_dip)), 1e-3)
+
+    # panel 1 — fault-plane map view (relative E–N km), with fault lines + section labels
     ax = axes[0]
-    for s_az, ls in ((strike, "-"), (strike + 90, "--")):
-        dx, dy = np.sin(np.deg2rad(s_az)), np.cos(np.deg2rad(s_az))
-        ax.plot([-L * dx, L * dx], [-L * dy, L * dy], color="0.4", lw=0.9, ls=ls, zorder=1)
-    ax.scatter(rx / 1000.0, ry / 1000.0, c=cvals, cmap=cmap, s=sz, edgecolor="k", lw=0.4, zorder=3)
+    ax.scatter(rx / 1000.0, ry / 1000.0, s=sz, facecolors="none", edgecolors=rgba,
+               linewidth=1.8, zorder=4)
+    ax.plot([-pad * su, pad * su], [-pad * du, pad * du], color="0.35", lw=1.1, ls="-", zorder=2)
+    ax.plot([pad * du, -pad * du], [-pad * su, pad * su], color="0.35", lw=1.1, ls="--", zorder=2)
     if ref and not np.isnan(ref["rake"]):
-        ax.add_collection(beach((strike, dip, ref["rake"]), xy=(-0.8 * L, 0.8 * L),
-                                width=0.5 * L, facecolor="0.5", edgecolor="k", linewidth=0.6, zorder=4))
-    ax.set(xlabel="E (km)", ylabel="N (km)", xlim=(-1.1 * L, 1.1 * L), ylim=(-1.1 * L, 1.1 * L),
-           title=f"Fault-plane map view (strike {strike:.0f}°)")
-    ax.set_aspect("equal", "box")
+        ax.add_collection(beach((ref["strike"], ref["dip"], ref["rake"]),
+                                xy=(-0.78 * pad, 0.78 * pad), width=0.34 * pad,
+                                facecolor="0.45", edgecolor="k", linewidth=0.8, zorder=5))
+    for sgn, lab in ((1, "A'"), (-1, "A")):                      # along-strike ends
+        ax.text(sgn * 0.97 * pad * su, sgn * 0.97 * pad * du, lab, fontsize=18, fontweight="bold",
+                ha="center", va="center", zorder=6)
+    for sgn, lab in ((1, "B"), (-1, "B'")):                      # across-strike ends
+        ax.text(sgn * 0.97 * pad * du, -sgn * 0.97 * pad * su, lab, fontsize=18, fontweight="bold",
+                ha="center", va="center", zorder=6)
+    ax.set(xlim=(-pad, pad), ylim=(-pad, pad), xlabel="E (km)", ylabel="N (km)",
+           title="Fault-plane map view"); _style(ax)
 
-    # panels 2,3 — along- and across-strike depth sections
-    for ax, dist, lab in ((axes[1], along, "Along-strike"), (axes[2], across, "Across-strike")):
-        sc = ax.scatter(dist, dep, c=cvals, cmap=cmap, s=sz, edgecolor="k", lw=0.4, zorder=3)
-        ax.invert_yaxis()
-        ax.set(xlabel="Distance (km)", ylabel="Depth rel. to reference (km)", title=lab)
-        ax.set_aspect("equal", "box")
-    # dashed fault line at the reference dip on the across-strike panel (clipped to the data
-    # depth range so a near-vertical dip doesn't blow up the axis)
-    xl, yl = axes[2].get_xlim(), axes[1].get_ylim()
-    xx = np.linspace(xl[0], xl[1], 50)
-    axes[2].plot(xx, xx * np.tan(np.deg2rad(dip)), color="k", lw=0.9, ls="--", zorder=1)
-    axes[2].set_xlim(xl); axes[2].set_ylim(yl)              # share the along-strike depth range
+    # panel 2 — along-strike depth section (A–A')
+    ax = axes[1]
+    ax.scatter(along, dep, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
+    ax.text(-0.92 * R, -0.88 * R, "A", fontsize=16, fontweight="bold")
+    ax.text(0.86 * R, -0.88 * R, "A'", fontsize=16, fontweight="bold")
+    ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Along-strike distance (km)",
+           ylabel="Depth rel. to reference (km)", title="Along-strike (A–A')")
+    _style(ax); ax.invert_yaxis()
 
-    plt.colorbar(sc, ax=axes, label="Depth (km)" if color_by == "depth" else "Magnitude", shrink=0.7)
-    rinfo = f"ref {ref['event_id']} (M{ref['mag']:.1f}, {ref['quality']})" if ref else "centroid"
-    fig.suptitle(f"{cfg.region} — relocated seismicity in fault coordinates "
-                 f"[strike {strike:.0f}°, dip {dip:.0f}°; {rinfo}]", fontsize=12)
+    # panel 3 — across-strike depth section (B–B'), with the dashed fault-dip line
+    ax = axes[2]
+    ax.scatter(across, dep, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
+    xx = np.linspace(-R, R, 50)
+    ax.plot(xx, xx * np.tan(np.deg2rad(used_dip)), color="k", lw=1.0, ls="--", zorder=1,
+            label=f"Dip {used_dip:.0f}°")
+    ax.text(-0.92 * R, -0.88 * R, "B", fontsize=16, fontweight="bold")
+    ax.text(0.86 * R, -0.88 * R, "B'", fontsize=16, fontweight="bold")
+    ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Across-strike distance (km)",
+           ylabel="Depth rel. to reference (km)", title="Across-strike (B–B')")
+    _style(ax); ax.invert_yaxis()
+    ax.legend(loc="lower right", fontsize=9)
+
+    # panel 4 — fault-plane (along-dip) view
+    ax = axes[3]
+    ax.scatter(along, along_dip, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
+    ax.text(-0.92 * R, -0.88 * R, "A", fontsize=16, fontweight="bold")
+    ax.text(0.86 * R, -0.88 * R, "A'", fontsize=16, fontweight="bold")
+    ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Along-strike distance (km)",
+           ylabel="Along-dip distance (km)", title="Fault-plane view (along-dip)")
+    _style(ax); ax.invert_yaxis()
+
+    # shared colour bar (origin time formatted as dates)
+    sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes.tolist(), shrink=0.85)
+    cbar.set_label(cbar_label)
+    if color_by == "time":
+        ticks = np.linspace(norm.vmin, norm.vmax, 5)
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels([mdates.num2date(t).strftime("%Y-%m-%d") for t in ticks])
+
+    src = "manual" if strike is not None else ("best-fit plane" if svd_strike is not None else "mechanism")
+    fmtxt = (f"; mechanism {ref['strike']:.0f}°/{ref['dip']:.0f}° ({ref['quality']})"
+             if ref else "")
+    fig.suptitle(f"{cfg.region} — relocated seismicity in fault coordinates ({branch})\n"
+                 f"strike {used_strike:.0f}°, dip {used_dip:.0f}° [{src}]{fmtxt}", fontsize=13)
     return fig
 
 
@@ -413,8 +529,30 @@ def compare_epicenters(cfg, velmodel="kim1983", variant="default"):
     for ax, df, lab in ((a1, ct, "dt.ct"), (a2, cc, f"dt.cc:{variant}")):
         if len(df):
             sc = ax.scatter(df.lon, df.lat, c=df.depth, s=60, cmap="viridis_r", edgecolor="k")
-            plt.colorbar(sc, ax=ax, label="depth (km)", shrink=0.8)
-        ax.set(xlabel="longitude", ylabel="latitude", title=f"{cfg.region} — {lab} ({len(df)} ev)")
+            plt.colorbar(sc, ax=ax, label="Depth (km)", shrink=0.8)
+        ax.set(xlabel="Longitude", ylabel="Latitude", title=f"{cfg.region} — {lab} ({len(df)} ev)")
         ax.set_aspect("equal", "datalim")
     fig.tight_layout()
     return fig
+
+
+def relocation_counts(cfg, velmodel="kim1983"):
+    """Located-event counts at each stage — `.sum` (HYPOINVERSE absolute), dt.ct (catalog
+    relocation), dt.cc (cross-correlation relocation, the high-end product). Counts shrink
+    `.sum ≥ dt.ct ≥ dt.cc` because HypoDD keeps only events with enough inter-event links: dt.ct
+    drops events isolated in catalog differential-time space, and dt.cc further drops events whose
+    waveforms don't cross-correlate well. (Each HypoDD run re-clusters independently, so the
+    ordering is not strictly monotonic.) Returns a tidy DataFrame."""
+    def _n(path, kind):
+        if not os.path.exists(path):
+            return None
+        try:
+            return int(len(sumio.read_sum(path) if kind == "sum" else sumio.read_reloc(path)))
+        except Exception:
+            return None
+    rows = [
+        (".sum (absolute)", _n(config.sum_file(cfg, velmodel), "sum")),
+        ("dt.ct (catalog)", _n(os.path.join(config.dtct_dir(cfg), "hypoDD.reloc"), "reloc")),
+        ("dt.cc (cross-corr, high-end)", _n(os.path.join(config.dtcc_dir(cfg), "hypoDD.reloc"), "reloc")),
+    ]
+    return pd.DataFrame([{"stage": s, "events": n} for s, n in rows])

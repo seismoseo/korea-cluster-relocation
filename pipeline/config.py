@@ -58,6 +58,9 @@ PNPLUS_HIGHPASS = float(os.environ.get("PNPLUS_HIGHPASS", "0.0"))   # Hz; 0 = ra
 PNPLUS_NT = int(os.environ.get("PNPLUS_NT", str(1024 * 36)))        # samples per inference patch
 # SKHASH focal-mechanism tool (needed only for the focal_mechanism stage).
 SKHASH_DIR = os.environ.get("SKHASH_DIR", "/home/msseo/works/44.SKHASH/SKHASH/SKHASH")
+# Optional Helvetica fonts for plot text (viz.py registers them if present; falls back to the
+# matplotlib default sans-serif otherwise, so a public clone never breaks).
+HELVETICA_DIR = os.environ.get("HELVETICA_DIR", "/home/msseo/Downloads/Helvetica")
 
 
 # ----------------------------------------------------------- parameter blocks

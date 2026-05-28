@@ -141,11 +141,27 @@ ratios only where the P and S SNR ≥ `fm_sp_min_snr` (3). Of the 11 events, **3
 (leader line to each epicenter); polarity is the primary signal, the vertical-component S/P ratio a
 secondary enhancement. The lower-quality (C/D) solutions are kept only for context.*
 
-`03_results.ipynb` shows all the key figures together: locations (absolute `.sum` + dt.ct/dt.cc
-relocation), **picks with first-motion polarity** (`viz.plot_3c` + `viz.plot_polarities`, a P-aligned
-record section sorted by azimuth), the focal mechanisms above, and **`viz.fault_sections`** — the
-relocated catalog rotated into the fault frame (map view with nodal planes + along-/across-strike
-sections) using the largest-magnitude mechanism's strike.
+![Gwangyang seismicity in fault coordinates](docs/figs/gwangyang_fault_sections.png)
+
+*The dt.cc relocation rotated into the fault frame (`viz.fault_sections`): fault-plane map view,
+along-strike (A–A') and across-strike (B–B') depth sections, and the fault-plane along-dip view, coloured
+by origin time. The orientation is the relocation cloud's best-fit plane (strike ≈ 108°, dip ≈ 80°) — which
+coincides with the focal mechanism's nodal plane — and the tight across-strike spread confirms a
+near-vertical, near-planar fault.*
+
+`03_results.ipynb` shows all the key figures together: locations (absolute `.sum` + the headline **dt.cc**
+relocation; `viz.relocation_counts` tabulates the per-stage event counts), **picks with first-motion
+polarity** (`viz.plot_3c` + `viz.plot_polarities`, a P-aligned record section sorted by azimuth), the
+focal mechanisms above, and **`viz.fault_sections`** — the relocated catalog rotated into the fault frame
+(a 2×2 figure: fault-plane map view, along-strike + across-strike depth sections, and a fault-plane
+along-dip view), coloured by origin time and **oriented to the relocation cloud's own best-fit plane
+(SVD), with the focal mechanism overlaid for comparison** (pass `strike=`/`dip=` to override).
+
+**Located-event counts shrink `.sum ≥ dt.ct ≥ dt.cc`.** `.sum` is every event HYPOINVERSE locates
+absolutely; **dt.ct** keeps only events with enough catalog differential-time links (isolated events
+drop); **dt.cc** re-clusters on waveform cross-correlation and keeps only well-correlating events.
+**dt.cc is the high-end product** (location errors of metres vs tens of metres for dt.ct) — it is the
+headline relocation in the notebooks.
 
 **Other clusters.** All four clusters relocate (locations + dt.cc), but only **Gwangyang** has the
 focal-sphere coverage for *well-constrained* mechanisms. Jangsung/Kimcheon events are shallow (~0.3–6 km),
