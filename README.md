@@ -110,17 +110,21 @@ Auxiliary QC (station misorientation, ZRT rotation, waveform similarity) is in
 
 ## Example — Gwangyang focal mechanisms
 
-Pick with PhaseNet+ (emits polarity + S/P amplitude), locate, then invert with SKHASH:
+Run the full pipeline with PhaseNet+ (emits polarity + S/P amplitude), then invert with SKHASH:
 
 ```bash
 PY=python
-$PY -m pipeline.cli.run_pipeline --cluster gwangyang --picker phasenet_plus --through hypoinverse
+# full relocation chain with the PhaseNet+ picker (pin cores — xcorr is heavy):
+taskset -c 0-9 $PY -m pipeline.cli.run_pipeline --cluster gwangyang --picker phasenet_plus \
+    --through dtcc --cores 10
+# focal mechanisms:
 $PY -m pipeline.cli.run_pipeline --cluster gwangyang --picker phasenet_plus \
     --stage-from focal_mechanism --through focal_mechanism
 # then view: pipeline/notebooks/03_results.ipynb  (CLUSTER="gwangyang", RUN_SUFFIX="_pnplus")
 ```
 
-Of the 11 events, **4 are well constrained (quality A/B)** and agree closely — near-vertical,
+The PhaseNet+ HypoDD relocation agrees with the trusted `stead` baseline to ≈100 m (depth within
+≈0.3 km). Of the 11 events, **4 are well constrained (quality A/B)** and agree closely — near-vertical,
 roughly N-striking strike-slip — consistent with a coherent fault source:
 
 | Event | Quality | Strike | Dip | Rake | Fault-plane uncert. | P polarities | S/P ratios |
@@ -135,6 +139,10 @@ roughly N-striking strike-slip — consistent with a coherent fault source:
 *Located epicenters (depth-coloured dots) with the high-confidence beachballs offset on a ring
 (leader line to each epicenter); polarity is the primary signal, the vertical-component S/P ratio a
 secondary enhancement. The lower-quality (C/D) solutions are kept only for context.*
+
+`03_results.ipynb` shows all the key figures together: locations (absolute `.sum` + dt.ct/dt.cc
+relocation), **picks with first-motion polarity** (`viz.plot_3c` + `viz.plot_polarities`, a P-aligned
+record section sorted by azimuth), and the focal mechanisms above.
 
 ## Adding a new cluster
 

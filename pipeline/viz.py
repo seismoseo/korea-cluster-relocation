@@ -76,10 +76,15 @@ def plot_picks(cfg, event_id, station=None, comp="Z", pre=5, post=25):
     ax.plot(w.times(), w.data, "k", lw=0.5)
     for _, r in sp.iterrows():
         pt = UTCDateTime(r["Time"]) - w.stats.starttime
-        c = "r" if r["Phase"] == "P" else "b"
+        is_p = r["Phase"] == "P"
+        c = "r" if is_p else "b"
         ax.axvline(pt, color=c, lw=1.5)
-        ax.text(pt, ax.get_ylim()[1] * 0.8, f"{r['Phase']} {r['Probability']}", color=c, fontsize=8)
-    ax.set(xlabel="time (s)", title=f"{cfg.region} {event_id} — {station}.{sensor}{comp} (red=P, blue=S)")
+        lab = f"{r['Phase']} {r['Probability']}"
+        pol = r.get("Polarity") if hasattr(r, "get") else (r["Polarity"] if "Polarity" in r else None)
+        if is_p and pol is not None and pd.notna(pol) and pol != "":
+            lab += f"  {'↑' if float(pol) >= 0 else '↓'}{float(pol):+.2f}"   # first-motion polarity
+        ax.text(pt, ax.get_ylim()[1] * 0.8, lab, color=c, fontsize=8)
+    ax.set(xlabel="Time (s)", title=f"{cfg.region} {event_id} — {station}.{sensor}{comp} (red=P, blue=S)")
     fig.tight_layout()
     return fig
 
@@ -114,6 +119,13 @@ def plot_3c(cfg, event_id, station=None, pre=5, post=25):
     if station is None or station not in sta.index:
         axes[0].set_title(f"{cfg.region} {event_id}: no station data"); return fig
     sensor = sta.loc[station, "Sensor"]
+    pol = None                                  # first-motion polarity (P) from the picks CSV
+    pc = config.picks_csv(cfg, event_id)
+    if os.path.exists(pc):
+        pp = pd.read_csv(pc)
+        pp = pp[(pp.Station == station) & (pp.Phase == "P")]
+        if len(pp) and "Polarity" in pp.columns and pd.notna(pp.iloc[0]["Polarity"]):
+            pol = float(pp.iloc[0]["Polarity"])
     for ax, comp in zip(axes, ("Z", "N", "E")):
         m = glob.glob(f"{wf}/{event_id}.*.{station}.{sensor}{comp}.sac")
         if not m:
@@ -128,9 +140,76 @@ def plot_3c(cfg, event_id, station=None, pre=5, post=25):
             v = s.get(hdr, -12345.0)
             if v != -12345.0:
                 ax.axvline((ref + v) - ptime, color=col, lw=1.3)
+        if comp == "Z" and pol is not None:     # mark P first-motion polarity on the vertical
+            ax.annotate(f"{'↑' if pol >= 0 else '↓'}{pol:+.2f}", xy=(0, 0.86),
+                        xycoords=("data", "axes fraction"),
+                        color=("r" if pol >= 0 else "b"), fontsize=10, fontweight="bold", ha="center")
         ax.set_ylabel(f"{sensor}{comp}")
-    axes[0].set_title(f"{cfg.region} {event_id} — {station} (red=P, blue=S; t=0 at P)")
-    axes[-1].set_xlabel("time from P (s)")
+    pol_txt = "" if pol is None else f"; P polarity {'↑ up' if pol >= 0 else '↓ down'} ({pol:+.2f})"
+    axes[0].set_title(f"{cfg.region} {event_id} — {station} (red=P, blue=S; t=0 at P{pol_txt})")
+    axes[-1].set_xlabel("Time from P (s)")
+    fig.tight_layout()
+    return fig
+
+
+def plot_polarities(cfg, event_id, win=0.4, sort="azimuth", min_weight=0.0, max_stations=45):
+    """First-motion record section: P-aligned vertical-component snippets (±`win` s around the P
+    pick), one per station, sorted by source→station azimuth, coloured by the PhaseNet+ first-motion
+    polarity (up = red, down = blue; |polarity| sets opacity). A ↑/↓ marker + station + azimuth +
+    polarity are annotated at each trace. This is the up/down-vs-azimuth pattern that constrains the
+    focal mechanism. Needs a phasenet_plus picks CSV (with the `Polarity` column)."""
+    from obspy.geodetics.base import gps2dist_azimuth
+    pc = config.picks_csv(cfg, event_id)
+    fig, ax = plt.subplots(figsize=(7.5, 8), dpi=120)
+    if not os.path.exists(pc):
+        ax.set_title(f"{cfg.region} {event_id}: no picks"); return fig
+    picks = pd.read_csv(pc)
+    if "Polarity" not in picks.columns:
+        ax.set_title(f"{cfg.region} {event_id}: no polarity (needs a phasenet_plus picking run)")
+        return fig
+    P = picks[(picks.Phase == "P") & picks.Polarity.notna()].copy()
+    P = P[P.Polarity.abs() >= min_weight]
+    sta = pd.read_csv(config.used_stations_csv(cfg)).set_index("Code")
+    wf = config.event_wf_dir(cfg, event_id)
+    rows = []
+    for _, r in P.iterrows():
+        code = r.Station
+        if code not in sta.index:
+            continue
+        m = glob.glob(f"{wf}/{event_id}.*.{code}.{sta.loc[code, 'Sensor']}Z.sac")
+        if not m:
+            continue
+        tr = read(m[0])[0]
+        s = tr.stats.sac
+        try:
+            az = gps2dist_azimuth(s.evla, s.evlo, s.stla, s.stlo)[1]
+        except Exception:                       # noqa: BLE001
+            az = np.nan
+        pt = UTCDateTime(r.Time)
+        w = tr.copy().detrend("demean").slice(pt - win, pt + win)
+        if len(w.data) < 3:
+            continue
+        d = w.data.astype(float)
+        d = d / (np.max(np.abs(d)) or 1.0)
+        rows.append(dict(code=code, az=float(az), pol=float(r.Polarity),
+                         t=w.times() - (pt - w.stats.starttime), d=d))
+    if not rows:
+        ax.set_title(f"{cfg.region} {event_id}: no usable first motions"); return fig
+    rows = sorted(rows, key=lambda x: (x["az"] if sort == "azimuth" else x["code"]))[:max_stations]
+    for i, rr in enumerate(rows):
+        up = rr["pol"] >= 0
+        col = "tab:red" if up else "tab:blue"
+        ax.axhline(i, color="0.9", lw=0.3, zorder=0)
+        ax.plot(rr["t"], rr["d"] * 0.45 + i, color=col, lw=0.7,
+                alpha=0.35 + 0.6 * min(abs(rr["pol"]), 1.0))
+        ax.annotate("↑" if up else "↓", xy=(0, i), color=col, fontsize=11,
+                    fontweight="bold", ha="center", va="center")
+        ax.text(-win * 1.03, i, rr["code"], ha="right", va="center", fontsize=7)
+        ax.text(win * 1.03, i, f"{rr['az']:.0f}° {rr['pol']:+.2f}", ha="left", va="center", fontsize=7)
+    ax.axvline(0, color="0.4", lw=0.8, ls="--")
+    ax.set(xlabel="Time from P (s)", yticks=[], xlim=(-win * 1.35, win * 1.45), ylim=(-1, len(rows)),
+           title=f"{cfg.region} {event_id} — P first-motion polarity "
+                 f"(red = up, blue = down; sorted by azimuth, n={len(rows)})")
     fig.tight_layout()
     return fig
 
