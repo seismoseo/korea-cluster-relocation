@@ -70,6 +70,15 @@ falling back to the matplotlib default otherwise.
   `--cores`/`cfg.num_cores`, and coarsen `xcorr.slide_step` for quick looks (0.001 = final grid).
 - **dt.cc is report-only** in regression (hand-tuned/judgment-dependent); the hard gates are stations,
   picks, `.sum`, and dt.ct. `shape_corr` = cluster-geometry fidelity (translation/rotation-invariant).
+- **Adaptive LSQR dt.cc tuning** (`core/hypodd.py`, only when `isolv==2` — forced when the dt set exceeds
+  the SVD MAXDATA0 limit; dt.ct baselines untouched). HypoDD LSQR needs the right damping and inter-event
+  distance cutoffs or poorly-linked events destabilise the solution. `run_dtcc` modulates both: (1) the
+  WDCC/WDCT **distance cutoffs are scaled to the cluster size** (`_cluster_diameter_km` from the dt.ct
+  reloc; `_scale_distance_cutoffs`, ref `DTCC_DIST_REF_KM`=1.5) so a compact cluster cuts long-distance
+  pairs and spatially peripheral / zero-cross-correlation events drop out; (2) **DAMP is auto-tuned per
+  weighting set so the condition number lands in ~40–80** (`_exec_hypodd` parses per-iteration CND from
+  `hypoDD.log`, re-runs until in band; writes `damping_calibration.txt`). E.g. Kimcheon: CND 196→~60, the
+  3 zero-CC fliers (one at 8 km depth) removed, dt.cc SVD fault plane 322°→40° (matching its mechanisms).
 - **Run things politely** on the shared box (taskset + bounded cores). Verify no baseline drift with
   `python -m pipeline.regression.freeze_baseline verify`.
 - Adding a cluster: see README "Adding a cluster" (`_base.kma_cluster` factory or a bespoke `stp_sac`

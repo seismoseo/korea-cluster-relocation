@@ -13,12 +13,21 @@ The dt.cc cross-correlation branch is built in core/xcorr.py + run_dtcc here.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
+import re
 import shutil
 import subprocess
 from glob import glob
 
 from pipeline import config
+
+# dt.cc inter-event distance cutoffs (WDCC/WDCT) are scaled to the cluster size when LSQR is used:
+# a cluster of diameter >= DTCC_DIST_REF_KM keeps the configured cutoffs; tighter clusters shrink
+# them (so long-distance pairs to spatially peripheral, poorly-linked events are cut and those
+# events drop out instead of destabilising the LSQR solution). Never tighter than DTCC_DIST_FMIN x.
+DTCC_DIST_REF_KM = 1.5
+DTCC_DIST_FMIN = 0.1
 
 
 # ---------------------------------------------------------------- ph2dt prep
@@ -104,13 +113,15 @@ def run_ph2dt(cfg):
 
 
 # ------------------------------------------------------------- hypoDD.inp
-def build_hypodd_inp(inp) -> str:
+def build_hypodd_inp(inp, iter_sets=None) -> str:
     """Render a hypoDD.inp string from a HypoDDInp. The first (cross-correlation)
-    data line is left blank when inp.cc_file is None -> catalog-only relocation."""
+    data line is left blank when inp.cc_file is None -> catalog-only relocation.
+    `iter_sets` overrides inp.iter_sets (used by the adaptive-damping loop)."""
     # cc and src are read by HypoDD's getinp as filename lines; blank => none.
     cc = inp.cc_file or ""
     src = ""
-    iters = "\n".join("    " + "  ".join(str(x) for x in row) for row in inp.iter_sets)
+    rows = inp.iter_sets if iter_sets is None else iter_sets
+    iters = "\n".join("    " + "  ".join(str(x) for x in row) for row in rows)
     top = "  ".join(str(x) for x in inp.top)
     vel = "  ".join(str(x) for x in inp.vel)
     return f"""* RELOC.INP
@@ -140,7 +151,7 @@ hypoDD.res
 *--- event clustering: OBSCC OBSCT
     {inp.obscc}      {inp.obsct}
 *--- solution control: ISTART ISOLV NSET
-    {inp.istart}       {inp.isolv}       {len(inp.iter_sets)}
+    {inp.istart}       {inp.isolv}       {len(rows)}
 *--- data weighting: NITER WTCCP WTCCS WRCC WDCC WTCTP WTCTS WRCT WDCT DAMP
 {iters}
 *--- 1D model: NLAY RATIO
@@ -154,8 +165,8 @@ hypoDD.res
 """
 
 
-def _exec_hypodd(d):
-    """Run hypoDD in directory `d` (which must already hold hypoDD.inp + inputs),
+def _exec_hypodd_once(d):
+    """Run hypoDD once in directory `d` (which must already hold hypoDD.inp + inputs),
     capture stdout to hypoDD.sum, archive per-iteration *.reloc.0* into reloc/, and
     guard against an empty reloc (the MAXDATA0 overflow). Returns the hypoDD.reloc path."""
     os.makedirs(os.path.join(d, "reloc"), exist_ok=True)
@@ -176,6 +187,134 @@ def _exec_hypodd(d):
     return reloc
 
 
+_CND_RE = re.compile(r"acond \(CND\)=\s*([0-9.]+)")
+_KV_RE = re.compile(r"([a-z_]+)=\s*(-?[0-9.]+)")
+
+
+def _parse_iteration_cnds(log_path):
+    """Pair each LSQR iteration's weighting signature with its condition number, from hypoDD.log.
+
+    Each iteration prints a `Weighting parameters for this iteration:` block (wt_ccp/wt_ccs/maxr_cc/
+    maxd_cc, wt_ctp/wt_cts/maxr_ct/maxd_ct, damp) followed by `... acond (CND)= <value>`. Returns a
+    list of (signature, cnd) where signature = (wt_ccp,wt_ccs,maxr_cc,maxd_cc,wt_ctp,wt_cts,maxr_ct,
+    maxd_ct) — enough to match each iteration to its iter_sets row regardless of NITER bookkeeping."""
+    out, cur = [], None
+    if not os.path.exists(log_path):
+        return out
+    for line in open(log_path, errors="ignore"):
+        if "Weighting parameters for this iteration" in line:
+            cur = {}
+        elif cur is not None and ("wt_ccp=" in line or "wt_ctp=" in line):
+            cur.update({k: float(v) for k, v in _KV_RE.findall(line)})
+        elif cur is not None and "acond (CND)=" in line:
+            m = _CND_RE.search(line)
+            if m:
+                sig = tuple(cur.get(k) for k in ("wt_ccp", "wt_ccs", "maxr_cc", "maxd_cc",
+                                                 "wt_ctp", "wt_cts", "maxr_ct", "maxd_ct"))
+                out.append((sig, float(m.group(1))))
+            cur = None
+    return out
+
+
+def _max_cnd_per_set(log_path, iter_sets, tol=0.02):
+    """Worst (max) condition number per weighting set, matching each logged iteration to its
+    iter_sets row by weighting signature (row cols 1..8 = WTCCP..WDCT). Returns {row_idx: max_cnd}."""
+    res = {}
+    for sig, cnd in _parse_iteration_cnds(log_path):
+        if any(v is None for v in sig):
+            continue
+        for i, row in enumerate(iter_sets):
+            rsig = [float(x) for x in row[1:9]]
+            if all(abs(a - b) <= tol + tol * abs(b) for a, b in zip(sig, rsig)):
+                res[i] = max(res.get(i, 0.0), cnd)
+                break
+    return res
+
+
+def _cluster_diameter_km(cfg):
+    """Characteristic cluster diameter (km) from the dt.ct relocation = 2 x the 95th-percentile
+    epicentral distance from the centroid. Used to size the dt.cc inter-event distance cutoffs.
+    Returns None if there is no dt.ct relocation yet."""
+    import numpy as np
+    from pipeline.core import sumio
+    p = os.path.join(config.dtct_dir(cfg), "hypoDD.reloc")
+    if not os.path.exists(p):
+        return None
+    d = sumio.read_reloc(p)
+    if not len(d):
+        return None
+    r = np.sqrt((d.x - d.x.mean()) ** 2 + (d.y - d.y.mean()) ** 2) / 1000.0
+    return 2.0 * float(np.percentile(r, 95))
+
+
+def _scale_distance_cutoffs(iter_sets, cluster_km, ref_km=DTCC_DIST_REF_KM, fmin=DTCC_DIST_FMIN):
+    """Scale each weighting set's inter-event distance cutoffs (WDCC = col 4, WDCT = col 8) to the
+    cluster size: factor f = clamp(cluster_km / ref_km, fmin, 1). A '-9' (no cutoff) stays '-9'.
+    Returns (scaled_iter_sets, f)."""
+    f = min(1.0, max(fmin, cluster_km / ref_km))
+    out = []
+    for row in iter_sets:
+        row = list(row)
+        for col in (4, 8):
+            if row[col] != -9:
+                row[col] = round(row[col] * f, 2)
+        out.append(tuple(row))
+    return tuple(out), f
+
+
+def _exec_hypodd(d, inp, adapt_damping=False, cnd_range=(40.0, 80.0), max_attempts=12):
+    """Run hypoDD in `d`, writing hypoDD.inp from `inp`. For LSQR runs with `adapt_damping`, modulate
+    each weighting set's DAMP so its condition number (CND) lands in `cnd_range` — the HypoDD-
+    recommended ~40–80 band. SVD (isolv=1) has no damping to tune, so it just runs once.
+
+    Why: with LSQR (forced when the dt data exceeds the SVD MAXDATA0 limit) a too-small DAMP leaves
+    the system ill-conditioned (CND ≫ 80); poorly-linked events (e.g. those with no cross-correlation
+    data) then take wild, unstable steps. Higher DAMP lowers CND and stabilises them. HypoDD is cheap
+    for these clusters, so we iterate: run → read CND per set → nudge DAMP toward the band → re-run."""
+    if not (adapt_damping and getattr(inp, "isolv", 1) == 2):
+        with open(os.path.join(d, "hypoDD.inp"), "w") as f:
+            f.write(build_hypodd_inp(inp))
+        return _exec_hypodd_once(d)
+
+    lo, hi = cnd_range
+    mid = (lo + hi) / 2.0
+    sets = [list(r) for r in inp.iter_sets]                 # mutable working copy (DAMP = col -1)
+    int_damp = [isinstance(r[-1], int) for r in inp.iter_sets]
+    best, history, reloc = None, [], None
+    for attempt in range(max_attempts):
+        with open(os.path.join(d, "hypoDD.inp"), "w") as f:
+            f.write(build_hypodd_inp(inp, iter_sets=sets))
+        reloc = _exec_hypodd_once(d)
+        cnds = _max_cnd_per_set(os.path.join(d, "hypoDD.log"), sets)
+        if not cnds:                                        # nothing to tune on (e.g. no CND logged)
+            break
+        score = max(max(0.0, c - hi) + max(0.0, lo - c) for c in cnds.values())
+        history.append(([s[-1] for s in sets], {k: round(v, 1) for k, v in sorted(cnds.items())},
+                        round(score, 1)))
+        if best is None or score < best[0]:
+            best = (score, [list(r) for r in sets])
+        if score <= 0.0:                                    # every set inside the band
+            break
+        for i, c in cnds.items():                           # higher DAMP -> lower CND
+            newd = sets[i][-1] * (c / mid) ** 0.5
+            newd = min(2000.0, max(1.0, newd))
+            sets[i][-1] = int(round(newd)) if int_damp[i] else round(newd, 2)
+    # make the returned reloc correspond to the best damping found
+    if best is not None and [list(r) for r in sets] != best[1]:
+        with open(os.path.join(d, "hypoDD.inp"), "w") as f:
+            f.write(build_hypodd_inp(inp, iter_sets=best[1]))
+        reloc = _exec_hypodd_once(d)
+    if history:
+        with open(os.path.join(d, "damping_calibration.txt"), "w") as f:
+            f.write(f"adaptive LSQR damping — target CND {lo:.0f}-{hi:.0f}\n"
+                    "attempt: DAMP per set -> max CND per set (worst-band violation)\n")
+            for a, (damps, cnds, score) in enumerate(history):
+                f.write(f"  {a}: {damps} -> {cnds}  (score {score})\n")
+            if best is not None:
+                f.write(f"chosen DAMP per set: {[r[-1] for r in best[1]]}\n")
+    return reloc
+
+
 def run_dtct(cfg):
     """Catalog-only (dt.ct) HypoDD relocation; returns the hypoDD.reloc path."""
     src = config.ph2dt_dir(cfg)
@@ -185,9 +324,8 @@ def run_dtct(cfg):
         s = os.path.join(src, fn)
         if os.path.exists(s):
             shutil.copyfile(s, os.path.join(d, fn))
-    with open(os.path.join(d, "hypoDD.inp"), "w") as f:
-        f.write(build_hypodd_inp(cfg.hypodd_dtct))
-    return _exec_hypodd(d)
+    # dt.ct is a hard regression baseline — keep its damping fixed (no adaptive tuning).
+    return _exec_hypodd(d, cfg.hypodd_dtct, adapt_damping=False)
 
 
 def _event_cuspid(cfg, event_id, velmodel="kim1983"):
@@ -233,9 +371,19 @@ def run_dtcc(cfg, variant="default"):
                 f"cross-correlation file {cc_src} not found — run the xcorr stage first.")
         if os.path.realpath(d) != os.path.realpath(base):
             shutil.copyfile(cc_src, os.path.join(d, inp.cc_file))
-    with open(os.path.join(d, "hypoDD.inp"), "w") as f:
-        f.write(build_hypodd_inp(inp))
-    return _exec_hypodd(d)
+    # dt.cc is report-only (judgment-dependent). When LSQR is forced (large dt set vs the SVD
+    # MAXDATA0 limit), flexibly modulate two ill-conditioning levers: (1) the inter-event distance
+    # cutoffs, scaled to the cluster size so spatially peripheral / poorly-linked events drop out;
+    # (2) DAMP, tuned so the condition number stays in the ~40–80 band.
+    adapt = (inp.isolv == 2)
+    if adapt:
+        L = _cluster_diameter_km(cfg)
+        if L:
+            scaled, f = _scale_distance_cutoffs(inp.iter_sets, L)
+            inp = dataclasses.replace(inp, iter_sets=scaled)
+            print(f"  [dt.cc:{variant}] LSQR: cluster diameter {L:.2f} km -> distance-cutoff "
+                  f"scale {f:.2f}; adaptive damping on (CND target 40-80)")
+    return _exec_hypodd(d, inp, adapt_damping=adapt)
 
 
 def run_backbone(cfg, velmodel="kim1983"):
