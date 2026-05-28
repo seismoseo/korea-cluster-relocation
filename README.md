@@ -106,7 +106,8 @@ cross-correlates **all** event pairs — keep iterations cheap with a small `SUB
 Auxiliary QC (station misorientation, ZRT rotation, waveform similarity) is in
 `pipeline/notebooks/01_qc.ipynb`; a quick run-all + regression dashboard is `00_run_and_inspect.ipynb`.
 **Results presentation** — locations and focal mechanisms together — is `03_results.ipynb`
-(set `CLUSTER` / `RUN_SUFFIX`).
+(set `CLUSTER` / `RUN_SUFFIX`); pre-configured per-cluster copies are `03_results_<cluster>.ipynb`
+(kimcheon / jangsung / gyeongju).
 
 ## Example — Gwangyang focal mechanisms
 
