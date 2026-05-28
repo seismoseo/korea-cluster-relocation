@@ -396,17 +396,25 @@ def _fault_ref(cfg, velmodel=None):
                 event_id=str(r.event_id))
 
 
+def _svd_normal(x, y, z):
+    """Unit normal of the least-squares plane through points (x, y, z) — the smallest-singular-value
+    (SVD) direction of the centred coordinates. Returned in the SAME coordinate frame as the inputs."""
+    c = np.column_stack((np.asarray(x, float), np.asarray(y, float), np.asarray(z, float)))
+    c = c - c.mean(axis=0)
+    n = np.linalg.svd(c)[2][-1]
+    return n / (np.linalg.norm(n) or 1.0)
+
+
 def _best_fit_plane(x, y, z):
-    """Strike/dip (deg) of the best-fitting plane through points (x, y, z) via SVD — the data-driven
-    fault orientation. Ported from the original notebooks' `calculate_strike_dip_svd`: the plane
-    normal is the smallest-singular-value direction; flip it up, then dip = acos(n_up),
-    strike = atan2(n_north, -n_east) (Aki & Richards right-hand rule). x,y = HypoDD .reloc X,Y
-    (east, north), z = .reloc Z (up-positive). Needs ≥ 3 points."""
-    coords = np.column_stack((np.asarray(x, float), np.asarray(y, float), np.asarray(z, float)))
-    coords = coords - coords.mean(axis=0)
-    normal = np.linalg.svd(coords)[2][-1]
-    n_e, n_n, n_u = normal if normal[2] > 0 else -normal
-    dip = float(np.degrees(np.arccos(np.clip(n_u, -1.0, 1.0))))
+    """Strike/dip (deg) of the best-fit plane through (x, y, z) via SVD — the data-driven fault
+    orientation (ported from the originals' `calculate_strike_dip_svd`). x, y = HypoDD .reloc X, Y
+    (East, North); **z = .reloc Z, which is positive DOWN** (Z tracks the `depth` column, +1000 m/km).
+    Dip = the plane's angle from horizontal = arccos|n_vertical| (independent of the up/down sense);
+    strike is the horizontal trend — a line, so its 180° sense is irrelevant to the along/across
+    sections. Needs ≥ 3 points."""
+    n = _svd_normal(x, y, z)
+    n_e, n_n, n_d = n if n[2] >= 0 else -n
+    dip = float(np.degrees(np.arccos(np.clip(abs(n_d), -1.0, 1.0))))
     strike = float((np.degrees(np.arctan2(n_n, -n_e)) + 360) % 360)
     return strike, dip
 
@@ -457,7 +465,7 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
     th = np.deg2rad(90.0 - used_strike)
     along = (rx * np.cos(th) + ry * np.sin(th)) / 1000.0          # km, +ve in strike azimuth
     across = (-rx * np.sin(th) + ry * np.cos(th)) / 1000.0        # km
-    dep = -(d.z.to_numpy() - z0) / 1000.0                         # km, +down, rel. to centre
+    dep = (d.z.to_numpy() - z0) / 1000.0                          # km, +down (Z is positive down)
     along_dip = across * np.cos(np.deg2rad(used_dip)) + dep * np.sin(np.deg2rad(used_dip))   # km
 
     # --- colour (origin time by default, as in the originals) + magnitude-scaled hollow markers ---
@@ -514,12 +522,20 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
            ylabel="Depth rel. to reference (km)", title="Along-strike (A–A')")
     _style(ax); ax.invert_yaxis()
 
-    # panel 3 — across-strike depth section (B–B'), with the dashed fault-dip line
+    # panel 3 — across-strike depth section (B–B'), with the dashed fault-dip line. Draw the actual
+    # trace of the best-fit plane in this section (from the SVD normal, rotated into fault coords),
+    # through the cloud centre — so the line dips the correct way and overlays the data.
     ax = axes[2]
     ax.scatter(across, dep, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
+    nrm = _svd_normal(d.x, d.y, d.z)                             # (E, N, down)
+    n_ac = -nrm[0] * np.sin(th) + nrm[1] * np.cos(th)            # across-strike component
+    ac0, dp0 = float(np.mean(across)), float(np.mean(dep))
     xx = np.linspace(-R, R, 50)
-    ax.plot(xx, xx * np.tan(np.deg2rad(used_dip)), color="k", lw=1.0, ls="--", zorder=1,
-            label=f"Dip {used_dip:.0f}°")
+    if abs(nrm[2]) > 1e-6:                                       # depth = dp0 − (n_across/n_down)(across−ac0)
+        ax.plot(xx, dp0 - (n_ac / nrm[2]) * (xx - ac0), color="k", lw=1.0, ls="--", zorder=1,
+                label=f"Dip {used_dip:.0f}°")
+    else:                                                        # vertical plane
+        ax.axvline(ac0, color="k", lw=1.0, ls="--", zorder=1, label=f"Dip {used_dip:.0f}°")
     ax.text(-0.92 * R, -0.88 * R, "B", fontsize=16, fontweight="bold")
     ax.text(0.86 * R, -0.88 * R, "B'", fontsize=16, fontweight="bold")
     ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Across-strike distance (km)",
@@ -613,7 +629,7 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time"):
     x0, y0, z0 = float(d.x.mean()), float(d.y.mean()), float(d.z.mean())
     E = (d.x - x0).to_numpy() / 1000.0
     N = (d.y - y0).to_numpy() / 1000.0
-    dep = -(d.z - z0).to_numpy() / 1000.0                       # km, +down
+    dep = (d.z - z0).to_numpy() / 1000.0                        # km, +down (Z is positive down)
     mag = np.nan_to_num(d.mag.to_numpy(), nan=0.0)
     size = np.clip(4 + 3 * mag, 3, 18)
 
@@ -632,14 +648,17 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time"):
                          text=[f"{int(i)}  M{m:.1f}" for i, m in zip(d.id, mag)])]
     title = f"{cfg.region} — 3-D relocated seismicity ({branch})"
     if len(d) >= 3:
-        strike, dip = _best_fit_plane(d.x, d.y, d.z)
-        phi, delta = np.deg2rad(strike), np.deg2rad(dip)
-        s_hat = np.array([np.sin(phi), np.cos(phi), 0.0])                          # along-strike (E,N,up)
-        d_hat = np.array([np.cos(delta) * np.sin(phi + np.pi / 2),
-                          np.cos(delta) * np.cos(phi + np.pi / 2), -np.sin(delta)])  # down-dip (E,N,up)
+        strike, dip = _best_fit_plane(d.x, d.y, d.z)                        # for the label
+        # build the plane patch in the SAME (E, N, depth-down) frame as the plotted points, directly
+        # from the SVD normal, so it lies in the cloud (no strike/dip round-trip, no sign ambiguity).
+        n = _svd_normal(E, N, dep)
+        u1 = np.cross(n, [0.0, 0.0, 1.0])
+        u1 = (np.array([1.0, 0.0, 0.0]) if np.linalg.norm(u1) < 1e-9 else u1 / np.linalg.norm(u1))
+        u2 = np.cross(n, u1); u2 = u2 / np.linalg.norm(u2)
         L = (max(np.ptp(E), np.ptp(N), np.ptp(dep)) / 2.0) or 0.2
-        corners = [a * s_hat + b * d_hat for a in (-L, L) for b in (-L, L)]   # idx 0,1,2,3
-        cx = [c[0] for c in corners]; cy = [c[1] for c in corners]; cz = [-c[2] for c in corners]
+        c0 = np.array([E.mean(), N.mean(), dep.mean()])
+        corners = [c0 + a * u1 + b * u2 for a in (-L, L) for b in (-L, L)]   # idx 0,1,2,3
+        cx = [c[0] for c in corners]; cy = [c[1] for c in corners]; cz = [c[2] for c in corners]
         data.append(go.Mesh3d(x=cx, y=cy, z=cz, i=[0, 0], j=[1, 3], k=[3, 2],
                               opacity=0.3, color="gray", hoverinfo="name",
                               name=f"Best-fit plane {strike:.0f}/{dip:.0f}", showscale=False))
