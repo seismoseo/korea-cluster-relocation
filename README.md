@@ -183,6 +183,25 @@ byte-identical `hypoDD.reloc` and the same chosen DAMP. (Example: Kimcheon's con
 went from a corrupted 322° to 40°, matching the focal mechanisms.) Only LSQR dt.cc runs are affected; SVD
 runs and the dt.ct baselines are untouched.
 
+**Bootstrap location uncertainty (95% error bars).** HypoDD's a-posteriori LSQR errors badly underestimate
+the true relative-location uncertainty (Kimcheon dt.cc: internal ex/ey/ez ≈ 0.3/0.3/1 m vs **bootstrap median
+≈ 4/4/52 m** — ~50–300×, depth worst). `core/hypodd.bootstrap_relocation` estimates it data-driven: pool all
+differential-time observations, **resample with replacement** (global), regroup into pairs, and re-run HypoDD
+`n` (≈1000) times with the **inversion held fixed** (the calibrated `hypoDD.inp`); each replica is
+**median-aligned** to the main solution and the per-event 95% error bar is the **2.5–97.5 percentile
+half-width** of the X/Y/Z scatter (percentile, not σ — robust to the heavy tail of the global resample;
+weakly-linked events honestly get large bars). It is **seeded/reproducible** and **cached**
+(`bootstrap_errors.csv` + per-replica `bootstrap_samples.npz`). Run it (opt-in, heavy) for the
+clusters/branches you plot:
+
+```bash
+python -m pipeline.cli.bootstrap --cluster kimcheon --suffix _pnplus --branch both --n 1000 --cores 10
+```
+
+Once the cache exists, `viz.map_catalog`/`depth_sections`/`compare_epicenters`/`fault_sections`/`plot_3d_plane`
+draw the 95% bars automatically (rotated into the along/across/depth frame for the fault sections; 3-D
+`error_x/y/z` for the plotly view). `03_results.ipynb` computes/loads it and tabulates bootstrap-vs-internal.
+
 **Other clusters.** All four clusters relocate (locations + dt.cc), but only **Gwangyang** has the
 focal-sphere coverage for *well-constrained* mechanisms. Jangsung/Kimcheon events are shallow (~0.3–6 km),
 so the steep takeoffs are unsampled (takeoff gap > 60°); Gyeongju's stations are one-sided (azimuthal

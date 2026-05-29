@@ -84,6 +84,21 @@ falling back to the matplotlib default otherwise.
   yields byte-identical `hypoDD.reloc` and the same chosen DAMP. Reproduce end-to-end with
   `run_pipeline --cluster kimcheon --picker phasenet_plus --through dtcc`; `damping_calibration.txt` is the
   audit trail of the per-set DAMP / CND.
+- **Bootstrap location uncertainty** (`core/hypodd.bootstrap_relocation`, opt-in). HypoDD's a-posteriori
+  ex/ey/ez badly underestimate the true relative-location error (Kimcheon dt.cc ≈0.3/0.3/1 m vs bootstrap
+  median ≈4/4/52 m — ~50–300×, depth worst, especially under LSQR). The bootstrap resamples the
+  differential-time data **globally** (pool all obs, draw with replacement, regroup into pairs;
+  `_resample_global`), re-runs HypoDD `n` (≈1000) times with the **inversion held fixed** (copies the
+  calibrated `hypoDD.inp`), and per event takes the **2.5–97.5 percentile half-width** of the X/Y/Z scatter
+  (95%; percentile, not σ — robust to the heavy tail of the global resample, where a weakly-linked event
+  flies ~km in a few % of replicas). Each replica is **median-aligned** to the main solution (a *mean* offset
+  would let one flier hijack the whole replica's alignment). `branch="dtcc"` resamples dt.ct+dt.cc;
+  `branch="dtct"` resamples dt.ct. Deterministic (`np.random.default_rng(seed+i)`), parallel (ThreadPool),
+  **cached** to `bootstrap_errors.csv` (+ per-replica samples `bootstrap_samples.npz`; the cache header tags
+  `align`/`ci` so a method change auto-invalidates). CLI: `python -m pipeline.cli.bootstrap --cluster <name>
+  --suffix _pnplus --branch both`. `viz` then draws the 95% bars — recomputed from the samples in each plot's
+  frame (rotated into along/across/depth for `fault_sections`; `error_x/y/z` in `plot_3d_plane`); no cache ⇒
+  no bars (graceful). Poorly-linked events (low `n_boot`) honestly get large bars.
 - **Run things politely** on the shared box (taskset + bounded cores). Verify no baseline drift with
   `python -m pipeline.regression.freeze_baseline verify`.
 - Adding a cluster: see README "Adding a cluster" (`_base.kma_cluster` factory or a bespoke `stp_sac`

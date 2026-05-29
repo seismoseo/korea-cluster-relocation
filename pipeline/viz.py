@@ -70,6 +70,31 @@ def _format_lonlat(ax):
         lab.set_rotation(30); lab.set_ha("right")
 
 
+def _load_bootstrap(cfg, branch):
+    """Load the bootstrap per-replica samples for a branch ('dt.cc'->dtcc, 'dt.ct'->dtct):
+    {event_id: aligned X/Y/Z samples [n, 3] in metres (Z +down)}, or None if not computed. The 95%
+    error bar in any frame is the 2.5–97.5 percentile half-width of the samples projected onto that
+    axis (`_pct_hw`). See `hypodd.bootstrap_relocation` (writes `bootstrap_samples.npz`)."""
+    bdir = config.dtcc_dir(cfg) if "cc" in branch else config.dtct_dir(cfg)
+    p = os.path.join(bdir, "bootstrap_samples.npz")
+    if not os.path.exists(p):
+        return None
+    data = np.load(p)["data"]
+    if data.size == 0:
+        return None
+    out = {}
+    for row in data:
+        out.setdefault(int(row[0]), []).append(row[1:4])
+    return {e: np.asarray(v, float) for e, v in out.items()} or None
+
+
+def _pct_hw(samples, v=None):
+    """95% half-width = (P97.5 − P2.5) / 2 of the bootstrap samples. With `v` (unit vector), of the
+    samples projected onto `v` (a scalar); otherwise per-axis (a 3-vector). All in the sample units (m)."""
+    a = samples if v is None else samples @ v
+    return (np.percentile(a, 97.5, axis=0) - np.percentile(a, 2.5, axis=0)) / 2.0
+
+
 def map_catalog(cfg, velmodel="kim1983", source="sum", ax=None):
     """Epicenter map coloured by depth, with the used stations. source = 'sum'|'reloc'.
     For source='reloc' the headline dt.cc relocation is shown (dt.ct fallback)."""
@@ -87,26 +112,50 @@ def map_catalog(cfg, velmodel="kim1983", source="sum", ax=None):
     sc = ax.scatter(df.lon, df.lat, c=df.depth, s=60, cmap="viridis_r",
                     edgecolor="k", zorder=3)
     plt.colorbar(sc, ax=ax, label="Depth (km)", shrink=0.8)
+    boot = _load_bootstrap(cfg, branch) if source == "reloc" else None
+    if boot:                                     # 95% bootstrap X/Y error bars (percentile, m -> deg)
+        for r in df.itertuples():
+            if int(r.id) not in boot:
+                continue
+            hw = _pct_hw(boot[int(r.id)])        # (E, N, Z) metres
+            ax.errorbar(r.lon, r.lat, xerr=hw[0] / (111320.0 * np.cos(np.deg2rad(r.lat))),
+                        yerr=hw[1] / 111320.0, fmt="none", ecolor="0.4",
+                        elinewidth=0.7, capsize=2, zorder=2)
     ax.scatter(*cfg.epicenter[::-1], marker="*", s=300, c="red",
                edgecolor="k", zorder=4, label="Cluster center")
+    bl = " + 95% bootstrap" if boot else ""
     ax.set(xlabel="Longitude", ylabel="Latitude",
-           title=f"{cfg.region} — {len(df)} events ({source}:{branch})")
+           title=f"{cfg.region} — {len(df)} events ({source}:{branch}{bl})")
     ax.legend(loc="best", fontsize=8); ax.set_aspect("equal", "datalim")
     _format_lonlat(ax)
     return ax.figure
 
 
 def depth_sections(cfg, velmodel="kim1983", source="sum"):
-    """Lon-depth and lat-depth cross-sections (source='reloc' uses the headline dt.cc relocation)."""
-    df = (sumio.read_sum(config.sum_file(cfg, velmodel)) if source == "sum"
-          else sumio.read_reloc(_reloc_path(cfg)[0]))
+    """Lon-depth and lat-depth cross-sections (source='reloc' uses the headline dt.cc relocation,
+    with 95% bootstrap depth/horizontal error bars when the bootstrap cache exists)."""
+    branch = "dt.cc"
+    if source == "sum":
+        df = sumio.read_sum(config.sum_file(cfg, velmodel))
+    else:
+        path, branch = _reloc_path(cfg)
+        df = sumio.read_reloc(path)
+    boot = _load_bootstrap(cfg, branch) if source == "reloc" else None
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4), dpi=110)
-    a1.scatter(df.lon, df.depth, s=40, c="steelblue", edgecolor="k")
+    a1.scatter(df.lon, df.depth, s=40, c="steelblue", edgecolor="k", zorder=3)
     a1.set(xlabel="Longitude", ylabel="Depth (km)", title=f"{cfg.region} longitude-depth")
-    a1.invert_yaxis()
-    a2.scatter(df.lat, df.depth, s=40, c="steelblue", edgecolor="k")
+    a2.scatter(df.lat, df.depth, s=40, c="steelblue", edgecolor="k", zorder=3)
     a2.set(xlabel="Latitude", ylabel="Depth (km)", title="Latitude-depth")
-    a2.invert_yaxis()
+    if boot:                                     # 95% bootstrap bars: depth (Z) + horizontal (X/Y)
+        for r in df.itertuples():
+            if int(r.id) not in boot:
+                continue
+            hw = _pct_hw(boot[int(r.id)])        # (E, N, Z) metres
+            a1.errorbar(r.lon, r.depth, xerr=hw[0] / (111320.0 * np.cos(np.deg2rad(r.lat))),
+                        yerr=hw[2] / 1000.0, fmt="none", ecolor="0.4", elinewidth=0.7, capsize=2, zorder=2)
+            a2.errorbar(r.lat, r.depth, xerr=hw[1] / 111320.0,
+                        yerr=hw[2] / 1000.0, fmt="none", ecolor="0.4", elinewidth=0.7, capsize=2, zorder=2)
+    a1.invert_yaxis(); a2.invert_yaxis()
     fig.tight_layout()
     return fig
 
@@ -468,6 +517,20 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
     dep = (d.z.to_numpy() - z0) / 1000.0                          # km, +down (Z is positive down)
     along_dip = across * np.cos(np.deg2rad(used_dip)) + dep * np.sin(np.deg2rad(used_dip))   # km
 
+    # --- 95% bootstrap error bars, rotated into the fault frame (percentile of projected samples) ---
+    boot = _load_bootstrap(cfg, branch)
+    sig_al = sig_ac = sig_dp = sig_ad = None
+    if boot:
+        ct, st, cdip, sdip = np.cos(th), np.sin(th), np.cos(np.deg2rad(used_dip)), np.sin(np.deg2rad(used_dip))
+        v_al = np.array([ct, st, 0.0]); v_ac = np.array([-st, ct, 0.0])
+        v_z = np.array([0.0, 0.0, 1.0]); v_ad = np.array([-st * cdip, ct * cdip, sdip])
+        sig_al, sig_ac, sig_dp, sig_ad = (np.full(len(d), np.nan) for _ in range(4))
+        for i, e in enumerate(d.id.astype(int)):
+            if e in boot:
+                s = boot[e]
+                sig_al[i], sig_ac[i] = _pct_hw(s, v_al) / 1000.0, _pct_hw(s, v_ac) / 1000.0
+                sig_dp[i], sig_ad[i] = _pct_hw(s, v_z) / 1000.0, _pct_hw(s, v_ad) / 1000.0
+
     # --- colour (origin time by default, as in the originals) + magnitude-scaled hollow markers ---
     mag = np.nan_to_num(d.mag.to_numpy(), nan=0.0)
     sz = np.clip(5.0 * np.exp(2.0 * mag), 25, 1500)
@@ -515,6 +578,9 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
 
     # panel 2 — along-strike depth section (A–A')
     ax = axes[1]
+    if boot is not None:
+        ax.errorbar(along, dep, xerr=sig_al, yerr=sig_dp, fmt="none", ecolor="0.55",
+                    elinewidth=0.6, capsize=1.5, zorder=3)
     ax.scatter(along, dep, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
     ax.text(-0.92 * R, -0.88 * R, "A", fontsize=16, fontweight="bold")
     ax.text(0.86 * R, -0.88 * R, "A'", fontsize=16, fontweight="bold")
@@ -526,6 +592,9 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
     # trace of the best-fit plane in this section (from the SVD normal, rotated into fault coords),
     # through the cloud centre — so the line dips the correct way and overlays the data.
     ax = axes[2]
+    if boot is not None:
+        ax.errorbar(across, dep, xerr=sig_ac, yerr=sig_dp, fmt="none", ecolor="0.55",
+                    elinewidth=0.6, capsize=1.5, zorder=3)
     ax.scatter(across, dep, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
     nrm = _svd_normal(d.x, d.y, d.z)                             # (E, N, down)
     n_ac = -nrm[0] * np.sin(th) + nrm[1] * np.cos(th)            # across-strike component
@@ -545,6 +614,9 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
 
     # panel 4 — fault-plane (along-dip) view
     ax = axes[3]
+    if boot is not None:
+        ax.errorbar(along, along_dip, xerr=sig_al, yerr=sig_ad, fmt="none", ecolor="0.55",
+                    elinewidth=0.6, capsize=1.5, zorder=3)
     ax.scatter(along, along_dip, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
     ax.text(-0.92 * R, -0.88 * R, "A", fontsize=16, fontweight="bold")
     ax.text(0.86 * R, -0.88 * R, "A'", fontsize=16, fontweight="bold")
@@ -564,7 +636,8 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
     src = "manual" if strike is not None else ("best-fit plane" if svd_strike is not None else "mechanism")
     fmtxt = (f"; mechanism {ref['strike']:.0f}°/{ref['dip']:.0f}° ({ref['quality']})"
              if ref else "")
-    fig.suptitle(f"{cfg.region} — relocated seismicity in fault coordinates ({branch})\n"
+    btxt = "  (bars = 95% bootstrap)" if boot is not None else ""
+    fig.suptitle(f"{cfg.region} — relocated seismicity in fault coordinates ({branch}){btxt}\n"
                  f"strike {used_strike:.0f}°, dip {used_dip:.0f}° [{src}]{fmtxt}", fontsize=13)
     return fig
 
@@ -576,10 +649,19 @@ def compare_epicenters(cfg, velmodel="kim1983", variant="default"):
                            "hypoDD.reloc" if variant == "default" else f"{variant}/hypoDD.reloc")
     cc = sumio.read_reloc(cc_path)
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5), dpi=110)
-    for ax, df, lab in ((a1, ct, "dt.ct"), (a2, cc, f"dt.cc:{variant}")):
+    for ax, df, lab, br in ((a1, ct, "dt.ct", "dt.ct"), (a2, cc, f"dt.cc:{variant}", "dt.cc")):
         if len(df):
-            sc = ax.scatter(df.lon, df.lat, c=df.depth, s=60, cmap="viridis_r", edgecolor="k")
+            sc = ax.scatter(df.lon, df.lat, c=df.depth, s=60, cmap="viridis_r", edgecolor="k", zorder=3)
             plt.colorbar(sc, ax=ax, label="Depth (km)", shrink=0.8)
+            boot = _load_bootstrap(cfg, br) if variant == "default" else None
+            for r in (df.itertuples() if boot else ()):
+                if int(r.id) not in boot:
+                    continue
+                hw = _pct_hw(boot[int(r.id)])    # (E, N, Z) metres
+                ax.errorbar(r.lon, r.lat,
+                            xerr=hw[0] / (111320.0 * np.cos(np.deg2rad(r.lat))),
+                            yerr=hw[1] / 111320.0,
+                            fmt="none", ecolor="0.4", elinewidth=0.7, capsize=2, zorder=2)
         ax.set(xlabel="Longitude", ylabel="Latitude", title=f"{cfg.region} — {lab} ({len(df)} ev)")
         ax.set_aspect("equal", "datalim")
         _format_lonlat(ax)
@@ -642,11 +724,22 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time"):
     else:
         cvals, cbar, cscale = d.depth.to_numpy(), dict(title="Depth (km)"), "Viridis_r"
 
+    boot = _load_bootstrap(cfg, branch)            # 95% bootstrap error bars in E/N/depth (percentile)
+    err = {}
+    if boot:
+        _hw = {int(i): (_pct_hw(boot[int(i)]) / 1000.0 if int(i) in boot else None) for i in d.id}
+        def _e(j):
+            return [_hw[int(i)][j] if _hw.get(int(i)) is not None else 0.0 for i in d.id]
+        err = dict(error_x=dict(type="data", array=_e(0), thickness=0.8, width=2, color="rgba(80,80,80,0.5)"),
+                   error_y=dict(type="data", array=_e(1), thickness=0.8, width=2, color="rgba(80,80,80,0.5)"),
+                   error_z=dict(type="data", array=_e(2), thickness=0.8, width=2, color="rgba(80,80,80,0.5)"))
     data = [go.Scatter3d(x=E, y=N, z=dep, mode="markers", name="Hypocentres",
                          marker=dict(size=size, color=cvals, colorscale=cscale, colorbar=cbar,
                                      line=dict(width=0.5, color="black"), opacity=0.95),
-                         text=[f"{int(i)}  M{m:.1f}" for i, m in zip(d.id, mag)])]
+                         text=[f"{int(i)}  M{m:.1f}" for i, m in zip(d.id, mag)], **err)]
     title = f"{cfg.region} — 3-D relocated seismicity ({branch})"
+    if boot:
+        title += "  (bars = 95% bootstrap)"
     if len(d) >= 3:
         strike, dip = _best_fit_plane(d.x, d.y, d.z)                        # for the label
         # build the plane patch in the SAME (E, N, depth-down) frame as the plotted points, directly

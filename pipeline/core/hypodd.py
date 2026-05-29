@@ -391,3 +391,163 @@ def run_backbone(cfg, velmodel="kim1983"):
     prep_ph2dt(cfg, velmodel=velmodel)
     run_ph2dt(cfg)
     return run_dtct(cfg)
+
+
+# ------------------------------------------------------------- bootstrap errors
+def _parse_dt_blocks(path):
+    """Parse a HypoDD dt.ct/dt.cc file into [(header_line, [obs_lines]), ...] (newlines stripped).
+    Blocks start with a `#` event-pair header; the following lines are the observations."""
+    blocks, cur = [], None
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            if line.lstrip().startswith("#"):
+                cur = (line, [])
+                blocks.append(cur)
+            elif cur is not None:
+                cur[1].append(line)
+    return blocks
+
+
+def _write_dt_blocks(path, blocks):
+    """Write [(header, [obs])] back to a dt file, skipping blocks left with no observations."""
+    with open(path, "w") as f:
+        for header, obs in blocks:
+            if not obs:
+                continue
+            f.write(header + "\n")
+            f.writelines(o + "\n" for o in obs)
+
+
+def _resample_global(blocks, rng):
+    """Global-observation bootstrap: pool every observation (tagged with its block), draw `len(pool)`
+    with replacement, and regroup by block — keeping each block's original header (incl. the cc OTC),
+    emitting only blocks that received ≥ 1 observation. Duplicates are allowed (HypoDD up-weights them)."""
+    pool = [(bi, o) for bi, (_h, obs) in enumerate(blocks) for o in obs]
+    if not pool:
+        return blocks
+    regrouped = [[] for _ in blocks]
+    for k in rng.integers(0, len(pool), size=len(pool)):
+        bi, o = pool[k]
+        regrouped[bi].append(o)
+    return [(blocks[bi][0], regrouped[bi]) for bi in range(len(blocks)) if regrouped[bi]]
+
+
+def _bootstrap_meta(csv_path):
+    """Read the `# bootstrap_errors n=.. seed=.. ..` provenance header of a cached errors CSV."""
+    try:
+        with open(csv_path) as f:
+            head = f.readline()
+    except OSError:
+        return {}
+    return {k: v for k, v in re.findall(r"(\w+)=(\S+)", head)}
+
+
+def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nboot=50, cache=True):
+    """Bootstrap the **relative-location uncertainty** of a HypoDD relocation by resampling the
+    differential-time data and re-inverting `n` times, then summarising the per-event scatter.
+
+    Resampling is **global** (pool all observations, draw with replacement, regroup into pairs;
+    `_resample_global`). The inversion is held FIXED — each replica copies the calibrated `hypoDD.inp`
+    (tuned damping + distance cutoffs) and `event.dat`/`event.sel`/`station.dat` from the run dir, so
+    only the data vary. `branch="dtcc"` resamples both `dt.ct` and the cc file (idat=3); `branch="dtct"`
+    resamples `dt.ct` only. Each replica is **translation-aligned** to the main solution over common
+    events (HypoDD relative locations are defined up to the cluster centroid), then per event we take
+    the 3×3 covariance of the aligned X/Y/Z and report the **Gaussian 95% half-widths ex95/ey95/ez95 =
+    1.96·σ** (suppressed for events seen in < `min_nboot` replicas). HypoDD's own ex/ey/ez are known to
+    underestimate these (especially under LSQR).
+
+    Deterministic: replica `i` uses `np.random.default_rng(seed + i)`. Result is cached to
+    `bootstrap_errors.csv` in the branch dir (provenance header records n/seed); re-call loads the cache
+    when n/seed match. Returns a DataFrame (one row per event)."""
+    import tempfile
+    from concurrent.futures import ThreadPoolExecutor
+    import numpy as np
+    import pandas as pd
+    from pipeline.core import sumio
+
+    bdir = config.dtcc_dir(cfg) if branch == "dtcc" else config.dtct_dir(cfg)
+    out_csv = os.path.join(bdir, "bootstrap_errors.csv")
+    reloc0, inp0 = os.path.join(bdir, "hypoDD.reloc"), os.path.join(bdir, "hypoDD.inp")
+    if not (os.path.exists(reloc0) and os.path.exists(inp0)):
+        raise FileNotFoundError(
+            f"need {branch} hypoDD.reloc + hypoDD.inp in {bdir} — run that relocation stage first")
+    if cache and os.path.exists(out_csv):
+        meta = _bootstrap_meta(out_csv)
+        if (meta.get("n") == str(n) and meta.get("seed") == str(seed) and meta.get("branch") == branch
+                and meta.get("align") == "median" and meta.get("ci") == "percentile2.5-97.5"):
+            return pd.read_csv(out_csv, comment="#")          # align/ci tags invalidate pre-fix caches
+
+    dt_files = ["dt.ct"] + ([cfg.hypodd_dtcc_variants["default"].cc_file] if branch == "dtcc" else [])
+    base_blocks = {fn: _parse_dt_blocks(os.path.join(bdir, fn)) for fn in dt_files}
+    aux = ("event.dat", "event.sel", "station.dat", "hypoDD.inp")
+    main = sumio.read_reloc(reloc0)
+    main_xyz = {int(r.id): (float(r.x), float(r.y), float(r.z)) for r in main.itertuples()}
+
+    def _one(i):
+        rng = np.random.default_rng(seed + i)
+        d = tempfile.mkdtemp(prefix=f"boot_{cfg.name}_{branch}_")
+        try:
+            for a in aux:
+                s = os.path.join(bdir, a)
+                if os.path.exists(s):
+                    shutil.copyfile(s, os.path.join(d, a))
+            for fn, blk in base_blocks.items():
+                _write_dt_blocks(os.path.join(d, fn), _resample_global(blk, rng))
+            try:                                            # a pathological resample can fail / overflow
+                rl = _exec_hypodd_once(d)                   # ('********' Fortran overflow) -> drop it
+                df = sumio.read_reloc(rl)
+                for c in ("x", "y", "z"):
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                df = df.dropna(subset=["x", "y", "z"])
+                return {int(r.id): (float(r.x), float(r.y), float(r.z)) for r in df.itertuples()}
+            except Exception:                               # noqa: BLE001
+                return {}
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    cores = cores or getattr(cfg, "num_cores", 4) or 4
+    with ThreadPoolExecutor(max_workers=int(cores)) as ex:
+        replicas = list(ex.map(_one, range(n)))
+
+    samples = {}                                            # id -> list[(x,y,z)] (translation-aligned)
+    for rep in replicas:
+        common = [e for e in rep if e in main_xyz]
+        if len(common) < 2:
+            continue
+        # MEDIAN offset (robust): with global resampling ~10% of replicas fling one weakly-linked event
+        # by ~km; a mean offset would let that single flier hijack the whole replica's alignment and
+        # inflate every event's σ. The median ignores it, so only genuinely unstable events get big bars.
+        off = np.median([[rep[e][k] - main_xyz[e][k] for k in range(3)] for e in common], axis=0)
+        for e, p in rep.items():
+            samples.setdefault(e, []).append([p[0] - off[0], p[1] - off[1], p[2] - off[2]])
+
+    # 95% interval = the 2.5–97.5 **percentile** half-width per axis (robust to the heavy tail of
+    # global resampling). The per-replica samples are also kept (bootstrap_samples.npz) so the viz can
+    # take percentiles in any rotated frame (along/across/depth) — percentiles, unlike a covariance,
+    # do not transform linearly, so they must be recomputed from the samples after projection.
+    def _hw(a):                                             # 95% percentile half-width per column
+        return (np.percentile(a, 97.5, axis=0) - np.percentile(a, 2.5, axis=0)) / 2.0
+    rows, samp_rows = [], []
+    for e in sorted(main_xyz):
+        s = np.asarray(samples.get(e, []), dtype=float)
+        nb = len(s)
+        row = dict(id=e, n_boot=nb, x_med=main_xyz[e][0], y_med=main_xyz[e][1], z_med=main_xyz[e][2],
+                   ex95=np.nan, ey95=np.nan, ez95=np.nan)
+        if nb >= max(2, min_nboot):
+            med, hw = np.median(s, axis=0), _hw(s)
+            row.update(x_med=med[0], y_med=med[1], z_med=med[2],
+                       ex95=hw[0], ey95=hw[1], ez95=hw[2])
+            samp_rows.extend([e, p[0], p[1], p[2]] for p in s)
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if cache:
+        with open(out_csv, "w") as f:
+            f.write(f"# bootstrap_errors n={n} seed={seed} branch={branch} cluster={cfg.name} "
+                    f"resample=global ci=percentile2.5-97.5 align=median\n")
+            out.to_csv(f, index=False)
+        np.savez(os.path.join(bdir, "bootstrap_samples.npz"),
+                 data=np.asarray(samp_rows, dtype=float) if samp_rows else np.empty((0, 4)))
+    return out
