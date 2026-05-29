@@ -157,6 +157,10 @@ focal mechanisms above, and **`viz.fault_sections`** — the relocated catalog r
 (a 2×2 figure: fault-plane map view, along-strike + across-strike depth sections, and a fault-plane
 along-dip view), coloured by origin time and **oriented to the relocation cloud's own best-fit plane
 (SVD), with the focal mechanism overlaid for comparison** (pass `strike=`/`dip=` to override).
+`viz.mechanism_table` lists **both nodal planes** (`strike/dip/rake` = NP1 from SKHASH, `strike2/dip2/rake2`
+= the conjugate NP2 via obspy `aux_plane`); `viz.plot_3d_plane` is the interactive plotly view with the
+best-fit plane sized to **span the cloud's actual extent** (projected onto the in-plane axes, so an
+asymmetric cloud is fully covered).
 
 **Located-event counts shrink `.sum ≥ dt.ct ≥ dt.cc`.** `.sum` is every event HYPOINVERSE locates
 absolutely; **dt.ct** keeps only events with enough catalog differential-time links (isolated events
@@ -203,7 +207,8 @@ Once the cache exists, `viz.map_catalog`/`depth_sections`/`compare_epicenters`/`
 draw the 95% bars automatically (E/N on the map view, rotated into along/across/depth for the fault sections,
 3-D `error_x/y/z` for the plotly view) and **drop events the bootstrap flags as under-constrained** (95%
 horizontal half-width > 0.1 km or `n_boot` < 0.6·n; tunable), noting the count. Hypocentre **circles scale by
-KMA local magnitude** (the reloc `mag` is 0, so the catalog magnitude is used). `03_results_<cluster>.ipynb`
+KMA local magnitude** in every scatter (the reloc `mag` is 0, so the catalog magnitude is used, matched
+cuspid→event_id→catalog row case-insensitively across all four clusters). `03_results_<cluster>.ipynb`
 computes/loads the bootstrap and tabulates bootstrap-vs-internal. *(Example: Kimcheon 200007 has good CC and a
 recovered main location, but is shallow with a 121° azimuthal gap → genuinely under-determined, so it's
 dropped.)*

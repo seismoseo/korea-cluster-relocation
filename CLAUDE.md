@@ -107,7 +107,13 @@ falling back to the matplotlib default otherwise.
   location recovered (0.61→1.96 km), but it is shallow (0.61 km) with a 121° azimuthal gap → genuinely
   under-determined (seeding from the solution does not shrink its bar) → dropped from the plots.
 - **Circles scale by KMA local magnitude** (`viz._event_magnitudes` cuspid→event_id→catalog `magnitude`;
-  `_mag_size` = `5·exp(2·M)`), since the reloc `mag` column is 0. Used in every hypocentre scatter.
+  `_mag_size` = `5·exp(2·M)`), since the reloc `mag` column is 0. Used in every hypocentre scatter. The
+  catalog columns are normalised to lowercase first (some clusters' catalogs are `Year`/`Magnitude`, others
+  `year`/`magnitude`) — otherwise the lookup throws and *every* circle falls back to one size.
+- **Focal-mechanism table** (`viz.mechanism_table`) lists **both nodal planes**: `strike/dip/rake` is the
+  SKHASH plane (NP1), `strike2/dip2/rake2` the conjugate (NP2, obspy `aux_plane`). The **3-D plane patch**
+  (`viz.plot_3d_plane`) is sized from the data's projection onto the in-plane axes (u1, u2), not a symmetric
+  `±max(ptp)/2` square, so an asymmetric cloud is fully spanned.
 - **Run things politely** on the shared box (taskset + bounded cores). Verify no baseline drift with
   `python -m pipeline.regression.freeze_baseline verify`.
 - Adding a cluster: see README "Adding a cluster" (`_base.kma_cluster` factory or a bespoke `stp_sac`

@@ -102,6 +102,7 @@ def _event_magnitudes(cfg):
     Returns {} on any failure (callers fall back to a default marker size)."""
     try:
         cat = pd.read_csv(cfg.event_catalog_csv)
+        cat.columns = [c.lower() for c in cat.columns]   # catalogs vary in case (Year vs year); normalise
         eid2mag = {}
         for r in cat.itertuples():
             t = UTCDateTime(int(r.year), int(r.month), int(r.day), int(r.hour), int(r.minute),
@@ -424,15 +425,23 @@ def _load_mechanisms(path):
 
 
 def mechanism_table(cfg, velmodel=None):
-    """Tidy focal-mechanism table (one row per event, preferred solution) for notebook display."""
+    """Tidy focal-mechanism table (one row per event, preferred solution) for notebook display.
+
+    Both nodal planes are listed: `strike/dip/rake` is the SKHASH-reported plane (NP1) and
+    `strike2/dip2/rake2` is the auxiliary plane (NP2), derived from NP1 with obspy `aux_plane`. A
+    double-couple mechanism is fully described by either plane; the fault is one of the two."""
     velmodel = velmodel or cfg.fm_velmodel
     path = config.fm_mech_csv(cfg, velmodel)
     if not os.path.exists(path):
         return pd.DataFrame()
-    m = _load_mechanisms(path)
-    cols = ["event_id", "quality", "strike", "dip", "rake", "fault_plane_uncertainty",
-            "num_p_pol", "num_sp_ratios", "azimuthal_gap", "sta_distribution_ratio",
-            "origin_depth_km"]
+    m = _load_mechanisms(path).reset_index(drop=True)
+    if {"strike", "dip", "rake"}.issubset(m.columns):     # auxiliary (conjugate) nodal plane
+        from obspy.imaging.beachball import aux_plane
+        aux = [aux_plane(float(r.strike), float(r.dip), float(r.rake)) for r in m.itertuples()]
+        m["strike2"], m["dip2"], m["rake2"] = (np.round([a[i] for a in aux], 1) for i in range(3))
+    cols = ["event_id", "quality", "strike", "dip", "rake", "strike2", "dip2", "rake2",
+            "fault_plane_uncertainty", "num_p_pol", "num_sp_ratios", "azimuthal_gap",
+            "sta_distribution_ratio", "origin_depth_km"]
     return m[[c for c in cols if c in m.columns]].reset_index(drop=True)
 
 
@@ -835,9 +844,16 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time"):
         u1 = np.cross(n, [0.0, 0.0, 1.0])
         u1 = (np.array([1.0, 0.0, 0.0]) if np.linalg.norm(u1) < 1e-9 else u1 / np.linalg.norm(u1))
         u2 = np.cross(n, u1); u2 = u2 / np.linalg.norm(u2)
-        L = (max(np.ptp(E), np.ptp(N), np.ptp(dep)) / 2.0) or 0.2
+        # span the patch over the data's ACTUAL projection onto the in-plane axes (u1, u2), not a
+        # symmetric square — the cloud is usually asymmetric about its centroid, so a ±max(ptp)/2 square
+        # leaves the far hypocentres off the plane. Project, take min/max per axis, pad 8%.
         c0 = np.array([E.mean(), N.mean(), dep.mean()])
-        corners = [c0 + a * u1 + b * u2 for a in (-L, L) for b in (-L, L)]   # idx 0,1,2,3
+        P = np.column_stack((E, N, dep)) - c0
+        p1, p2 = P @ u1, P @ u2
+        m1 = 0.08 * (np.ptp(p1) or 0.2); m2 = 0.08 * (np.ptp(p2) or 0.2)
+        a1lo, a1hi = p1.min() - m1, p1.max() + m1
+        a2lo, a2hi = p2.min() - m2, p2.max() + m2
+        corners = [c0 + a * u1 + b * u2 for a in (a1lo, a1hi) for b in (a2lo, a2hi)]   # idx 0,1,2,3
         cx = [c[0] for c in corners]; cy = [c[1] for c in corners]; cz = [c[2] for c in corners]
         data.append(go.Mesh3d(x=cx, y=cy, z=cz, i=[0, 0], j=[1, 3], k=[3, 2],
                               opacity=0.3, color="gray", hoverinfo="name",
