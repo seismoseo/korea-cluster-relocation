@@ -205,13 +205,17 @@ python -m pipeline.cli.bootstrap --cluster kimcheon --suffix _pnplus --branch bo
 
 Once the cache exists, `viz.map_catalog`/`depth_sections`/`compare_epicenters`/`fault_sections`/`plot_3d_plane`
 draw the 95% bars automatically (E/N on the map view, rotated into along/across/depth for the fault sections,
-3-D `error_x/y/z` for the plotly view) and **drop events the bootstrap flags as under-constrained** (95%
-horizontal half-width > 0.1 km or `n_boot` < 0.6·n; tunable), noting the count. Hypocentre **circles scale by
-KMA local magnitude** in every scatter (the reloc `mag` is 0, so the catalog magnitude is used, matched
-cuspid→event_id→catalog row case-insensitively across all four clusters). `03_results_<cluster>.ipynb`
-computes/loads the bootstrap and tabulates bootstrap-vs-internal. *(Example: Kimcheon 200007 has good CC and a
-recovered main location, but is shallow with a 121° azimuthal gap → genuinely under-determined, so it's
-dropped.)*
+3-D `error_x/y/z` whiskers — or, with `plot_3d_plane(..., error="ellipsoid")`, a translucent 95% bootstrap
+**error ellipsoid** per event) and **drop events the bootstrap flags as under-constrained** (95% horizontal
+half-width > 0.1 km or `n_boot` < 0.6·n; tunable module constants `viz.BOOT_DROP_HORIZ_KM` /
+`viz.BOOT_DROP_MIN_NBOOT_FRAC`), noting the count. Hypocentre **circles scale by KMA local magnitude** in every
+scatter (the reloc `mag` is 0, so the catalog magnitude is used, matched cuspid→event_id→catalog row
+case-insensitively across all four clusters). `viz.location_table` is the **headline deliverable** — one neat
+row per event (location + KMA magnitude + bootstrap 95% half-widths `ex95_m`/`ey95_m`/`ez95_m` + `n_boot` +
+link counts + `under_constrained` flag), written to **`final_locations.csv`** in the dt.cc run dir and shown
+styled in the notebook. `03_results_<cluster>.ipynb` computes/loads the bootstrap and tabulates
+bootstrap-vs-internal. *(Example: Kimcheon 200007 has good CC and a recovered main location, but is shallow
+with a 121° azimuthal gap → genuinely under-determined, so it's dropped.)*
 
 **Other clusters.** All four clusters relocate (locations + dt.cc), but only **Gwangyang** has the
 focal-sphere coverage for *well-constrained* mechanisms. Jangsung/Kimcheon events are shallow (~0.3–6 km),

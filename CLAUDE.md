@@ -113,7 +113,12 @@ falling back to the matplotlib default otherwise.
 - **Focal-mechanism table** (`viz.mechanism_table`) lists **both nodal planes**: `strike/dip/rake` is the
   SKHASH plane (NP1), `strike2/dip2/rake2` the conjugate (NP2, obspy `aux_plane`). The **3-D plane patch**
   (`viz.plot_3d_plane`) is sized from the data's projection onto the in-plane axes (u1, u2), not a symmetric
-  `±max(ptp)/2` square, so an asymmetric cloud is fully spanned.
+  `±max(ptp)/2` square, so an asymmetric cloud is fully spanned. `plot_3d_plane(..., error="ellipsoid")` draws
+  a 95% bootstrap **error ellipsoid** per event (shape = sample covariance, size = empirical 95% Mahalanobis
+  radius; `_ellipsoid_points`) instead of the default `error="bars"` whiskers.
+- **Final deliverable table** (`viz.location_table`): one neat row per event — location, KMA magnitude,
+  bootstrap 95% half-widths (`ex95_m`/`ey95_m`/`ez95_m`), `n_boot`, cc/ct link counts, `under_constrained`
+  flag — written to `final_locations.csv` in the branch's run dir and shown styled in `03_results_<cluster>`.
 - **Run things politely** on the shared box (taskset + bounded cores). Verify no baseline drift with
   `python -m pipeline.regression.freeze_baseline verify`.
 - Adding a cluster: see README "Adding a cluster" (`_base.kma_cluster` factory or a bespoke `stp_sac`

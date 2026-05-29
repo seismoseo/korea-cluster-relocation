@@ -132,6 +132,13 @@ def _mag_for(cfg, ids):
     return np.array([mg.get(int(i), np.nan) for i in ids], dtype=float)
 
 
+def _cuspid_event_ids(cfg):
+    """{cuspid: event_id (UTC YYYYMMDDHHMMSS)} from the sorted waveform dirs — the cuspid scheme
+    (cuspid = cfg.cuspid_offset + index). The inverse of the `id` carried through reloc/mechanisms."""
+    dirs = sorted(glob.glob(os.path.join(config.waveforms_dir(cfg), "20*")))
+    return {cfg.cuspid_offset + i: os.path.basename(d) for i, d in enumerate(dirs)}
+
+
 # bootstrap-flagged "under-constrained" events are dropped from the dt.cc views: their relative location
 # is poorly determined (large 95% spread / few stable replicas) — e.g. a shallow, large-azimuthal-gap event
 # whose good CC data still can't resolve it. Tunable.
@@ -784,13 +791,98 @@ def relocation_counts(cfg, velmodel="kim1983"):
     return pd.DataFrame([{"stage": s, "events": n} for s, n in rows])
 
 
-def plot_3d_plane(cfg, velmodel=None, color_by="time"):
+def location_table(cfg, branch=None, save=True):
+    """Final relocation table — locations + bootstrap 95% errors, one neat row per event. This is the
+    headline deliverable: the relocated hypocentres with their data-driven uncertainty.
+
+    Columns: `event_id` (UTC), `origin_time`, `latitude`, `longitude`, `depth_km`, `magnitude` (KMA
+    local), `ex95_m`/`ey95_m`/`ez95_m` (bootstrap 95% half-widths, E/N/Z metres), `n_boot` (replicas the
+    event relocated in), `cc_links`/`ct_links` (HypoDD inter-event links), and `under_constrained` (the
+    bootstrap-flagged events the plots drop — `_boot_underconstrained`: horizontal 95% half-width >
+    `BOOT_DROP_HORIZ_KM` km, or `n_boot` < `BOOT_DROP_MIN_NBOOT_FRAC`·n). Reads the headline dt.cc reloc
+    (dt.ct fallback) unless `branch` ('dtcc'|'dtct') is given; merges the cached `bootstrap_errors.csv`
+    when present (NaN errors otherwise). When `save`, writes `<branch dir>/final_locations.csv`. Returns
+    the DataFrame sorted by origin time. Empty frame if there is no reloc."""
+    if branch is None:
+        path, lab = _reloc_path(cfg)
+        branch = "dtcc" if "cc" in lab else "dtct"
+    bdir = config.dtcc_dir(cfg) if "cc" in branch else config.dtct_dir(cfg)
+    path = os.path.join(bdir, "hypoDD.reloc")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    d = sumio.read_reloc(path)
+    if not len(d):
+        return pd.DataFrame()
+    eids = _cuspid_event_ids(cfg)
+    mags = _event_magnitudes(cfg)
+    drop = _boot_underconstrained(cfg, "dt.cc" if "cc" in branch else "dt.ct")
+    bpath = os.path.join(bdir, "bootstrap_errors.csv")
+    bmap = {}
+    if os.path.exists(bpath):
+        bmap = {int(r.id): r for r in pd.read_csv(bpath, comment="#").itertuples()}
+    rows = []
+    for r in d.itertuples():
+        cid = int(r.id)
+        b = bmap.get(cid)
+        be = (lambda v: round(float(v), 1) if b is not None and np.isfinite(v) else np.nan)
+        rows.append(dict(
+            event_id=eids.get(cid, str(cid)),
+            origin_time=(r.time.strftime("%Y-%m-%d %H:%M:%S")
+                         if hasattr(r.time, "strftime") else str(r.time)),
+            latitude=round(float(r.lat), 5), longitude=round(float(r.lon), 5),
+            depth_km=round(float(r.depth), 3),
+            magnitude=round(float(mags[cid]), 1) if cid in mags else np.nan,
+            ex95_m=be(b.ex95) if b is not None else np.nan,
+            ey95_m=be(b.ey95) if b is not None else np.nan,
+            ez95_m=be(b.ez95) if b is not None else np.nan,
+            n_boot=int(b.n_boot) if b is not None else 0,
+            cc_links=int(r.nccp + r.nccs), ct_links=int(r.nctp + r.ncts),
+            under_constrained=bool(cid in drop)))
+    out = pd.DataFrame(rows).sort_values("origin_time").reset_index(drop=True)
+    if save:
+        try:
+            out.to_csv(os.path.join(bdir, "final_locations.csv"), index=False)
+        except Exception:                        # noqa: BLE001 — never let saving break display
+            pass
+    return out
+
+
+def _ellipsoid_points(center, samples, ngrid=14):
+    """Surface points of the 95% bootstrap error ellipsoid for one event (fed to a plotly Mesh3d with a
+    convex hull). The ellipsoid's shape is the sample **covariance** and its size the empirical **95%
+    Mahalanobis radius** (95% of the bootstrap samples fall inside — consistent with the percentile error
+    bars). `center` and `samples` are in the plotted (E, N, depth) km frame; the sample mean offset is
+    removed so the ellipsoid sits on the plotted hypocentre. Returns an (N, 3) point cloud, or None if the
+    covariance is degenerate (too few / collinear samples)."""
+    s = np.asarray(samples, float)
+    s = s - np.median(s, axis=0)
+    if len(s) < 4:
+        return None
+    cov = np.cov(s.T)
+    if not np.all(np.isfinite(cov)):
+        return None
+    try:
+        vals, vecs = np.linalg.eigh(cov)
+        vals = np.clip(vals, 1e-18, None)
+        d2 = np.einsum("ij,jk,ik->i", s, np.linalg.inv(cov), s)
+        r = float(np.sqrt(np.percentile(d2, 95.0)))
+    except np.linalg.LinAlgError:
+        return None
+    u = np.linspace(0, 2 * np.pi, ngrid); v = np.linspace(0, np.pi, ngrid)
+    uu, vv = np.meshgrid(u, v)
+    sph = np.stack([np.cos(uu) * np.sin(vv), np.sin(uu) * np.sin(vv), np.cos(vv)], -1).reshape(-1, 3)
+    return (sph * (r * np.sqrt(vals))) @ vecs.T + np.asarray(center, float)
+
+
+def plot_3d_plane(cfg, velmodel=None, color_by="time", error="bars"):
     """Interactive 3-D view (**plotly**) of the dt.cc-relocated hypocentres with the SVD best-fit fault
     plane overlaid as a translucent patch — rotate/zoom in a notebook. Returns a plotly Figure.
 
     Hypocentres: relative E–N–depth (km) about the cloud centroid, coloured by origin time (default;
     `color_by="depth"`), sized by magnitude. Plane: the relocation cloud's best-fit plane
     (`_best_fit_plane`) through the centroid, drawn over the cloud extent. Depth axis points down.
+    `error`: `"bars"` (default — 95% bootstrap error_x/y/z whiskers), `"ellipsoid"` (a translucent 95%
+    bootstrap error ellipsoid per event, coloured like its marker; `_ellipsoid_points`), or `"none"`.
     Reads the headline dt.cc reloc (dt.ct fallback). plotly is imported lazily (optional dependency)."""
     import plotly.graph_objects as go
     import matplotlib.dates as mdates
@@ -820,9 +912,9 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time"):
     else:
         cvals, cbar, cscale = d.depth.to_numpy(), dict(title="Depth (km)"), "Viridis_r"
 
-    boot = _load_bootstrap(cfg, branch)            # 95% bootstrap error bars in E/N/depth (percentile)
+    boot = _load_bootstrap(cfg, branch)            # 95% bootstrap uncertainty in E/N/depth (percentile)
     err = {}
-    if boot:
+    if boot and error == "bars":                   # error_x/y/z whiskers on the markers
         _hw = {int(i): (_pct_hw(boot[int(i)]) / 1000.0 if int(i) in boot else None) for i in d.id}
         def _e(j):
             return [_hw[int(i)][j] if _hw.get(int(i)) is not None else 0.0 for i in d.id]
@@ -834,8 +926,27 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time"):
                                      line=dict(width=0.5, color="black"), opacity=0.95),
                          text=[f"{int(i)}  M{m:.1f}" for i, m in zip(d.id, mfill)], **err)]
     title = f"{cfg.region} — 3-D relocated seismicity ({branch})"
+    if boot and error == "ellipsoid":              # one translucent 95% ellipsoid per event, marker-coloured
+        import matplotlib.colors as _mc
+        mcmap = plt.get_cmap("coolwarm" if color_by == "time" else "viridis_r")
+        lo, hi = float(np.min(cvals)), float(np.max(cvals))
+        mnorm = _mc.Normalize(vmin=lo, vmax=hi if hi > lo else lo + 1.0)
+        first = True
+        for i, cid in enumerate(d.id.astype(int)):
+            if cid not in boot:
+                continue
+            pts = _ellipsoid_points((E[i], N[i], dep[i]), boot[cid] / 1000.0)
+            if pts is None:
+                continue
+            rr, gg, bb, _ = mcmap(mnorm(cvals[i]))
+            data.append(go.Mesh3d(x=pts[:, 0], y=pts[:, 1], z=pts[:, 2], alphahull=0,
+                                  color=f"rgb({int(255*rr)},{int(255*gg)},{int(255*bb)})", opacity=0.18,
+                                  hoverinfo="skip", showscale=False, flatshading=True,
+                                  name="95% bootstrap ellipsoid", showlegend=first))
+            first = False
     if boot:
-        title += "  (bars = 95% bootstrap)"
+        title += "  (ellipsoids = 95% bootstrap)" if error == "ellipsoid" else (
+            "  (bars = 95% bootstrap)" if error == "bars" else "")
     if len(d) >= 3:
         strike, dip = _best_fit_plane(d.x, d.y, d.z)                        # for the label
         # build the plane patch in the SAME (E, N, depth-down) frame as the plotted points, directly
