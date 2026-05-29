@@ -41,7 +41,7 @@ when azimuthal gap > 90° or takeoff gap > 60° (the grade thresholds are hardco
 graded (often D) solution. Validated: **Gwangyang 3/11 events A/B** (deep ~14 km, all-around stations),
 consistent ~N-striking strike-slip; **Jangsung/Kimcheon** (shallow ~0.3–6 km → takeoff gap) and
 **Gyeongju** (one-sided stations → azimuthal gap) relocate fine but yield only **D** mechanisms.
-**Results viewer:** `notebooks/03_results.ipynb` (cluster-parameterized) shows the key figures together —
+**Results viewer:** `notebooks/03_results_<cluster>.ipynb` (one per cluster) shows the key figures together —
 locations (`viz.map_catalog` .sum + dt.ct/dt.cc reloc, `depth_sections`, `compare_epicenters`), **picks +
 first-motion polarity** (`viz.plot_3c` marks the P polarity; `viz.plot_polarities` is a P-aligned record
 section sorted by azimuth, red=up/blue=down), and focal mechanisms (`viz.map_mechanisms` beachballs on a
@@ -93,12 +93,21 @@ falling back to the matplotlib default otherwise.
   (95%; percentile, not σ — robust to the heavy tail of the global resample, where a weakly-linked event
   flies ~km in a few % of replicas). Each replica is **median-aligned** to the main solution (a *mean* offset
   would let one flier hijack the whole replica's alignment). `branch="dtcc"` resamples dt.ct+dt.cc;
-  `branch="dtct"` resamples dt.ct. Deterministic (`np.random.default_rng(seed+i)`), parallel (ThreadPool),
-  **cached** to `bootstrap_errors.csv` (+ per-replica samples `bootstrap_samples.npz`; the cache header tags
-  `align`/`ci` so a method change auto-invalidates). CLI: `python -m pipeline.cli.bootstrap --cluster <name>
-  --suffix _pnplus --branch both`. `viz` then draws the 95% bars — recomputed from the samples in each plot's
-  frame (rotated into along/across/depth for `fault_sections`; `error_x/y/z` in `plot_3d_plane`); no cache ⇒
-  no bars (graceful). Poorly-linked events (low `n_boot`) honestly get large bars.
+  `branch="dtct"` resamples dt.ct. **Each replica is seeded from the converged relocation** (event.dat
+  LAT/LON/DEPTH overwritten with the main `hypoDD.reloc` positions; `_seed_event_dat`), so the error is the
+  data-driven spread *around the solution*, not each replica's ability to re-converge from a poor initial
+  absolute location. Deterministic (`np.random.default_rng(seed+i)`), parallel (ThreadPool), **cached** to
+  `bootstrap_errors.csv` (+ per-replica samples `bootstrap_samples.npz`; the header tags `align`/`ci`/`init`
+  so a method change auto-invalidates). CLI: `python -m pipeline.cli.bootstrap --cluster <name> --suffix
+  _pnplus --branch both`. `viz` draws the 95% bars — recomputed from the samples in each plot's frame
+  (E/N on the map view, rotated into along/across/depth for `fault_sections`, `error_x/y/z` in `plot_3d_plane`);
+  no cache ⇒ no bars (graceful). The dt.cc views **drop bootstrap-flagged under-constrained events**
+  (`viz._boot_underconstrained`: 95% horizontal half-width > `BOOT_DROP_HORIZ_KM`=0.1, or `n_boot` < 0.6·n)
+  and note the count. *Worked example:* Kimcheon 200007 has plenty of good CC (cc 0.7–0.99) and its main
+  location recovered (0.61→1.96 km), but it is shallow (0.61 km) with a 121° azimuthal gap → genuinely
+  under-determined (seeding from the solution does not shrink its bar) → dropped from the plots.
+- **Circles scale by KMA local magnitude** (`viz._event_magnitudes` cuspid→event_id→catalog `magnitude`;
+  `_mag_size` = `5·exp(2·M)`), since the reloc `mag` column is 0. Used in every hypocentre scatter.
 - **Run things politely** on the shared box (taskset + bounded cores). Verify no baseline drift with
   `python -m pipeline.regression.freeze_baseline verify`.
 - Adding a cluster: see README "Adding a cluster" (`_base.kma_cluster` factory or a bespoke `stp_sac`

@@ -106,9 +106,9 @@ cross-correlates **all** event pairs — keep iterations cheap with a small `SUB
 
 Auxiliary QC (station misorientation, ZRT rotation, waveform similarity) is in
 `pipeline/notebooks/01_qc.ipynb`; a quick run-all + regression dashboard is `00_run_and_inspect.ipynb`.
-**Results presentation** — locations and focal mechanisms together — is `03_results.ipynb`
-(set `CLUSTER` / `RUN_SUFFIX`); pre-configured per-cluster copies are `03_results_<cluster>.ipynb`
-(kimcheon / jangsung / gyeongju).
+**Results presentation** — locations and focal mechanisms together — is one notebook per cluster,
+`03_results_<cluster>.ipynb` (gwangyang / kimcheon / jangsung / gyeongju), each with `CLUSTER` /
+`RUN_SUFFIX` set at the top.
 
 ## Example — Gwangyang focal mechanisms
 
@@ -122,7 +122,7 @@ taskset -c 0-9 $PY -m pipeline.cli.run_pipeline --cluster gwangyang --picker pha
 # focal mechanisms:
 $PY -m pipeline.cli.run_pipeline --cluster gwangyang --picker phasenet_plus \
     --stage-from focal_mechanism --through focal_mechanism
-# then view: pipeline/notebooks/03_results.ipynb  (CLUSTER="gwangyang", RUN_SUFFIX="_pnplus")
+# then view: pipeline/notebooks/03_results_gwangyang.ipynb  (CLUSTER="gwangyang", RUN_SUFFIX="_pnplus")
 ```
 
 The PhaseNet+ HypoDD relocation agrees with the trusted `stead` baseline to ≈100 m (depth within
@@ -150,7 +150,7 @@ by origin time. The orientation is the relocation cloud's best-fit plane (strike
 coincides with the focal mechanism's nodal plane — and the tight across-strike spread confirms a
 near-vertical, near-planar fault.*
 
-`03_results.ipynb` shows all the key figures together: locations (absolute `.sum` + the headline **dt.cc**
+`03_results_<cluster>.ipynb` shows all the key figures together: locations (absolute `.sum` + the headline **dt.cc**
 relocation; `viz.relocation_counts` tabulates the per-stage event counts), **picks with first-motion
 polarity** (`viz.plot_3c` + `viz.plot_polarities`, a P-aligned record section sorted by azimuth), the
 focal mechanisms above, and **`viz.fault_sections`** — the relocated catalog rotated into the fault frame
@@ -187,10 +187,11 @@ runs and the dt.ct baselines are untouched.
 the true relative-location uncertainty (Kimcheon dt.cc: internal ex/ey/ez ≈ 0.3/0.3/1 m vs **bootstrap median
 ≈ 4/4/52 m** — ~50–300×, depth worst). `core/hypodd.bootstrap_relocation` estimates it data-driven: pool all
 differential-time observations, **resample with replacement** (global), regroup into pairs, and re-run HypoDD
-`n` (≈1000) times with the **inversion held fixed** (the calibrated `hypoDD.inp`); each replica is
-**median-aligned** to the main solution and the per-event 95% error bar is the **2.5–97.5 percentile
-half-width** of the X/Y/Z scatter (percentile, not σ — robust to the heavy tail of the global resample;
-weakly-linked events honestly get large bars). It is **seeded/reproducible** and **cached**
+`n` (≈1000) times with the **inversion held fixed** (the calibrated `hypoDD.inp`). Each replica is
+**seeded from the converged relocation** (so the error is the data-driven spread around the solution, not
+each replica's ability to re-converge from a poor initial absolute location) and **median-aligned**; the
+per-event 95% error bar is the **2.5–97.5 percentile half-width** of the X/Y/Z scatter (percentile, not σ —
+robust to the heavy tail of the global resample). It is **seeded/reproducible** and **cached**
 (`bootstrap_errors.csv` + per-replica `bootstrap_samples.npz`). Run it (opt-in, heavy) for the
 clusters/branches you plot:
 
@@ -199,8 +200,13 @@ python -m pipeline.cli.bootstrap --cluster kimcheon --suffix _pnplus --branch bo
 ```
 
 Once the cache exists, `viz.map_catalog`/`depth_sections`/`compare_epicenters`/`fault_sections`/`plot_3d_plane`
-draw the 95% bars automatically (rotated into the along/across/depth frame for the fault sections; 3-D
-`error_x/y/z` for the plotly view). `03_results.ipynb` computes/loads it and tabulates bootstrap-vs-internal.
+draw the 95% bars automatically (E/N on the map view, rotated into along/across/depth for the fault sections,
+3-D `error_x/y/z` for the plotly view) and **drop events the bootstrap flags as under-constrained** (95%
+horizontal half-width > 0.1 km or `n_boot` < 0.6·n; tunable), noting the count. Hypocentre **circles scale by
+KMA local magnitude** (the reloc `mag` is 0, so the catalog magnitude is used). `03_results_<cluster>.ipynb`
+computes/loads the bootstrap and tabulates bootstrap-vs-internal. *(Example: Kimcheon 200007 has good CC and a
+recovered main location, but is shallow with a 121° azimuthal gap → genuinely under-determined, so it's
+dropped.)*
 
 **Other clusters.** All four clusters relocate (locations + dt.cc), but only **Gwangyang** has the
 focal-sphere coverage for *well-constrained* mechanisms. Jangsung/Kimcheon events are shallow (~0.3–6 km),

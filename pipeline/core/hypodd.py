@@ -435,6 +435,24 @@ def _resample_global(blocks, rng):
     return [(blocks[bi][0], regrouped[bi]) for bi in range(len(blocks)) if regrouped[bi]]
 
 
+def _seed_event_dat(src_event_dat, reloc_df):
+    """Return an event.dat whose LAT/LON/DEPTH are replaced, per event ID, by that event's position in the
+    main relocation (`reloc_df`) — so bootstrap replicas start from the converged solution instead of the
+    raw catalog/HYPOINVERSE start. Events absent from the reloc keep their catalog line. Free-format
+    columns: DATE TIME LAT LON DEPTH MAG EH EZ RMS ID."""
+    pos = {int(r.id): (float(r.lat), float(r.lon), float(r.depth)) for r in reloc_df.itertuples()}
+    out = []
+    for line in open(src_event_dat):
+        t = line.split()
+        if len(t) >= 10 and t[-1].lstrip("-").isdigit() and int(t[-1]) in pos:
+            la, lo, dp = pos[int(t[-1])]
+            t[2], t[3], t[4] = f"{la:.4f}", f"{lo:.4f}", f"{dp:.3f}"
+            out.append("  ".join(t) + "\n")
+        else:
+            out.append(line if line.endswith("\n") else line + "\n")
+    return "".join(out)
+
+
 def _bootstrap_meta(csv_path):
     """Read the `# bootstrap_errors n=.. seed=.. ..` provenance header of a cached errors CSV."""
     try:
@@ -477,14 +495,19 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
     if cache and os.path.exists(out_csv):
         meta = _bootstrap_meta(out_csv)
         if (meta.get("n") == str(n) and meta.get("seed") == str(seed) and meta.get("branch") == branch
-                and meta.get("align") == "median" and meta.get("ci") == "percentile2.5-97.5"):
-            return pd.read_csv(out_csv, comment="#")          # align/ci tags invalidate pre-fix caches
+                and meta.get("align") == "median" and meta.get("ci") == "percentile2.5-97.5"
+                and meta.get("init") == "solution"):
+            return pd.read_csv(out_csv, comment="#")          # align/ci/init tags invalidate old caches
 
     dt_files = ["dt.ct"] + ([cfg.hypodd_dtcc_variants["default"].cc_file] if branch == "dtcc" else [])
     base_blocks = {fn: _parse_dt_blocks(os.path.join(bdir, fn)) for fn in dt_files}
-    aux = ("event.dat", "event.sel", "station.dat", "hypoDD.inp")
+    aux = ("event.sel", "station.dat", "hypoDD.inp")          # event.dat is written solution-seeded
     main = sumio.read_reloc(reloc0)
     main_xyz = {int(r.id): (float(r.x), float(r.y), float(r.z)) for r in main.itertuples()}
+    # Start every replica from the CONVERGED solution (not the raw catalog), so the error reflects the
+    # data-driven spread around the solution, not each replica's ability to re-converge from a poor
+    # initial absolute location (e.g. a shallow, large-azimuthal-gap event). ISTART=1 reads event.dat.
+    seeded_event_dat = _seed_event_dat(os.path.join(bdir, "event.dat"), main)
 
     def _one(i):
         rng = np.random.default_rng(seed + i)
@@ -494,6 +517,8 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
                 s = os.path.join(bdir, a)
                 if os.path.exists(s):
                     shutil.copyfile(s, os.path.join(d, a))
+            with open(os.path.join(d, "event.dat"), "w") as f:
+                f.write(seeded_event_dat)
             for fn, blk in base_blocks.items():
                 _write_dt_blocks(os.path.join(d, fn), _resample_global(blk, rng))
             try:                                            # a pathological resample can fail / overflow
@@ -546,7 +571,7 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
     if cache:
         with open(out_csv, "w") as f:
             f.write(f"# bootstrap_errors n={n} seed={seed} branch={branch} cluster={cfg.name} "
-                    f"resample=global ci=percentile2.5-97.5 align=median\n")
+                    f"resample=global ci=percentile2.5-97.5 align=median init=solution\n")
             out.to_csv(f, index=False)
         np.savez(os.path.join(bdir, "bootstrap_samples.npz"),
                  data=np.asarray(samp_rows, dtype=float) if samp_rows else np.empty((0, 4)))

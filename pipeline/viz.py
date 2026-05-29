@@ -95,22 +95,89 @@ def _pct_hw(samples, v=None):
     return (np.percentile(a, 97.5, axis=0) - np.percentile(a, 2.5, axis=0)) / 2.0
 
 
+def _event_magnitudes(cfg):
+    """{cuspid: KMA local magnitude} from the event catalog (KST origins), matched to the UTC event dirs
+    via the cuspid scheme (cuspid = cfg.cuspid_offset + index over sorted waveform dirs; reloc/mechanism
+    `id` IS the cuspid). The reloc `mag` column is 0, so this catalog lookup is the magnitude source.
+    Returns {} on any failure (callers fall back to a default marker size)."""
+    try:
+        cat = pd.read_csv(cfg.event_catalog_csv)
+        eid2mag = {}
+        for r in cat.itertuples():
+            t = UTCDateTime(int(r.year), int(r.month), int(r.day), int(r.hour), int(r.minute),
+                            int(r.second)) - cfg.kst_offset_hours * 3600
+            eid2mag[t.strftime("%Y%m%d%H%M%S")] = float(r.magnitude)
+        dirs = sorted(glob.glob(os.path.join(config.waveforms_dir(cfg), "20*")))
+        return {cfg.cuspid_offset + i: eid2mag[os.path.basename(d)]
+                for i, d in enumerate(dirs) if os.path.basename(d) in eid2mag}
+    except Exception:                                # noqa: BLE001
+        return {}
+
+
+def _mag_size(mags, smin=20.0, smax=1200.0):
+    """Marker areas ∝ exp(magnitude) (the originals' `s = 5·exp(2·M)`), clipped to [smin, smax]. NaN
+    entries (events without a catalog match) use the median magnitude so they still plot."""
+    m = np.asarray(mags, dtype=float)
+    if not np.isfinite(m).any():
+        m = np.ones_like(m)
+    med = np.nanmedian(m)
+    m = np.where(np.isfinite(m), m, med)
+    return np.clip(5.0 * np.exp(2.0 * m), smin, smax)
+
+
+def _mag_for(cfg, ids):
+    """Magnitude array aligned to `ids` (cuspids) from `_event_magnitudes` (NaN where unmatched)."""
+    mg = _event_magnitudes(cfg)
+    return np.array([mg.get(int(i), np.nan) for i in ids], dtype=float)
+
+
+# bootstrap-flagged "under-constrained" events are dropped from the dt.cc views: their relative location
+# is poorly determined (large 95% spread / few stable replicas) — e.g. a shallow, large-azimuthal-gap event
+# whose good CC data still can't resolve it. Tunable.
+BOOT_DROP_HORIZ_KM = 0.1            # drop if the 95% horizontal half-width √(ex95²+ey95²) exceeds this
+BOOT_DROP_MIN_NBOOT_FRAC = 0.6      # ...or if relocated in fewer than this fraction of replicas
+
+
+def _boot_underconstrained(cfg, branch):
+    """Cuspids the bootstrap flags as under-constrained (drop them from the dt.cc views): horizontal 95%
+    half-width > `BOOT_DROP_HORIZ_KM`, or `n_boot` below `BOOT_DROP_MIN_NBOOT_FRAC` of the replicas, or no
+    CI at all. Empty set when there's no bootstrap cache (so plots are unchanged without one)."""
+    bdir = config.dtcc_dir(cfg) if "cc" in branch else config.dtct_dir(cfg)
+    p = os.path.join(bdir, "bootstrap_errors.csv")
+    if not os.path.exists(p):
+        return set()
+    import re
+    n = next((int(m.group(1)) for m in [re.search(r"\bn=(\d+)", open(p).readline())] if m), None)
+    df = pd.read_csv(p, comment="#")
+    bad = set()
+    for r in df.itertuples():
+        horiz = np.hypot(r.ex95, r.ey95) / 1000.0 if np.isfinite(r.ex95) else np.inf
+        if (not np.isfinite(r.ex95) or horiz > BOOT_DROP_HORIZ_KM
+                or (n and r.n_boot < BOOT_DROP_MIN_NBOOT_FRAC * n)):
+            bad.add(int(r.id))
+    return bad
+
+
 def map_catalog(cfg, velmodel="kim1983", source="sum", ax=None):
     """Epicenter map coloured by depth, with the used stations. source = 'sum'|'reloc'.
     For source='reloc' the headline dt.cc relocation is shown (dt.ct fallback)."""
     branch = velmodel
+    ndrop = 0
     if source == "sum":
         df = sumio.read_sum(config.sum_file(cfg, velmodel))
     else:
         path, branch = _reloc_path(cfg)
         df = sumio.read_reloc(path)
+        drop = _boot_underconstrained(cfg, branch)   # bootstrap-flagged under-constrained events
+        ndrop = int(df.id.isin(drop).sum())
+        df = df[~df.id.isin(drop)]
     sta = pd.read_csv(config.used_stations_csv(cfg))
     if ax is None:
         _, ax = plt.subplots(figsize=(6, 6), dpi=110)
     ax.scatter(sta.Longitude, sta.Latitude, marker="^", s=40, c="0.6",
                edgecolor="k", label=f"Stations ({len(sta)})", zorder=2)
-    sc = ax.scatter(df.lon, df.lat, c=df.depth, s=60, cmap="viridis_r",
-                    edgecolor="k", zorder=3)
+    sc = ax.scatter(df.lon, df.lat, c=df.depth, s=_mag_size(_mag_for(cfg, df.id)), cmap="viridis_r",
+                    edgecolor="k", zorder=3)                 # circle area ∝ M_L
     plt.colorbar(sc, ax=ax, label="Depth (km)", shrink=0.8)
     boot = _load_bootstrap(cfg, branch) if source == "reloc" else None
     if boot:                                     # 95% bootstrap X/Y error bars (percentile, m -> deg)
@@ -124,8 +191,9 @@ def map_catalog(cfg, velmodel="kim1983", source="sum", ax=None):
     ax.scatter(*cfg.epicenter[::-1], marker="*", s=300, c="red",
                edgecolor="k", zorder=4, label="Cluster center")
     bl = " + 95% bootstrap" if boot else ""
+    dl = f", {ndrop} under-constrained dropped" if ndrop else ""
     ax.set(xlabel="Longitude", ylabel="Latitude",
-           title=f"{cfg.region} — {len(df)} events ({source}:{branch}{bl})")
+           title=f"{cfg.region} — {len(df)} events ({source}:{branch}{bl}{dl})")
     ax.legend(loc="best", fontsize=8); ax.set_aspect("equal", "datalim")
     _format_lonlat(ax)
     return ax.figure
@@ -140,11 +208,13 @@ def depth_sections(cfg, velmodel="kim1983", source="sum"):
     else:
         path, branch = _reloc_path(cfg)
         df = sumio.read_reloc(path)
+        df = df[~df.id.isin(_boot_underconstrained(cfg, branch))]   # drop under-constrained
     boot = _load_bootstrap(cfg, branch) if source == "reloc" else None
+    sz = _mag_size(_mag_for(cfg, df.id))         # circle area ∝ M_L
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4), dpi=110)
-    a1.scatter(df.lon, df.depth, s=40, c="steelblue", edgecolor="k", zorder=3)
+    a1.scatter(df.lon, df.depth, s=sz, c="steelblue", edgecolor="k", zorder=3)
     a1.set(xlabel="Longitude", ylabel="Depth (km)", title=f"{cfg.region} longitude-depth")
-    a2.scatter(df.lat, df.depth, s=40, c="steelblue", edgecolor="k", zorder=3)
+    a2.scatter(df.lat, df.depth, s=sz, c="steelblue", edgecolor="k", zorder=3)
     a2.set(xlabel="Latitude", ylabel="Depth (km)", title="Latitude-depth")
     if boot:                                     # 95% bootstrap bars: depth (Z) + horizontal (X/Y)
         for r in df.itertuples():
@@ -387,8 +457,9 @@ def map_mechanisms(cfg, velmodel=None, quality_keep=("A", "B"), ax=None):
     norm = mpl.colors.Normalize(vmin=float(m.origin_depth_km.min()),
                                 vmax=float(m.origin_depth_km.max()))
     cmap = plt.get_cmap("viridis_r")
+    msz = (_mag_size(m.magnitude.to_numpy()) if "magnitude" in m.columns else 55)   # area ∝ M_L
     sc = ax.scatter(m.origin_lon, m.origin_lat, c=m.origin_depth_km, cmap=cmap, norm=norm,
-                    s=55, edgecolor="k", lw=0.5, zorder=4, label=f"Located events ({len(m)})")
+                    s=msz, edgecolor="k", lw=0.5, zorder=4, label=f"Located events ({len(m)})")
     plt.colorbar(sc, ax=ax, label="Depth (km)", shrink=0.8)
 
     keep = m[m.quality.isin(list(quality_keep))]
@@ -489,6 +560,8 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
     if not os.path.exists(reloc):
         axes[0].set_title(f"{cfg.region}: no HypoDD reloc (run ph2dt→dtcc first)"); return fig
     d = sumio.read_reloc(reloc).reset_index(drop=True)
+    ndrop = int(d.id.isin(_boot_underconstrained(cfg, branch)).sum())   # under-constrained -> drop
+    d = d[~d.id.isin(_boot_underconstrained(cfg, branch))].reset_index(drop=True)
     if not len(d):
         axes[0].set_title(f"{cfg.region}: empty reloc"); return fig
 
@@ -524,22 +597,25 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
         ct, st, cdip, sdip = np.cos(th), np.sin(th), np.cos(np.deg2rad(used_dip)), np.sin(np.deg2rad(used_dip))
         v_al = np.array([ct, st, 0.0]); v_ac = np.array([-st, ct, 0.0])
         v_z = np.array([0.0, 0.0, 1.0]); v_ad = np.array([-st * cdip, ct * cdip, sdip])
-        sig_al, sig_ac, sig_dp, sig_ad = (np.full(len(d), np.nan) for _ in range(4))
+        v_e = np.array([1.0, 0.0, 0.0]); v_n = np.array([0.0, 1.0, 0.0])
+        sig_al, sig_ac, sig_dp, sig_ad, sig_e, sig_n = (np.full(len(d), np.nan) for _ in range(6))
         for i, e in enumerate(d.id.astype(int)):
             if e in boot:
                 s = boot[e]
                 sig_al[i], sig_ac[i] = _pct_hw(s, v_al) / 1000.0, _pct_hw(s, v_ac) / 1000.0
                 sig_dp[i], sig_ad[i] = _pct_hw(s, v_z) / 1000.0, _pct_hw(s, v_ad) / 1000.0
+                sig_e[i], sig_n[i] = _pct_hw(s, v_e) / 1000.0, _pct_hw(s, v_n) / 1000.0
 
-    # --- colour (origin time by default, as in the originals) + magnitude-scaled hollow markers ---
-    mag = np.nan_to_num(d.mag.to_numpy(), nan=0.0)
-    sz = np.clip(5.0 * np.exp(2.0 * mag), 25, 1500)
+    # --- colour (origin time by default) + KMA-magnitude-scaled hollow markers (reloc mag is 0) ---
+    mag = _mag_for(cfg, d.id)                      # KMA local magnitude per event (NaN if unmatched)
+    sz = _mag_size(mag, smin=25, smax=1500)
     if color_by == "time" and "time" in d and d.time.notna().any():
         cv = np.array(mdates.date2num([t.datetime for t in d.time]))
         norm = mcolors.Normalize(vmin=cv.min(), vmax=cv.max() if cv.max() > cv.min() else cv.min() + 1)
         cmap = plt.get_cmap("coolwarm"); cbar_label = "Origin time"
     elif color_by == "mag":
-        cv = mag; norm = mcolors.Normalize(vmin=cv.min(), vmax=max(cv.max(), cv.min() + 0.1))
+        cv = np.nan_to_num(mag, nan=float(np.nanmedian(mag)) if np.isfinite(mag).any() else 1.0)
+        norm = mcolors.Normalize(vmin=cv.min(), vmax=max(cv.max(), cv.min() + 0.1))
         cmap = plt.get_cmap("viridis"); cbar_label = "Magnitude"
     else:
         cv = d.depth.to_numpy(); norm = mcolors.Normalize(vmin=np.nanmin(cv), vmax=np.nanmax(cv))
@@ -559,6 +635,9 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
 
     # panel 1 — fault-plane map view (relative E–N km), with fault lines + section labels
     ax = axes[0]
+    if boot is not None:
+        ax.errorbar(rx / 1000.0, ry / 1000.0, xerr=sig_e, yerr=sig_n, fmt="none", ecolor="0.55",
+                    elinewidth=0.6, capsize=1.5, zorder=3)
     ax.scatter(rx / 1000.0, ry / 1000.0, s=sz, facecolors="none", edgecolors=rgba,
                linewidth=1.8, zorder=4)
     ax.plot([-pad * su, pad * su], [-pad * du, pad * du], color="0.35", lw=1.1, ls="-", zorder=2)
@@ -636,7 +715,8 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time"):
     src = "manual" if strike is not None else ("best-fit plane" if svd_strike is not None else "mechanism")
     fmtxt = (f"; mechanism {ref['strike']:.0f}°/{ref['dip']:.0f}° ({ref['quality']})"
              if ref else "")
-    btxt = "  (bars = 95% bootstrap)" if boot is not None else ""
+    btxt = ("  (bars = 95% bootstrap" + (f"; {ndrop} under-constrained dropped)" if ndrop else ")")
+            if boot is not None else "")
     fig.suptitle(f"{cfg.region} — relocated seismicity in fault coordinates ({branch}){btxt}\n"
                  f"strike {used_strike:.0f}°, dip {used_dip:.0f}° [{src}]{fmtxt}", fontsize=13)
     return fig
@@ -648,10 +728,14 @@ def compare_epicenters(cfg, velmodel="kim1983", variant="default"):
     cc_path = os.path.join(config.dtcc_dir(cfg),
                            "hypoDD.reloc" if variant == "default" else f"{variant}/hypoDD.reloc")
     cc = sumio.read_reloc(cc_path)
+    if variant == "default":                     # drop bootstrap-flagged under-constrained events
+        ct = ct[~ct.id.isin(_boot_underconstrained(cfg, "dt.ct"))]
+        cc = cc[~cc.id.isin(_boot_underconstrained(cfg, "dt.cc"))]
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5), dpi=110)
     for ax, df, lab, br in ((a1, ct, "dt.ct", "dt.ct"), (a2, cc, f"dt.cc:{variant}", "dt.cc")):
         if len(df):
-            sc = ax.scatter(df.lon, df.lat, c=df.depth, s=60, cmap="viridis_r", edgecolor="k", zorder=3)
+            sc = ax.scatter(df.lon, df.lat, c=df.depth, s=_mag_size(_mag_for(cfg, df.id)),
+                            cmap="viridis_r", edgecolor="k", zorder=3)   # circle area ∝ M_L
             plt.colorbar(sc, ax=ax, label="Depth (km)", shrink=0.8)
             boot = _load_bootstrap(cfg, br) if variant == "default" else None
             for r in (df.itertuples() if boot else ()):
@@ -704,6 +788,8 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time"):
     velmodel = velmodel or cfg.fm_velmodel
     reloc, branch = _reloc_path(cfg)
     d = sumio.read_reloc(reloc) if os.path.exists(reloc) else pd.DataFrame()
+    if len(d):
+        d = d[~d.id.isin(_boot_underconstrained(cfg, branch))].reset_index(drop=True)   # drop under-constrained
     if not len(d):
         return go.Figure().update_layout(
             title=f"{cfg.region}: no HypoDD reloc (run ph2dt→dtcc first)")
@@ -712,8 +798,9 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time"):
     E = (d.x - x0).to_numpy() / 1000.0
     N = (d.y - y0).to_numpy() / 1000.0
     dep = (d.z - z0).to_numpy() / 1000.0                        # km, +down (Z is positive down)
-    mag = np.nan_to_num(d.mag.to_numpy(), nan=0.0)
-    size = np.clip(4 + 3 * mag, 3, 18)
+    mag = _mag_for(cfg, d.id)                                   # KMA local magnitude (reloc mag is 0)
+    mfill = np.where(np.isfinite(mag), mag, np.nanmedian(mag) if np.isfinite(mag).any() else 1.0)
+    size = np.clip(4 + 4 * mfill, 3, 22)                        # plotly marker px, grows with M_L
 
     if color_by == "time" and "time" in d and d.time.notna().any():
         cvals = np.array(mdates.date2num([t.datetime for t in d.time]))
@@ -736,7 +823,7 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time"):
     data = [go.Scatter3d(x=E, y=N, z=dep, mode="markers", name="Hypocentres",
                          marker=dict(size=size, color=cvals, colorscale=cscale, colorbar=cbar,
                                      line=dict(width=0.5, color="black"), opacity=0.95),
-                         text=[f"{int(i)}  M{m:.1f}" for i, m in zip(d.id, mag)], **err)]
+                         text=[f"{int(i)}  M{m:.1f}" for i, m in zip(d.id, mfill)], **err)]
     title = f"{cfg.region} — 3-D relocated seismicity ({branch})"
     if boot:
         title += "  (bars = 95% bootstrap)"
