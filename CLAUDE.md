@@ -44,14 +44,23 @@ consistent ~N-striking strike-slip; **Jangsung/Kimcheon** (shallow ~0.3–6 km �
 **Results viewer:** `notebooks/03_results_<cluster>.ipynb` (one per cluster) shows the key figures together —
 locations (`viz.map_catalog` .sum + dt.ct/dt.cc reloc, `depth_sections`, `compare_epicenters`), **picks +
 first-motion polarity** (`viz.plot_3c` marks the P polarity; `viz.plot_polarities` is a P-aligned record
-section sorted by azimuth, red=up/blue=down), and focal mechanisms (`viz.map_mechanisms` beachballs on a
-leader-line ring + `viz.mechanism_table` + the SKHASH gallery), and **`viz.fault_sections`** (relocated
-catalog rotated into the fault frame — a 2×2 figure: fault-plane map view + along/across-strike depth
-sections + a fault-plane along-dip view, coloured by origin time). Its orientation is the **relocation
-cloud's own best-fit plane (SVD, `_best_fit_plane`), with the focal mechanism overlaid only for comparison**
-(`strike=`/`dip=` override) — so an under-constrained mechanism (e.g. grade-D Jangsung) can't distort the
-view; the header prints both, making any disagreement explicit. The phasenet_plus run goes through the full
-relocation chain; its HypoDD reloc matches the stead baseline to ≈100 m.
+section sorted by azimuth, red=up/blue=down), **HypoDD inter-event link map** (`viz.link_maps` — dt.ct on
+the left, dt.cc on the right; each line is one (id1,id2) pair coloured + thickened by observation count
+so strong doublets stand out and the connectivity asymmetry between branches is obvious; `min_obs=N`
+declutters big clusters), focal mechanisms (`viz.map_mechanisms` beachballs on a leader-line ring +
+`viz.mechanism_table` + the SKHASH gallery), and **`viz.fault_sections`** (relocated catalog rotated
+into the fault frame — a 2×2 figure: fault-plane map view + along/across-strike depth sections + a
+fault-plane along-dip view, coloured by origin time). Its orientation is governed by the **`frame_from`**
+parameter (notebook-exposed as `FRAME_FROM` in the params block): `"auto"` (default) uses the mainshock's
+nodal plane (NP1/NP2 matched to the SVD strike, picking the plane that aligns with the seismicity
+lineation) when a high-confidence mechanism exists, else SVD; `"svd"` always uses the data-driven
+SVD best-fit plane (`_best_fit_plane`) — use this when the relocation forms a clear lineation but the
+mechanism is small/unreliable (Uiseong-type case, grade-B M1.5 mechanism strike disagrees with the
+relocation lineation by ~34°); `"mechanism"` always uses the mechanism (raises if absent). `strike=`/
+`dip=` still override entirely. The header prints the chosen plane and the mechanism for comparison,
+making any disagreement explicit. `plot_3d_plane` honours the same `frame_from` selector so the 3-D view
+and the 2-D sections stay consistent. The phasenet_plus run goes through the full relocation chain;
+its HypoDD reloc matches the stead baseline to ≈100 m.
 **Located counts** shrink `.sum ≥ dt.ct ≥ dt.cc` (HypoDD keeps only events with enough inter-event links;
 dt.ct drops catalog-isolated events, dt.cc further drops poorly-correlating ones). **dt.cc is the high-end
 product** (errors of metres) and is the headline relocation; `viz.relocation_counts` tabulates the stages.
