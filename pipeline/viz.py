@@ -1037,23 +1037,54 @@ def plot_custom_beachball(cfg, event_id, velmodel=None, ax=None,
     return ax.figure
 
 
-def _fault_ref(cfg, velmodel=None):
-    """Reference (strike, dip, rake, cuspid, magnitude) for the fault sections = the
-    largest-magnitude high-confidence (A/B) mechanism; fallback = best-quality available.
-    None if there are no mechanisms."""
+def _fault_ref(cfg, velmodel=None, mech_select="highest_quality"):
+    """Reference (strike, dip, rake, cuspid, magnitude) for the fault sections + 3D plane.
+
+    `mech_select` controls how the reference event is chosen when there's more than one
+    candidate mechanism:
+
+      - ``"highest_quality"`` (default): pick the **best-graded** mechanism first
+        (A → B → C → D); within the best-available grade, the largest-magnitude wins.
+        So a grade-A M2.2 beats a grade-B M3.5 — quality always wins over magnitude.
+        This matches the intuition that lower-grade solutions are less reliable
+        regardless of source size.
+      - ``"largest_magnitude"``: legacy v1.3.1 behaviour. Within
+        `cfg.fm_quality_keep` (typically A+B as a unified pool), pick the largest
+        magnitude; falls back to all-quality if the pool is empty. Use this to
+        reproduce a pre-v1.3.2 view, or when you specifically want the mainshock
+        regardless of its grade.
+
+    Returns ``None`` if there are no mechanisms."""
     velmodel = velmodel or cfg.fm_velmodel
     path = config.fm_mech_csv(cfg, velmodel)
     if not os.path.exists(path):
         return None
     m = _load_mechanisms(path)
-    hi = m[m.quality.isin(list(cfg.fm_quality_keep))]
-    pool = hi if len(hi) else m
+    if not len(m):
+        return None
+
+    if mech_select == "highest_quality":
+        # Try A, then B, then C, then D (or whatever order SKHASH grades exist in).
+        # Within the chosen grade, largest magnitude wins.
+        for grade in ("A", "B", "C", "D"):
+            pool = m[m.quality == grade]
+            if len(pool):
+                break
+        else:
+            pool = m                                    # no graded events at all; take any
+    elif mech_select == "largest_magnitude":
+        hi = m[m.quality.isin(list(cfg.fm_quality_keep))]
+        pool = hi if len(hi) else m
+    else:
+        raise ValueError(f"unknown mech_select={mech_select!r} "
+                         f"(expected 'highest_quality' or 'largest_magnitude')")
+
     if not len(pool):
         return None
     if "magnitude" in pool.columns and pool["magnitude"].notna().any() and pool["magnitude"].max() > 0:
         r = pool.sort_values("magnitude", ascending=False).iloc[0]
     else:
-        r = pool.iloc[0]                                    # best quality (already sorted)
+        r = pool.iloc[0]                                    # best ordering (mechanisms.csv is sorted)
     return dict(strike=float(r.strike), dip=float(r.dip), rake=float(r.rake),
                 cuspid=int(r.cuspid), quality=str(r.quality),
                 mag=float(r.magnitude) if "magnitude" in r and pd.notna(r.magnitude) else float("nan"),
@@ -1083,8 +1114,11 @@ def _best_fit_plane(x, y, z):
     return strike, dip
 
 
-def _mechanism_plane(cfg, velmodel, svd_strike=None):
-    """Strike/dip of the fault plane from the reference mechanism (largest-magnitude grade-A/B).
+def _mechanism_plane(cfg, velmodel, svd_strike=None, mech_select="highest_quality"):
+    """Strike/dip of the fault plane from the reference mechanism. Reference selection
+    rule is controlled by ``mech_select`` (see `_fault_ref`); default `"highest_quality"`
+    picks the best-graded mechanism first (A → B → C → D), largest magnitude as the
+    in-grade tiebreaker.
 
     A focal mechanism has two nodal planes (NP1 from SKHASH + the conjugate NP2 via obspy
     `aux_plane`). Either could be the actual rupture surface — disambiguation usually comes
@@ -1100,7 +1134,7 @@ def _mechanism_plane(cfg, velmodel, svd_strike=None):
 
     Returns (strike, dip, source_str) or None if no mechanism is available.
     """
-    ref = _fault_ref(cfg, velmodel)
+    ref = _fault_ref(cfg, velmodel, mech_select=mech_select)
     if ref is None:
         return None
     from obspy.imaging.beachball import aux_plane
@@ -1120,7 +1154,7 @@ def _mechanism_plane(cfg, velmodel, svd_strike=None):
 
 
 def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
-                   frame_from="auto"):
+                   frame_from="auto", mech_select="highest_quality"):
     """Relocated seismicity in fault coordinates — a 2×2 figure styled after the original dt.cc
     notebooks: (1) fault-plane map view, (2) along-strike depth section, (3) across-strike depth
     section (with the dashed fault-dip line), (4) fault-plane (along-dip) view.
@@ -1134,8 +1168,12 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
          - "svd": always use the SVD best-fit plane (the v1.1.1 default behavior).
          - "mechanism": always use the mainshock's nodal plane (raises if no mechanism).
 
-    Centred on the largest-magnitude event. Markers coloured by origin time, sized by magnitude.
-    Reads the headline dt.cc relocation (dt.ct fallback).
+    `mech_select` controls which mechanism is treated as the "reference" — see `_fault_ref`.
+    Default `"highest_quality"` prefers a small grade-A over a larger grade-B; pass
+    `"largest_magnitude"` to fall back to v1.3.1 behaviour.
+
+    Markers coloured by origin time, sized by magnitude. Reads the headline dt.cc relocation
+    (dt.ct fallback).
     """
     import matplotlib.dates as mdates
     import matplotlib.colors as mcolors
@@ -1153,13 +1191,14 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     if not len(d):
         axes[0].set_title(f"{cfg.region}: empty reloc"); return fig
 
-    ref = _fault_ref(cfg, velmodel)          # focal mechanism — for overlay/comparison
+    ref = _fault_ref(cfg, velmodel, mech_select=mech_select)  # focal mechanism — for overlay/comparison
 
     # --- orientation: explicit args > frame_from selection > sensible fallback ---
     svd_strike = svd_dip = None
     if len(d) >= 3:
         svd_strike, svd_dip = _best_fit_plane(d.x, d.y, d.z)
-    mech_plane = _mechanism_plane(cfg, velmodel, svd_strike=svd_strike) if ref else None
+    mech_plane = _mechanism_plane(cfg, velmodel, svd_strike=svd_strike,
+                                  mech_select=mech_select) if ref else None
     if strike is not None and dip is not None:
         used_strike, used_dip = strike, dip
         used_source = "explicit args"
@@ -1478,7 +1517,8 @@ def _ellipsoid_points(center, samples, ngrid=14):
     return (sph * (r * np.sqrt(vals))) @ vecs.T + np.asarray(center, float)
 
 
-def plot_3d_plane(cfg, velmodel=None, color_by="time", error="bars", frame_from="auto"):
+def plot_3d_plane(cfg, velmodel=None, color_by="time", error="bars", frame_from="auto",
+                  mech_select="highest_quality"):
     """Interactive 3-D view (**plotly**) of the dt.cc-relocated hypocentres with a fault plane
     overlaid as a translucent patch — rotate/zoom in a notebook. Returns a plotly Figure.
 
@@ -1488,6 +1528,9 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time", error="bars", frame_from=
       - "svd": SVD best-fit plane through the cloud centroid (the v1.1.1 default).
       - "mechanism": mainshock's nodal plane through the mainshock hypocentre (raises if no
         mechanism, or the mainshock isn't in the reloc).
+
+    `mech_select` chooses which mechanism counts as "the mainshock" — see `_fault_ref`.
+    Default `"highest_quality"` prefers the best-graded mechanism over the largest one.
 
     NP1/NP2 disambiguation: the plane whose strike matches the SVD strike better is selected
     as "the fault" (the other is the auxiliary). Depth axis points down.
@@ -1505,7 +1548,7 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time", error="bars", frame_from=
 
     # --- centring: prefer the mainshock hypocentre (required for frame_from='mechanism'),
     # fall back to the cloud centroid for SVD / when no mainshock row is in the reloc.
-    ref = _fault_ref(cfg, velmodel)
+    ref = _fault_ref(cfg, velmodel, mech_select=mech_select)
     refrow = d[d.id == ref["cuspid"]] if ref else d.iloc[0:0]
     if frame_from == "mechanism" and not len(refrow):
         raise RuntimeError(
@@ -1568,7 +1611,8 @@ def plot_3d_plane(cfg, velmodel=None, color_by="time", error="bars", frame_from=
             "  (bars = 95% bootstrap)" if error == "bars" else "")
     if len(d) >= 3:
         svd_strike, svd_dip = _best_fit_plane(d.x, d.y, d.z)
-        mech_plane = _mechanism_plane(cfg, velmodel, svd_strike=svd_strike) if ref else None
+        mech_plane = _mechanism_plane(cfg, velmodel, svd_strike=svd_strike,
+                                      mech_select=mech_select) if ref else None
         # plane orientation per frame_from
         if frame_from == "svd" or (frame_from == "auto" and mech_plane is None):
             strike, dip = svd_strike, svd_dip
