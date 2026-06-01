@@ -991,8 +991,14 @@ def plot_custom_beachball(cfg, event_id, velmodel=None, ax=None,
                 # outliers if they want)
                 vmax = min(vmax, max(abs(sp_log_clip[0]), abs(sp_log_clip[1])))
                 norm = mpl.colors.Normalize(vmin=-vmax, vmax=vmax)
-                ox, oy = 0.07, -0.07         # offset so the S/P marker doesn't sit on the triangle
-                sc = ax.scatter(sp._x + ox, sp._y + oy, marker="o",
+                # S/P circles must be at the EXACT projected (az, takeoff) position — same
+                # as the polarity triangle. Earlier versions added a constant (+0.07, -0.07)
+                # offset for visual separation, but that (a) misrepresented the geometry and
+                # (b) pushed markers outside the unit circle for horizontal-ray stations
+                # (r_polarity ≈ 1). Now: plot at sp._x, sp._y unmodified; the triangle
+                # markers (`^` / `v`, larger and fully filled) and the S/P circle (`o`,
+                # smaller, viridis-coloured) remain distinguishable when stacked.
+                sc = ax.scatter(sp._x, sp._y, marker="o",
                                 c=np.clip(sp_log, -vmax, vmax), cmap="RdBu_r", norm=norm,
                                 s=55, edgecolor="k", linewidth=0.5, alpha=0.95, zorder=6)
                 cb = plt.colorbar(sc, ax=ax, shrink=0.55, pad=0.08, location="right")
