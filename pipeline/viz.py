@@ -1238,9 +1238,16 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     rx, ry = (d.x - x0).to_numpy(), (d.y - y0).to_numpy()         # metres, relative to centre
     th = np.deg2rad(90.0 - used_strike)
     along = (rx * np.cos(th) + ry * np.sin(th)) / 1000.0          # km, +ve in strike azimuth
-    across = (-rx * np.sin(th) + ry * np.cos(th)) / 1000.0        # km
+    across = (-rx * np.sin(th) + ry * np.cos(th)) / 1000.0        # km, +ve in LEFT-of-strike direction
     dep = (d.z.to_numpy() - z0) / 1000.0                          # km, +down (Z is positive down)
-    along_dip = across * np.cos(np.deg2rad(used_dip)) + dep * np.sin(np.deg2rad(used_dip))   # km
+    # Along-dip projection: the right-hand-rule dip-direction is the OPPOSITE of `across`
+    # (across points LEFT of strike; dip-direction points RIGHT of strike). So the on-fault
+    # along-dip distance is `-across·cos(δ) + dep·sin(δ)`. Previously this was written as
+    # `+across·cos(δ) + dep·sin(δ)`, which gave the wrong sign + a factor-cos(2δ)/cos(δ)
+    # distortion (degenerating to zero at δ=45° — verified by a synthetic-fault test). Fixed
+    # in 2026-06-01 — the panel-3 dashed dip-line already uses the right-hand-rule convention
+    # (slope -tan(δ) descending to +across), and now panel-4 is consistent with it.
+    along_dip = -across * np.cos(np.deg2rad(used_dip)) + dep * np.sin(np.deg2rad(used_dip))   # km
 
     # --- 95% bootstrap error bars, rotated into the fault frame (percentile of projected samples) ---
     boot = _load_bootstrap(cfg, branch)
@@ -1248,7 +1255,10 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     if boot:
         ct, st, cdip, sdip = np.cos(th), np.sin(th), np.cos(np.deg2rad(used_dip)), np.sin(np.deg2rad(used_dip))
         v_al = np.array([ct, st, 0.0]); v_ac = np.array([-st, ct, 0.0])
-        v_z = np.array([0.0, 0.0, 1.0]); v_ad = np.array([-st * cdip, ct * cdip, sdip])
+        # v_ad: down-dip direction in (E, N, +down). Horizontal component is the right-hand-
+        # rule dip direction (RIGHT of strike = -across_vector) × cos(δ); vertical is +sin(δ).
+        # Was `(-st*cdip, ct*cdip, sdip)` — same sign bug as the along_dip formula above.
+        v_z = np.array([0.0, 0.0, 1.0]); v_ad = np.array([st * cdip, -ct * cdip, sdip])
         v_e = np.array([1.0, 0.0, 0.0]); v_n = np.array([0.0, 1.0, 0.0])
         sig_al, sig_ac, sig_dp, sig_ad, sig_e, sig_n = (np.full(len(d), np.nan) for _ in range(6))
         for i, e in enumerate(d.id.astype(int)):
@@ -1461,7 +1471,9 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
     along = (rx * np.cos(th) + ry * np.sin(th)) / 1000.0
     across = (-rx * np.sin(th) + ry * np.cos(th)) / 1000.0
     dep = (d.z.to_numpy() - z0) / 1000.0
-    along_dip = across * np.cos(np.deg2rad(used_dip)) + dep * np.sin(np.deg2rad(used_dip))
+    # See fault_sections for the sign derivation — eq-cycle's `+across` is LEFT-of-strike
+    # while the right-hand-rule dip-direction is RIGHT-of-strike, hence the leading minus.
+    along_dip = -across * np.cos(np.deg2rad(used_dip)) + dep * np.sin(np.deg2rad(used_dip))
     rx_km, ry_km = rx / 1000.0, ry / 1000.0
 
     # --- colour by origin time, size by magnitude ---
@@ -1531,11 +1543,15 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
     _style(ax); ax.invert_yaxis()
     ax.legend(loc="upper right", fontsize=10, framealpha=0.9)
 
-    # Panel 4 — fault-plane (along-dip) view
+    # Panel 4 — fault-plane (along-dip) view. Invert y so down-dip-deeper events appear at the
+    # BOTTOM (consistent with the static `fault_sections` panel 4); A / A' labels mark the
+    # along-strike line at the up-dip edge (top after the inversion).
     ax = axes[3]
+    ax.text(-0.92 * R, -0.88 * R, "A", fontsize=16, fontweight="bold")
+    ax.text(0.86 * R, -0.88 * R, "A'", fontsize=16, fontweight="bold")
     ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Along-strike distance (km)",
            ylabel="Along-dip distance (km)", title="Fault-plane view (along-dip)")
-    _style(ax)
+    _style(ax); ax.invert_yaxis()
 
     # Dynamic scatters — one per panel, populated per frame
     sc0 = axes[0].scatter([], [], s=[], facecolors="none", edgecolors=[], linewidth=1.8, zorder=4)
