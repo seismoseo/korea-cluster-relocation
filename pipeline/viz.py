@@ -1494,9 +1494,16 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
     mag = _mag_for(cfg, d.id)
     sz = _mag_size(mag, smin=25, smax=1500)
 
-    # --- figure layout (matches fault_sections panels) ---
-    fig, axarr = plt.subplots(2, 2, figsize=(11, 10), dpi=110, constrained_layout=True)
-    axes = axarr.ravel()
+    # --- figure layout: 2×2 section panels + a wide time-magnitude reference strip below ---
+    # The strip shows all events as faded gray dots (full timeline reference, fixed) plus the
+    # cumulative subset highlighted in the same coolwarm-by-time colour as the main panels +
+    # a vertical cursor at t_now. Lets the viewer see "where in the sequence" each frame is
+    # without having to interpret only the changing scatter density.
+    fig = plt.figure(figsize=(11, 12.6), dpi=110, constrained_layout=True)
+    _gs = fig.add_gridspec(3, 2, height_ratios=[1.0, 1.0, 0.45])
+    axes = np.array([fig.add_subplot(_gs[0, 0]), fig.add_subplot(_gs[0, 1]),
+                     fig.add_subplot(_gs[1, 0]), fig.add_subplot(_gs[1, 1])])
+    ax_tm = fig.add_subplot(_gs[2, :])
     L = (max(np.ptp(rx), np.ptp(ry)) / 1000.0) or 0.2
     pad = 1.25 * L
     R = 1.15 * max(np.nanmax(np.abs(along)), np.nanmax(np.abs(across)),
@@ -1565,6 +1572,35 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
     sc2 = axes[2].scatter([], [], s=[], facecolors="none", edgecolors=[], linewidth=1.8, zorder=4)
     sc3 = axes[3].scatter([], [], s=[], facecolors="none", edgecolors=[], linewidth=1.8, zorder=4)
 
+    # --- time-magnitude reference strip (bottom row of GridSpec) ---
+    # Always-on backdrop: every catalog event as a small faded gray dot at its (origin, mag).
+    # Dynamic foreground: the cumulative subset coloured by origin time (same coolwarm cmap as
+    # the section scatters above), plus a vertical cursor line at the current frame's t_now.
+    times_dt = times                                          # list of datetime
+    mag_for_tm = np.where(np.isfinite(mag), mag, np.nanmin(mag) if np.isfinite(mag).any() else 0.0)
+    ax_tm.scatter(times_dt, mag_for_tm, s=18, facecolor="0.82", edgecolor="0.62",
+                   linewidth=0.4, zorder=2)
+    sc_tm = ax_tm.scatter([], [], s=[], facecolors="none", edgecolors=[], linewidth=1.4, zorder=4)
+    cursor = ax_tm.axvline(times_dt[0], color="0.25", lw=1.0, ls=":", zorder=3)
+    # Y-range padding so M~0 events are visible and M~5+ doesn't clip
+    _mlo = float(np.nanmin(mag_for_tm) - 0.3)
+    _mhi = float(np.nanmax(mag_for_tm) + 0.3)
+    if not (_mhi > _mlo):
+        _mhi = _mlo + 1.0
+    ax_tm.set_xlim(times_dt[0], times_dt[-1])
+    ax_tm.set_ylim(_mlo, _mhi)
+    ax_tm.set_facecolor("#FAFAFA"); ax_tm.grid(True, linestyle=":", alpha=0.7)
+    ax_tm.set_ylabel("KMA magnitude", fontsize=11)
+    ax_tm.set_title("Time vs magnitude  (gray = all events, coloured = cumulative through current frame)",
+                    fontsize=10, loc="left")
+    # Format the date axis: just enough ticks for readability
+    import matplotlib.ticker as _ticker
+    ax_tm.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=7))
+    ax_tm.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    ax_tm.tick_params(labelsize=10)
+    for _lbl in ax_tm.get_xticklabels():
+        _lbl.set_rotation(0)
+
     # Frame timeline + suptitle. d.time is obspy.UTCDateTime per cluster (not pandas);
     # normalise via the .datetime attribute (or .to_pydatetime() if pandas Timestamp).
     def _as_py(t):
@@ -1582,6 +1618,13 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
     fmtxt = (f"   |   mechanism {ref['strike']:.0f}°/{ref['dip']:.0f}° ({ref['quality']})"
              if ref else "")
 
+    # Pre-compute the time-magnitude reference points so the inner loop just slices them.
+    tm_xy = np.column_stack([mdates.date2num(times_dt), mag_for_tm])
+    # Slightly smaller markers on the time strip than in the section panels — keeps the
+    # strip from feeling visually noisy when many events have lit up. Same coolwarm-by-time
+    # colour mapping as `rgba` so the eye links the cursor to the corresponding section dots.
+    sz_tm = np.clip(sz * 0.5, 20, 220)
+
     def _update(i):
         t_now = frame_times[i]
         # cumulative mask: events with origin ≤ t_now
@@ -1596,15 +1639,18 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
             sc2.set_sizes(sz[m]); sc2.set_edgecolors(rgba[m])
             sc3.set_offsets(np.column_stack([along[m], along_dip[m]]))
             sc3.set_sizes(sz[m]); sc3.set_edgecolors(rgba[m])
+            sc_tm.set_offsets(tm_xy[m])
+            sc_tm.set_sizes(sz_tm[m]); sc_tm.set_edgecolors(rgba[m])
         else:
-            for sc in (sc0, sc1, sc2, sc3):
+            for sc in (sc0, sc1, sc2, sc3, sc_tm):
                 sc.set_offsets(np.empty((0, 2)))
                 sc.set_sizes([]); sc.set_edgecolors([])
+        cursor.set_xdata([mdates.date2num(t_now)])
         title_text.set_text(
             f"{cfg.region} — seismicity time-lapse ({branch})\n"
             f"strike {used_strike:.0f}°, dip {used_dip:.0f}° [{used_source}]{fmtxt}\n"
             f"{t_now:%Y-%m-%d %H:%M:%S} UTC   |   {n_cum} / {n_events} events")
-        return sc0, sc1, sc2, sc3, title_text
+        return sc0, sc1, sc2, sc3, sc_tm, cursor, title_text
 
     anim = FuncAnimation(fig, _update, frames=frames, interval=1000.0 / fps, blit=False)
 
