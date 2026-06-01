@@ -142,14 +142,17 @@ def _cuspid_event_ids(cfg):
 # bootstrap-flagged "under-constrained" events are dropped from the dt.cc views: their relative location
 # is poorly determined (large 95% spread / few stable replicas) — e.g. a shallow, large-azimuthal-gap event
 # whose good CC data still can't resolve it. Tunable.
-BOOT_DROP_HORIZ_KM = 0.1            # drop if the 95% horizontal half-width √(ex95²+ey95²) exceeds this
+BOOT_DROP_HORIZ_KM = 0.1            # drop if the 95% horizontal half-width √(ex95²+ey95²) exceeds this (km)
+BOOT_DROP_VERT_KM  = 0.1            # drop if the 95% vertical half-width ez95 exceeds this (km); set None to disable
 BOOT_DROP_MIN_NBOOT_FRAC = 0.6      # ...or if relocated in fewer than this fraction of replicas
 
 
 def _boot_underconstrained(cfg, branch):
     """Cuspids the bootstrap flags as under-constrained (drop them from the dt.cc views): horizontal 95%
-    half-width > `BOOT_DROP_HORIZ_KM`, or `n_boot` below `BOOT_DROP_MIN_NBOOT_FRAC` of the replicas, or no
-    CI at all. Empty set when there's no bootstrap cache (so plots are unchanged without one)."""
+    half-width > `BOOT_DROP_HORIZ_KM`, vertical 95% half-width > `BOOT_DROP_VERT_KM` (when not None),
+    `n_boot` below `BOOT_DROP_MIN_NBOOT_FRAC` of the replicas, or no CI at all. Empty set when there's no
+    bootstrap cache (so plots are unchanged without one). The three constants are module-level so a
+    notebook can `viz.BOOT_DROP_VERT_KM = 0.5` to relax per-run."""
     bdir = config.dtcc_dir(cfg) if "cc" in branch else config.dtct_dir(cfg)
     p = os.path.join(bdir, "bootstrap_errors.csv")
     if not os.path.exists(p):
@@ -160,8 +163,10 @@ def _boot_underconstrained(cfg, branch):
     bad = set()
     for r in df.itertuples():
         horiz = np.hypot(r.ex95, r.ey95) / 1000.0 if np.isfinite(r.ex95) else np.inf
+        vert  = r.ez95 / 1000.0 if np.isfinite(r.ez95) else np.inf
         if (not np.isfinite(r.ex95) or horiz > BOOT_DROP_HORIZ_KM
-                or (n and r.n_boot < BOOT_DROP_MIN_NBOOT_FRAC * n)):
+                or (n and r.n_boot < BOOT_DROP_MIN_NBOOT_FRAC * n)
+                or (BOOT_DROP_VERT_KM is not None and vert > BOOT_DROP_VERT_KM)):
             bad.add(int(r.id))
     return bad
 
