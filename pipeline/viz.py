@@ -1399,7 +1399,7 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
 
 def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
                        frame_from="auto", mech_select="highest_quality",
-                       fps=8, frames=None, out_path=None, return_html=False):
+                       fps=4, frames=None, out_path=None, return_html=False):
     """Cumulative time-lapse animation in the **same 4-panel fault-frame layout** as
     `fault_sections`. Each frame is the running set of events with origin time ≤ t,
     where t walks from the cluster's first origin to its last in `frames` equal
