@@ -59,8 +59,13 @@ mechanism is small/unreliable (Uiseong-type case, grade-B M1.5 mechanism strike 
 relocation lineation by ~34°); `"mechanism"` always uses the mechanism (raises if absent). `strike=`/
 `dip=` still override entirely. The header prints the chosen plane and the mechanism for comparison,
 making any disagreement explicit. `plot_3d_plane` honours the same `frame_from` selector so the 3-D view
-and the 2-D sections stay consistent. The phasenet_plus run goes through the full relocation chain;
-its HypoDD reloc matches the stead baseline to ≈100 m.
+and the 2-D sections stay consistent. **Which mechanism is the "reference"** is controlled by
+**`mech_select`** (notebook-exposed as `MECH_SELECT`): default `"highest_quality"` scans A → B → C → D
+and picks the largest magnitude within the best-available grade — so a grade-A M1.2 beats a grade-B M1.4
+(Hampyeong-type case, where the two planes can rotate by ~140°); legacy `"largest_magnitude"` reproduces
+the v1.3.1 behaviour of picking the largest magnitude inside the unified `cfg.fm_quality_keep` pool. The
+phasenet_plus run goes through the full relocation chain; its HypoDD reloc matches the stead baseline
+to ≈100 m.
 **Located counts** shrink `.sum ≥ dt.ct ≥ dt.cc` (HypoDD keeps only events with enough inter-event links;
 dt.ct drops catalog-isolated events, dt.cc further drops poorly-correlating ones). **dt.cc is the high-end
 product** (errors of metres) and is the headline relocation; `viz.relocation_counts` tabulates the stages.
@@ -111,10 +116,16 @@ falling back to the matplotlib default otherwise.
   _pnplus --branch both`. `viz` draws the 95% bars — recomputed from the samples in each plot's frame
   (E/N on the map view, rotated into along/across/depth for `fault_sections`, `error_x/y/z` in `plot_3d_plane`);
   no cache ⇒ no bars (graceful). The dt.cc views **drop bootstrap-flagged under-constrained events**
-  (`viz._boot_underconstrained`: 95% horizontal half-width > `BOOT_DROP_HORIZ_KM`=0.1, or `n_boot` < 0.6·n)
-  and note the count. *Worked example:* Kimcheon 200007 has plenty of good CC (cc 0.7–0.99) and its main
-  location recovered (0.61→1.96 km), but it is shallow (0.61 km) with a 121° azimuthal gap → genuinely
-  under-determined (seeding from the solution does not shrink its bar) → dropped from the plots.
+  (`viz._boot_underconstrained`: 95% horizontal half-width > `BOOT_DROP_HORIZ_KM`=0.1, 95% vertical
+  half-width ez95 > `BOOT_DROP_VERT_KM`=0.1, or `n_boot` < 0.6·n; set `viz.BOOT_DROP_VERT_KM = None`
+  in a notebook to disable vertical filtering and reproduce v1.3.0 behaviour) and note the count.
+  Notebook params expose `BOOT_DROP_HORIZ_KM`/`BOOT_DROP_VERT_KM` (and assign them onto `viz.*`) so
+  each cluster can tune the threshold; the diagnostic table prints `horiz_ok` / `vert_ok` / `nboot_ok`
+  flags so the drop reason for each event is explicit. *Worked example:* Kimcheon 200007 has plenty
+  of good CC (cc 0.7–0.99) and its main location recovered (0.61→1.96 km), but it is shallow
+  (0.61 km) with a 121° azimuthal gap → genuinely under-determined (seeding from the solution does
+  not shrink its bar) → dropped from the plots. Taean 200010 was the case that motivated adding the
+  vertical filter: horiz 93.7 m (passes 100 m cap) but ez95 187 m (now drops on vertical).
 - **Circles scale by KMA local magnitude** (`viz._event_magnitudes` cuspid→event_id→catalog `magnitude`;
   `_mag_size` = `5·exp(2·M)`), since the reloc `mag` column is 0. Used in every hypocentre scatter. The
   catalog columns are normalised to lowercase first (some clusters' catalogs are `Year`/`Magnitude`, others

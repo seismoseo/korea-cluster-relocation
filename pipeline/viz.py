@@ -1381,6 +1381,223 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     return fig
 
 
+def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
+                       frame_from="auto", mech_select="highest_quality",
+                       fps=8, frames=None, out_path=None, return_html=False):
+    """Cumulative time-lapse animation in the **same 4-panel fault-frame layout** as
+    `fault_sections`. Each frame is the running set of events with origin time ≤ t,
+    where t walks from the cluster's first origin to its last in `frames` equal
+    steps. The fault plane, strike + dip line, and reference-mechanism beachball are
+    static (computed once from the full event set); only the hypocentre scatter +
+    title clock change with t.
+
+    Saves an animated GIF to `out_path` (default `<output_root>/<cluster>_seismicity.gif`)
+    via matplotlib's `PillowWriter` — no ffmpeg or imageio required. Returns the
+    `FuncAnimation` so a notebook can also call `IPython.display.HTML(anim.to_jshtml())`;
+    pass `return_html=True` to get the embeddable HTML directly.
+
+    `frames=None` auto-picks `min(60, 2*n_events)` — enough motion for sparse clusters
+    (Buyeo: 14 events → 28 frames at 8 fps = 3.5 s), capped for dense ones (chungju ~250
+    events → 60 frames = 7.5 s with multiple events accumulating per frame).
+
+    No bootstrap error bars on this view (would be visually noisy frame-to-frame); for
+    the static error-bar view use `fault_sections`."""
+    import matplotlib.dates as mdates
+    import matplotlib.colors as mcolors
+    from matplotlib.animation import FuncAnimation, PillowWriter
+    from obspy.imaging.beachball import beach
+
+    velmodel = velmodel or cfg.fm_velmodel
+    reloc, branch = _reloc_path(cfg)
+    if not os.path.exists(reloc):
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.set_title(f"{cfg.region}: no HypoDD reloc (run ph2dt→dtcc first)")
+        return fig
+    d = sumio.read_reloc(reloc).reset_index(drop=True)
+    d = d[~d.id.isin(_boot_underconstrained(cfg, branch))].reset_index(drop=True)
+    if not len(d):
+        fig, ax = plt.subplots(figsize=(6, 4)); ax.set_title(f"{cfg.region}: empty reloc")
+        return fig
+    # require time column (otherwise animation makes no sense)
+    if "time" not in d.columns or not d.time.notna().any():
+        raise RuntimeError("animate_seismicity needs origin time per event — `time` column missing or all NaN")
+    d = d.sort_values("time").reset_index(drop=True)
+
+    ref = _fault_ref(cfg, velmodel, mech_select=mech_select)
+
+    # --- orientation (mirrors fault_sections) ---
+    svd_strike = svd_dip = None
+    if len(d) >= 3:
+        svd_strike, svd_dip = _best_fit_plane(d.x, d.y, d.z)
+    mech_plane = _mechanism_plane(cfg, velmodel, svd_strike=svd_strike,
+                                  mech_select=mech_select) if ref else None
+    if strike is not None and dip is not None:
+        used_strike, used_dip, used_source = strike, dip, "explicit args"
+    elif frame_from == "svd":
+        used_strike = svd_strike if svd_strike is not None else (ref["strike"] if ref else 0.0)
+        used_dip = svd_dip if svd_dip is not None else (ref["dip"] if ref else 90.0)
+        used_source = "SVD best-fit plane"
+    elif frame_from == "mechanism":
+        if mech_plane is None:
+            raise RuntimeError("frame_from='mechanism' but no focal mechanism available")
+        used_strike, used_dip, used_source = mech_plane
+    else:                                      # "auto"
+        if mech_plane is not None:
+            used_strike, used_dip, used_source = mech_plane
+        elif svd_strike is not None:
+            used_strike, used_dip, used_source = svd_strike, svd_dip, "SVD best-fit plane"
+        else:
+            used_strike, used_dip, used_source = 0.0, 90.0, "default (N-S vertical)"
+
+    # --- centring on the reference event (same rule as fault_sections) ---
+    refrow = d[d.id == ref["cuspid"]] if ref else d.iloc[0:0]
+    if not len(refrow) and "mag" in d and d.mag.notna().any():
+        refrow = d.loc[[d.mag.idxmax()]]
+    x0, y0, z0 = (float(refrow.iloc[0].x), float(refrow.iloc[0].y), float(refrow.iloc[0].z)) \
+        if len(refrow) else (float(d.x.mean()), float(d.y.mean()), float(d.z.mean()))
+
+    rx, ry = (d.x - x0).to_numpy(), (d.y - y0).to_numpy()
+    th = np.deg2rad(90.0 - used_strike)
+    along = (rx * np.cos(th) + ry * np.sin(th)) / 1000.0
+    across = (-rx * np.sin(th) + ry * np.cos(th)) / 1000.0
+    dep = (d.z.to_numpy() - z0) / 1000.0
+    along_dip = across * np.cos(np.deg2rad(used_dip)) + dep * np.sin(np.deg2rad(used_dip))
+    rx_km, ry_km = rx / 1000.0, ry / 1000.0
+
+    # --- colour by origin time, size by magnitude ---
+    def _to_py(t):
+        return t.datetime if hasattr(t, "datetime") else (
+            t.to_pydatetime() if hasattr(t, "to_pydatetime") else t)
+    times = [_to_py(t) for t in d.time]
+    t_num = np.array(mdates.date2num(times))
+    norm = mcolors.Normalize(vmin=t_num.min(), vmax=t_num.max() if t_num.max() > t_num.min() else t_num.min() + 1)
+    cmap = plt.get_cmap("coolwarm")
+    rgba = cmap(norm(t_num))
+    mag = _mag_for(cfg, d.id)
+    sz = _mag_size(mag, smin=25, smax=1500)
+
+    # --- figure layout (matches fault_sections panels) ---
+    fig, axarr = plt.subplots(2, 2, figsize=(11, 10), dpi=110, constrained_layout=True)
+    axes = axarr.ravel()
+    L = (max(np.ptp(rx), np.ptp(ry)) / 1000.0) or 0.2
+    pad = 1.25 * L
+    R = 1.15 * max(np.nanmax(np.abs(along)), np.nanmax(np.abs(across)),
+                   np.nanmax(np.abs(dep)), np.nanmax(np.abs(along_dip)), 1e-3)
+    su, du = np.sin(np.deg2rad(used_strike)), np.cos(np.deg2rad(used_strike))
+
+    def _style(ax):
+        ax.set_aspect("equal", "box"); ax.grid(True, linestyle=":", alpha=0.7)
+        ax.set_facecolor("#FAFAFA"); ax.tick_params(labelsize=11)
+
+    # Static overlays (drawn once)
+    # Panel 1 — fault-plane map view
+    ax = axes[0]
+    ax.plot([-pad * su, pad * su], [-pad * du, pad * du], color="0.35", lw=1.1, ls="-", zorder=2)
+    ax.plot([pad * du, -pad * du], [-pad * su, pad * su], color="0.35", lw=1.1, ls="--", zorder=2)
+    if ref and not np.isnan(ref["rake"]):
+        ax.add_collection(beach((ref["strike"], ref["dip"], ref["rake"]),
+                                xy=(-0.78 * pad, 0.78 * pad), width=0.34 * pad,
+                                facecolor="0.45", edgecolor="k", linewidth=0.8, zorder=5))
+    for sgn, lab in ((1, "A'"), (-1, "A")):
+        ax.text(sgn * 0.97 * pad * su, sgn * 0.97 * pad * du, lab, fontsize=18, fontweight="bold",
+                ha="center", va="center", zorder=6)
+    for sgn, lab in ((1, "B"), (-1, "B'")):
+        ax.text(sgn * 0.97 * pad * du, -sgn * 0.97 * pad * su, lab, fontsize=18, fontweight="bold",
+                ha="center", va="center", zorder=6)
+    ax.set(xlim=(-pad, pad), ylim=(-pad, pad), xlabel="E (km)", ylabel="N (km)",
+           title="Fault-plane map view"); _style(ax)
+
+    # Panel 2 — along-strike depth section
+    ax = axes[1]
+    ax.text(-0.92 * R, -0.88 * R, "A", fontsize=16, fontweight="bold")
+    ax.text(0.86 * R, -0.88 * R, "A'", fontsize=16, fontweight="bold")
+    ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Along-strike distance (km)",
+           ylabel="Depth rel. to reference (km)", title="Along-strike (A–A')")
+    _style(ax); ax.invert_yaxis()
+
+    # Panel 3 — across-strike depth section with dip line
+    ax = axes[2]
+    dip_rad = np.deg2rad(used_dip)
+    xx = np.linspace(-R, R, 50)
+    if abs(np.cos(dip_rad)) > 1e-6:
+        ax.plot(xx, -np.tan(dip_rad) * xx, color="k", lw=1.0, ls="--", zorder=1,
+                label=f"Dip {used_dip:.0f}°")
+    else:
+        ax.axvline(0.0, color="k", lw=1.0, ls="--", zorder=1, label=f"Dip {used_dip:.0f}°")
+    ax.text(-0.92 * R, -0.88 * R, "B", fontsize=16, fontweight="bold")
+    ax.text(0.86 * R, -0.88 * R, "B'", fontsize=16, fontweight="bold")
+    ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Across-strike distance (km)",
+           ylabel="Depth rel. to reference (km)", title="Across-strike (B–B')")
+    _style(ax); ax.invert_yaxis()
+    ax.legend(loc="upper right", fontsize=10, framealpha=0.9)
+
+    # Panel 4 — fault-plane (along-dip) view
+    ax = axes[3]
+    ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Along-strike distance (km)",
+           ylabel="Along-dip distance (km)", title="Fault-plane view (along-dip)")
+    _style(ax)
+
+    # Dynamic scatters — one per panel, populated per frame
+    sc0 = axes[0].scatter([], [], s=[], facecolors="none", edgecolors=[], linewidth=1.8, zorder=4)
+    sc1 = axes[1].scatter([], [], s=[], facecolors="none", edgecolors=[], linewidth=1.8, zorder=4)
+    sc2 = axes[2].scatter([], [], s=[], facecolors="none", edgecolors=[], linewidth=1.8, zorder=4)
+    sc3 = axes[3].scatter([], [], s=[], facecolors="none", edgecolors=[], linewidth=1.8, zorder=4)
+
+    # Frame timeline + suptitle. d.time is obspy.UTCDateTime per cluster (not pandas);
+    # normalise via the .datetime attribute (or .to_pydatetime() if pandas Timestamp).
+    def _as_py(t):
+        return t.datetime if hasattr(t, "datetime") else (
+            t.to_pydatetime() if hasattr(t, "to_pydatetime") else t)
+    n_events = len(d)
+    if frames is None:
+        frames = min(60, max(8, 2 * n_events))
+    t_py = [_as_py(t) for t in d.time]
+    t_min, t_max = min(t_py), max(t_py)
+    span = t_max - t_min if t_max != t_min else (t_max - t_min)
+    frame_times = [t_min + (t_max - t_min) * (i / max(frames - 1, 1)) for i in range(frames)]
+
+    title_text = fig.suptitle("", fontsize=13)
+    fmtxt = (f"   |   mechanism {ref['strike']:.0f}°/{ref['dip']:.0f}° ({ref['quality']})"
+             if ref else "")
+
+    def _update(i):
+        t_now = frame_times[i]
+        # cumulative mask: events with origin ≤ t_now
+        m = np.array([(_as_py(t) <= t_now) for t in d.time])
+        n_cum = int(m.sum())
+        if n_cum:
+            sc0.set_offsets(np.column_stack([rx_km[m], ry_km[m]]))
+            sc0.set_sizes(sz[m]); sc0.set_edgecolors(rgba[m])
+            sc1.set_offsets(np.column_stack([along[m], dep[m]]))
+            sc1.set_sizes(sz[m]); sc1.set_edgecolors(rgba[m])
+            sc2.set_offsets(np.column_stack([across[m], dep[m]]))
+            sc2.set_sizes(sz[m]); sc2.set_edgecolors(rgba[m])
+            sc3.set_offsets(np.column_stack([along[m], along_dip[m]]))
+            sc3.set_sizes(sz[m]); sc3.set_edgecolors(rgba[m])
+        else:
+            for sc in (sc0, sc1, sc2, sc3):
+                sc.set_offsets(np.empty((0, 2)))
+                sc.set_sizes([]); sc.set_edgecolors([])
+        title_text.set_text(
+            f"{cfg.region} — seismicity time-lapse ({branch})\n"
+            f"strike {used_strike:.0f}°, dip {used_dip:.0f}° [{used_source}]{fmtxt}\n"
+            f"{t_now:%Y-%m-%d %H:%M:%S} UTC   |   {n_cum} / {n_events} events")
+        return sc0, sc1, sc2, sc3, title_text
+
+    anim = FuncAnimation(fig, _update, frames=frames, interval=1000.0 / fps, blit=False)
+
+    if out_path is None:
+        os.makedirs(cfg.output_root, exist_ok=True)
+        out_path = os.path.join(cfg.output_root, f"{cfg.name}_seismicity.gif")
+    anim.save(out_path, writer=PillowWriter(fps=fps))
+    print(f"wrote {out_path}  ({frames} frames at {fps} fps, {frames/fps:.1f} s)")
+
+    if return_html:
+        from IPython.display import HTML
+        return HTML(anim.to_jshtml())
+    return anim
+
+
 def compare_epicenters(cfg, velmodel="kim1983", variant="default"):
     """Side-by-side epicenter maps: dt.ct (left) vs dt.cc (right) HypoDD relocations."""
     ct = sumio.read_reloc(os.path.join(config.dtct_dir(cfg), "hypoDD.reloc"))
