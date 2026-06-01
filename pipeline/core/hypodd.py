@@ -165,25 +165,49 @@ hypoDD.res
 """
 
 
+class _MaxData0Overflow(RuntimeError):
+    """Raised when hypoDD aborts with 'STOP >>> Increase MAXDATA0' — the SVD array
+    limit has been exceeded. Caught by `_exec_hypodd` to auto-fallback to LSQR."""
+
+
 def _exec_hypodd_once(d):
     """Run hypoDD once in directory `d` (which must already hold hypoDD.inp + inputs),
     capture stdout to hypoDD.sum, archive per-iteration *.reloc.0* into reloc/, and
-    guard against an empty reloc (the MAXDATA0 overflow). Returns the hypoDD.reloc path."""
+    guard against an empty reloc. Returns the hypoDD.reloc path.
+
+    Raises `_MaxData0Overflow` specifically for the SVD-array-limit failure (so
+    `_exec_hypodd` can transparently retry with LSQR); plain `RuntimeError` for any
+    other empty-reloc cause."""
     os.makedirs(os.path.join(d, "reloc"), exist_ok=True)
     proc = subprocess.run(["hypoDD", "hypoDD.inp"], cwd=d,
                           capture_output=True, text=True)
+    # Capture BOTH stdout and stderr into hypoDD.sum — hypoDD's STOP/ERROR messages
+    # (including 'STOP >>> Increase MAXDATA0') go to stderr, while the normal progress
+    # output goes to stdout. Without stderr we can't detect why the run aborted.
+    sum_text = (proc.stdout or "")
+    if proc.stderr:
+        sum_text += "\n--- stderr ---\n" + proc.stderr
     with open(os.path.join(d, "hypoDD.sum"), "w") as out:
-        out.write(proc.stdout)
+        out.write(sum_text)
     for f in glob(os.path.join(d, "*.reloc.0*")):           # like the baseline hypoDD.sh
         shutil.move(f, os.path.join(d, "reloc", os.path.basename(f)))
     reloc = os.path.join(d, "hypoDD.reloc")
     if not os.path.exists(reloc) or os.path.getsize(reloc) == 0:
-        tail = (proc.stdout or "").strip().splitlines()[-3:]
+        combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        # Detect the SVD-array-limit failure specifically so `_exec_hypodd` can
+        # transparently retry with LSQR. The hypoDD source prints
+        # "STOP >>> Increase MAXDATA0 in hypoDD.inc..." to **stderr** on that path,
+        # and may also print a related complaint on stdout.
+        if "MAXDATA0" in combined:
+            raise _MaxData0Overflow(
+                "hypoDD SVD array overflow (MAXDATA0) — dt observations exceed the "
+                "compiled SVD limit for this binary")
+        tail = combined.strip().splitlines()[-5:]
         raise RuntimeError(
-            "hypoDD produced no relocations. Last output:\n  " + "\n  ".join(tail)
-            + "\n(A 'STOP >>> Increase MAXDATA0' means the dt data exceeds the binary's "
-            "compiled SVD array limit — switch that cluster to LSQR (isolv=2), recompile "
-            "hypoDD with a larger hypoDD.inc, or relocate a tighter sub-cluster.)")
+            "hypoDD produced no relocations. Last stdout+stderr lines:\n  "
+            + "\n  ".join(tail)
+            + "\n(Common causes: bad dt input, all events dropped by clustering, or "
+            "the binary's MAXDATA0 limit if MAXDATA0 appears above.)")
     return reloc
 
 
@@ -267,6 +291,12 @@ def _exec_hypodd(d, inp, adapt_damping=False, cnd_range=(40.0, 80.0), max_attemp
     each weighting set's DAMP so its condition number (CND) lands in `cnd_range` — the HypoDD-
     recommended ~40–80 band. SVD (isolv=1) has no damping to tune, so it just runs once.
 
+    **Auto SVD→LSQR fallback**: when SVD overflows MAXDATA0 (the dt observations exceed the
+    binary's compiled SVD array limit) we transparently retry with LSQR (isolv=2) and
+    adaptive damping enabled — no manual rebuild of hypoDD.inp needed. This makes
+    `run_dtct` / `run_dtcc` resilient on large clusters (e.g. Yeoncheon, ~100 events with
+    ~2,800 picks). The fallback prints a one-line note so the user sees what happened.
+
     Why: with LSQR (forced when the dt data exceeds the SVD MAXDATA0 limit) a too-small DAMP leaves
     the system ill-conditioned (CND ≫ 80); poorly-linked events (e.g. those with no cross-correlation
     data) then take wild, unstable steps. Higher DAMP lowers CND and stabilises them. HypoDD is cheap
@@ -274,7 +304,23 @@ def _exec_hypodd(d, inp, adapt_damping=False, cnd_range=(40.0, 80.0), max_attemp
     if not (adapt_damping and getattr(inp, "isolv", 1) == 2):
         with open(os.path.join(d, "hypoDD.inp"), "w") as f:
             f.write(build_hypodd_inp(inp))
-        return _exec_hypodd_once(d)
+        try:
+            return _exec_hypodd_once(d)
+        except _MaxData0Overflow:
+            # SVD array overflow — transparently retry with LSQR + adaptive damping.
+            # Only meaningful when we were ON SVD; if isolv is already 2 the binary
+            # has a different limit issue and we should not silently loop.
+            if getattr(inp, "isolv", 1) != 1:
+                raise
+            print(f"  [hypodd] SVD MAXDATA0 overflow — auto-falling back to LSQR "
+                  f"(isolv=2) with adaptive damping; original isolv=1 inp preserved in "
+                  f"hypoDD.inp_svd_attempt.")
+            shutil.move(os.path.join(d, "hypoDD.inp"),
+                        os.path.join(d, "hypoDD.inp_svd_attempt"))
+            inp_lsqr = dataclasses.replace(inp, isolv=2)
+            # Recurse into the LSQR adaptive-damping branch (the `else` below).
+            return _exec_hypodd(d, inp_lsqr, adapt_damping=True,
+                                cnd_range=cnd_range, max_attempts=max_attempts)
 
     lo, hi = cnd_range
     mid = (lo + hi) / 2.0
