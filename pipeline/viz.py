@@ -1159,8 +1159,41 @@ def _mechanism_plane(cfg, velmodel, svd_strike=None, mech_select="highest_qualit
     return s, d, f"{label} of M{ref['mag']:.1f} {ref['quality']} mechanism"
 
 
+def _center_row(cfg, d, ref, prefer):
+    """Pick the centring row (the event the section plane passes through). `prefer` is one of:
+
+      - ``"mainshock"``: largest **KMA** magnitude in the relocated set (via `_mag_for`).
+        This is the right default — the visual anchor is the geologically meaningful
+        mainshock, not whatever small event happened to score grade A in SKHASH.
+      - ``"mech"``: the focal-mechanism event (`ref["cuspid"]`). Required when
+        ``frame_from="mechanism"`` — a nodal plane is mathematically defined to
+        contain the event whose mechanism produced it.
+      - ``"centroid"``: return ``None`` so the caller falls back to the cloud centroid.
+
+    Returns a single-row DataFrame, or ``None`` for ``"centroid"`` / when no candidate exists.
+    Falls back gracefully: mainshock → mech → centroid → cloud centroid.
+    """
+    if prefer == "centroid":
+        return None
+    if prefer == "mech":
+        if ref is None:
+            return None
+        sub = d[d.id == ref["cuspid"]]
+        return sub if len(sub) else None
+    # "mainshock" — KMA-magnitude lookup, NaN-safe
+    mags = _mag_for(cfg, d.id)
+    if np.isfinite(mags).any():
+        return d.iloc[[int(np.nanargmax(mags))]]
+    if ref is not None:
+        sub = d[d.id == ref["cuspid"]]
+        if len(sub):
+            return sub
+    return None
+
+
 def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
-                   frame_from="auto", mech_select="highest_quality"):
+                   frame_from="auto", mech_select="highest_quality",
+                   center_on="mainshock", show_bootstrap=False):
     """Relocated seismicity in fault coordinates — a 2×2 figure styled after the original dt.cc
     notebooks: (1) fault-plane map view, (2) along-strike depth section, (3) across-strike depth
     section (with the dashed fault-dip line), (4) fault-plane (along-dip) view.
@@ -1178,6 +1211,25 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     Default `"highest_quality"` prefers a small grade-A over a larger grade-B; pass
     `"largest_magnitude"` to fall back to v1.3.1 behaviour.
 
+    `center_on` controls which event the section plane passes through (the (x0, y0, z0)
+    origin in fault-frame coordinates):
+
+      - ``"mainshock"`` (default): the largest-magnitude relocated event. Decouples the
+        section's *location* from the focal-mechanism event's *orientation* — fixes the
+        bias where a small peripheral grade-A FM event (e.g. Yeoncheon's M1.4) pulled
+        the section plane off the cluster centre. This is what you almost always want.
+      - ``"mech"``: legacy behaviour — pass through the FM event's hypocentre. Auto-forced
+        when ``frame_from="mechanism"`` (the nodal plane is mathematically defined to
+        contain that event, so the section must too).
+      - ``"centroid"``: pass through the cloud centroid (no preferred event at all).
+
+    `show_bootstrap` (default **False** — the SOTA PocketQuake default): when True, draw the
+    95 % bootstrap error bars and drop the events the bootstrap flags as under-constrained
+    (horizontal/vertical 95 % half-width over the `BOOT_DROP_*_KM` thresholds). When False,
+    every event in `hypoDD.reloc` is shown unfiltered — the plain dt.cc relocation. The
+    earlier v1.x default was always-on bootstrap; this v1.4.6+ default makes the simple
+    relocation the headline view and treats bootstrap as an opt-in diagnostic.
+
     Markers coloured by origin time, sized by magnitude. Reads the headline dt.cc relocation
     (dt.ct fallback).
     """
@@ -1192,8 +1244,12 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     if not os.path.exists(reloc):
         axes[0].set_title(f"{cfg.region}: no HypoDD reloc (run ph2dt→dtcc first)"); return fig
     d = sumio.read_reloc(reloc).reset_index(drop=True)
-    ndrop = int(d.id.isin(_boot_underconstrained(cfg, branch)).sum())   # under-constrained -> drop
-    d = d[~d.id.isin(_boot_underconstrained(cfg, branch))].reset_index(drop=True)
+    # SOTA default: show every event in hypoDD.reloc. Drops are opt-in via show_bootstrap=True.
+    if show_bootstrap:
+        ndrop = int(d.id.isin(_boot_underconstrained(cfg, branch)).sum())
+        d = d[~d.id.isin(_boot_underconstrained(cfg, branch))].reset_index(drop=True)
+    else:
+        ndrop = 0
     if not len(d):
         axes[0].set_title(f"{cfg.region}: empty reloc"); return fig
 
@@ -1224,22 +1280,28 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
         else:
             used_strike, used_dip, used_source = 0.0, 90.0, "default (N-S vertical)"
 
-    # --- centre on the reference event ---
-    # frame_from="mechanism" REQUIRES the mainshock hypocenter as the centring point: the
-    # nodal plane is defined to pass through the mainshock, not through the cloud centroid.
-    # For "svd"/"auto", we prefer the mainshock row when available (so the SVD plane gets
-    # anchored where the inversion's strongest signal lives), fall back to the largest-magnitude
-    # row, then to the cloud centroid.
-    refrow = d[d.id == ref["cuspid"]] if ref else d.iloc[0:0]
-    if used_source.startswith(("NP1", "NP2")) and not len(refrow):
+    # --- centring on the reference event ---
+    # `center_on` controls which row (x0, y0, z0) is used. `frame_from="mechanism"` forces
+    # `"mech"` because the nodal plane is mathematically defined to contain the FM event;
+    # everything else respects the user's `center_on` choice (default `"mainshock"` —
+    # decouples the section's location from the FM-grading event, which can be tiny and
+    # peripheral, e.g. Yeoncheon's grade-A M1.4 sitting 5 km SW of the cluster bulk).
+    eff_center = "mech" if frame_from == "mechanism" else center_on
+    refrow = _center_row(cfg, d, ref, eff_center)
+    if frame_from == "mechanism" and (refrow is None or not len(refrow)):
         raise RuntimeError(
-            f"frame_from='mechanism' requires the mainshock (cuspid {ref['cuspid']}) to be in "
-            f"the HypoDD .reloc, but it isn't -- HypoDD's clustering may have dropped it. "
-            f"Re-run with frame_from='svd' or pass explicit strike/dip.")
-    if not len(refrow) and "mag" in d and d.mag.notna().any():
-        refrow = d.loc[[d.mag.idxmax()]]
-    x0, y0, z0 = (float(refrow.iloc[0].x), float(refrow.iloc[0].y), float(refrow.iloc[0].z)) \
-        if len(refrow) else (float(d.x.mean()), float(d.y.mean()), float(d.z.mean()))
+            f"frame_from='mechanism' requires the mainshock (cuspid "
+            f"{ref['cuspid'] if ref else 'N/A'}) to be in the HypoDD .reloc, but it isn't -- "
+            f"HypoDD's clustering may have dropped it. Re-run with frame_from='svd' or pass "
+            f"explicit strike/dip.")
+    if (refrow is None or not len(refrow)):
+        x0, y0, z0 = float(d.x.mean()), float(d.y.mean()), float(d.z.mean())
+        center_cuspid, center_mag = None, float("nan")
+    else:
+        rr = refrow.iloc[0]
+        x0, y0, z0 = float(rr.x), float(rr.y), float(rr.z)
+        center_cuspid = int(rr.id)
+        center_mag = float(_mag_for(cfg, [int(rr.id)])[0])
 
     rx, ry = (d.x - x0).to_numpy(), (d.y - y0).to_numpy()         # metres, relative to centre
     th = np.deg2rad(90.0 - used_strike)
@@ -1256,7 +1318,9 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     along_dip = -across * np.cos(np.deg2rad(used_dip)) + dep * np.sin(np.deg2rad(used_dip))   # km
 
     # --- 95% bootstrap error bars, rotated into the fault frame (percentile of projected samples) ---
-    boot = _load_bootstrap(cfg, branch)
+    # Gated on show_bootstrap so the SOTA simple-relocation view skips the bars too — visual
+    # clutter (gray cross-hairs over every event) is what the user wants gone, not just the drops.
+    boot = _load_bootstrap(cfg, branch) if show_bootstrap else None
     sig_al = sig_ac = sig_dp = sig_ad = None
     if boot:
         ct, st, cdip, sdip = np.cos(th), np.sin(th), np.cos(np.deg2rad(used_dip)), np.sin(np.deg2rad(used_dip))
@@ -1352,13 +1416,25 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     #  zero along strike by construction, hence the 2D slope = -tan(dip) in (across, depth).)
     # The plane passes through the centring point (across=0, depth=0) since the relative
     # coordinates `across`, `dep` are measured from the reference event.
+    # The dip guide is the projection of the SECTION plane (used_strike, used_dip) — that's
+    # the FM nodal plane the user picked (explicit args or auto-resolved from `mech_plane`),
+    # NOT the SVD plane. Label it with provenance so a reader can confirm at-a-glance.
+    if used_source.startswith(("NP1", "NP2")):
+        _dip_src = used_source.split(" of ")[0]            # "NP1" or "NP2 (aux)"
+    elif used_source == "explicit args":
+        _dip_src = "FM (user)"
+    elif used_source.startswith("SVD"):
+        _dip_src = "SVD"
+    else:
+        _dip_src = used_source
     dip_rad = np.deg2rad(used_dip)
     xx = np.linspace(-R, R, 50)
     if abs(np.cos(dip_rad)) > 1e-6:               # non-vertical plane: depth = -tan(dip) * across
         ax.plot(xx, -np.tan(dip_rad) * xx, color="k", lw=1.0, ls="--", zorder=1,
-                label=f"Dip {used_dip:.0f}°")
+                label=f"Dip {used_dip:.0f}° ({_dip_src})")
     else:                                          # vertical plane
-        ax.axvline(0.0, color="k", lw=1.0, ls="--", zorder=1, label=f"Dip {used_dip:.0f}°")
+        ax.axvline(0.0, color="k", lw=1.0, ls="--", zorder=1,
+                   label=f"Dip {used_dip:.0f}° ({_dip_src})")
     ax.text(-0.92 * R, -0.88 * R, "B", fontsize=16, fontweight="bold")
     ax.text(0.86 * R, -0.88 * R, "B'", fontsize=16, fontweight="bold")
     ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Across-strike distance (km)",
@@ -1387,18 +1463,29 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
         cbar.set_ticks(ticks)
         cbar.set_ticklabels([mdates.num2date(t).strftime("%Y-%m-%d") for t in ticks])
 
-    fmtxt = (f"; mechanism {ref['strike']:.0f}°/{ref['dip']:.0f}° ({ref['quality']})"
+    # `mechanism NP1=…` makes it unambiguous that the listed strike/dip is NP1 (the
+    # SKHASH-reported plane); the section may be drawn with NP2 (the conjugate) when the
+    # SVD strike matched NP2 better, so distinguishing the two prevents the reader from
+    # asking "why does the section dip differ from the mechanism dip?".
+    fmtxt = (f"; mechanism NP1={ref['strike']:.0f}°/{ref['dip']:.0f}° ({ref['quality']})"
              if ref else "")
     btxt = ("  (bars = 95% bootstrap" + (f"; {ndrop} under-constrained dropped)" if ndrop else ")")
             if boot is not None else "")
+    if center_cuspid is not None:
+        ctxt = (f"  •  centred on {eff_center} event {center_cuspid}"
+                + (f" (M{center_mag:.1f})" if np.isfinite(center_mag) else ""))
+    else:
+        ctxt = "  •  centred on cloud centroid"
     fig.suptitle(f"{cfg.region} — relocated seismicity in fault coordinates ({branch}){btxt}\n"
-                 f"strike {used_strike:.0f}°, dip {used_dip:.0f}° [{used_source}]{fmtxt}",
+                 f"section: strike {used_strike:.0f}°, dip {used_dip:.0f}° [{used_source}]"
+                 f"{fmtxt}{ctxt}",
                  fontsize=13)
     return fig
 
 
 def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
                        frame_from="auto", mech_select="highest_quality",
+                       center_on="mainshock", show_bootstrap=False,
                        fps=4, frames=None, out_path=None, return_html=False):
     """Cumulative time-lapse animation in the **same 4-panel fault-frame layout** as
     `fault_sections`. Each frame is the running set of events with origin time ≤ t,
@@ -1430,7 +1517,8 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
         ax.set_title(f"{cfg.region}: no HypoDD reloc (run ph2dt→dtcc first)")
         return fig
     d = sumio.read_reloc(reloc).reset_index(drop=True)
-    d = d[~d.id.isin(_boot_underconstrained(cfg, branch))].reset_index(drop=True)
+    if show_bootstrap:
+        d = d[~d.id.isin(_boot_underconstrained(cfg, branch))].reset_index(drop=True)
     if not len(d):
         fig, ax = plt.subplots(figsize=(6, 4)); ax.set_title(f"{cfg.region}: empty reloc")
         return fig
@@ -1466,11 +1554,16 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
             used_strike, used_dip, used_source = 0.0, 90.0, "default (N-S vertical)"
 
     # --- centring on the reference event (same rule as fault_sections) ---
-    refrow = d[d.id == ref["cuspid"]] if ref else d.iloc[0:0]
-    if not len(refrow) and "mag" in d and d.mag.notna().any():
-        refrow = d.loc[[d.mag.idxmax()]]
-    x0, y0, z0 = (float(refrow.iloc[0].x), float(refrow.iloc[0].y), float(refrow.iloc[0].z)) \
-        if len(refrow) else (float(d.x.mean()), float(d.y.mean()), float(d.z.mean()))
+    # Uses `_center_row` which looks up KMA magnitudes via `_mag_for`; the reloc's
+    # own `mag` column is all-zero, so `d.mag.idxmax()` on it would silently center
+    # on the first row of the catalog — the bug this helper fixes.
+    eff_center = "mech" if frame_from == "mechanism" else center_on
+    refrow = _center_row(cfg, d, ref, eff_center)
+    if (refrow is None or not len(refrow)):
+        x0, y0, z0 = float(d.x.mean()), float(d.y.mean()), float(d.z.mean())
+    else:
+        rr = refrow.iloc[0]
+        x0, y0, z0 = float(rr.x), float(rr.y), float(rr.z)
 
     rx, ry = (d.x - x0).to_numpy(), (d.y - y0).to_numpy()
     th = np.deg2rad(90.0 - used_strike)
@@ -1540,15 +1633,26 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
            ylabel="Depth rel. to reference (km)", title="Along-strike (A–A')")
     _style(ax); ax.invert_yaxis()
 
-    # Panel 3 — across-strike depth section with dip line
+    # Panel 3 — across-strike depth section with dip line. Dip provenance labelled the same
+    # way as `fault_sections` (FM NP1/NP2, FM-user, SVD) so the static + animated figures
+    # are visually consistent.
     ax = axes[2]
+    if used_source.startswith(("NP1", "NP2")):
+        _dip_src = used_source.split(" of ")[0]
+    elif used_source == "explicit args":
+        _dip_src = "FM (user)"
+    elif used_source.startswith("SVD"):
+        _dip_src = "SVD"
+    else:
+        _dip_src = used_source
     dip_rad = np.deg2rad(used_dip)
     xx = np.linspace(-R, R, 50)
     if abs(np.cos(dip_rad)) > 1e-6:
         ax.plot(xx, -np.tan(dip_rad) * xx, color="k", lw=1.0, ls="--", zorder=1,
-                label=f"Dip {used_dip:.0f}°")
+                label=f"Dip {used_dip:.0f}° ({_dip_src})")
     else:
-        ax.axvline(0.0, color="k", lw=1.0, ls="--", zorder=1, label=f"Dip {used_dip:.0f}°")
+        ax.axvline(0.0, color="k", lw=1.0, ls="--", zorder=1,
+                   label=f"Dip {used_dip:.0f}° ({_dip_src})")
     ax.text(-0.92 * R, -0.88 * R, "B", fontsize=16, fontweight="bold")
     ax.text(0.86 * R, -0.88 * R, "B'", fontsize=16, fontweight="bold")
     ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Across-strike distance (km)",
