@@ -35,8 +35,25 @@ CLUSTER_SRC_DIRS = (
     "Kimcheon_cluster",
     "Jangsung_cluster",
     "201704_Gyeongju_swarm",
-)
-CLUSTER_NAMES = ("gwangyang", "kimcheon", "jangsung", "gyeongju")
+    "Changnyeong_cluster",
+    "Chungju_cluster",
+    "Sangju_cluster",
+    "Yesan_cluster",
+    "West_gyeongju_cluster",
+    "2019_changnyeong_cluster",
+    "Haman_cluster",
+    "Uiseong_cluster",
+    "Taean_cluster",
+    "Hampyeong_cluster",
+    "Buyeo_cluster",
+    "Yeoncheon_cluster",
+    "Youngcheon_cluster",
+    "Gwangju_cluster",
+    "Donghae_cluster",
+    "Yeoju_cluster",
+    "Jecheon_cluster",
+    "Yeongyang_cluster",)
+CLUSTER_NAMES = ("gwangyang", "kimcheon", "jangsung", "gyeongju", "changnyeong", "chungju", "sangju", "yesan", "west_gyeongju", "2019_changnyeong", "haman", "uiseong", "taean", "hampyeong", "buyeo", "yeoncheon", "youngcheon", "gwangju", "donghae", "yeoju", "jecheon", "yeongyang")
 
 
 # ------------------------------------------------- picker backends (by model)
@@ -181,8 +198,21 @@ class ClusterConfig:
     velocity_models: tuple = ()             # tuple[VelModel]
     # COP3 P/S weight code by epicentral distance: ((max_km, Pcode, Scode), ...)
     # P: <20->0, <50->1, <70->2, <100->3, else 4 ; S: <20->1, <50->2, else 3.
+    # Used when phs_weight_scheme == "distance".
     phs_dist_weight_bins: tuple = (
         (20, 0, 1), (50, 1, 2), (70, 2, 3), (100, 3, 3), (1e9, 4, 3),
+    )
+    # Probability-based weighting (v1.0.0). When phs_weight_scheme == "probability", write_phs
+    # reads the per-event picks CSV (Station, Phase, Probability) and maps probability -> weight
+    # code via phs_prob_weight_bins, instead of using the epicentral-distance bins above. Same
+    # mapping for P and S; bins are descending-by-threshold so the first match wins. hyp1.40
+    # itself still does its own distance taper internally (DIS command), so the Python-side
+    # weight code is now driven by AI pick confidence rather than distance. Source clusters
+    # (gwangyang/jangsung/kimcheon/gyeongju) keep "distance" for v0.5.0 baseline byte-identity;
+    # PocketQuake-scaffolded clusters default to "probability" (see pocketquake/scaffold.py).
+    phs_weight_scheme: str = "distance"     # "distance" | "probability"
+    phs_prob_weight_bins: tuple = (         # (prob_threshold_inclusive, weight_code)
+        (0.90, 0), (0.70, 1), (0.50, 2), (0.30, 3), (0.00, 4),
     )
 
     # ph2dt + hypoDD
