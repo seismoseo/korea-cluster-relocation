@@ -37,6 +37,42 @@ def _weight(bins, epi_km, phase):
     return bins[-1][idx]
 
 
+def _weight_prob(prob, bins):
+    """Map a PhaseNet+ pick probability in [0, 1] to a HypoInverse weight code (0=full,
+    ..., 4=drop). `bins` is descending-by-threshold: ((0.90, 0), (0.70, 1), ..., (0.00, 4)).
+    Falls back to the last bin (code 4) for None/NaN."""
+    if prob is None:
+        return bins[-1][1]
+    for threshold, code in bins:
+        if prob >= threshold:
+            return code
+    return bins[-1][1]
+
+
+def _load_picks_csv(cfg, event_id):
+    """Return {(station, phase): probability} for one event, or {} if the CSV is absent
+    or unreadable. Picks CSVs are written by `pipeline/core/picking.py:pick_event*`
+    alongside the SAC headers (columns: Event_ID, Network, Station, Phase, Time,
+    Probability, Polarity, Amplitude)."""
+    csv_path = config.picks_csv(cfg, event_id)
+    if not os.path.exists(csv_path):
+        return {}
+    try:
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        out = {}
+        for r in df.itertuples(index=False):
+            try:
+                p = float(r.Probability)
+            except (TypeError, ValueError):
+                continue
+            if p == p:                                            # filter NaN
+                out[(str(r.Station), str(r.Phase))] = p
+        return out
+    except Exception:                                              # noqa: BLE001
+        return {}
+
+
 # --------------------------------------------------------------------- STA
 def write_sta(cfg):
     """Write STA/<Region>.sta (CSV) and STA/<Region>_hyp.sta (HYPOINVERSE fmt 2)."""
@@ -68,18 +104,31 @@ def write_sta(cfg):
 
 # --------------------------------------------------------------------- PHS
 def write_phs(cfg):
-    """Write PHS/<Region>.phs (COP3) from the picks stored in the SAC a/t0 headers."""
+    """Write PHS/<Region>.phs (COP3) from the picks stored in the SAC a/t0 headers.
+
+    Weight-code column 18 of each phase line is set per `cfg.phs_weight_scheme`:
+      - "distance" (default for source clusters): epicentral-distance bins
+        (`cfg.phs_dist_weight_bins`) -- byte-identical to v0.5.x behavior.
+      - "probability" (default for PocketQuake-scaffolded clusters): PhaseNet+ pick
+        probability bins (`cfg.phs_prob_weight_bins`). Falls back to distance for any
+        pick whose probability is missing in the picks CSV (e.g. when the picker
+        didn't write one). The scheme decision is logged once per call.
+    """
     catalog = {e["event_id"]: e for e in waveforms.load_catalog(cfg)}
-    bins = cfg.phs_dist_weight_bins
+    dist_bins = cfg.phs_dist_weight_bins
+    scheme = getattr(cfg, "phs_weight_scheme", "distance")
+    prob_bins = getattr(cfg, "phs_prob_weight_bins", ())
     os.makedirs(config.assert_writable(config.phs_dir(cfg)), exist_ok=True)
     event_dirs = sorted(glob(os.path.join(config.waveforms_dir(cfg), "20*")))
 
+    n_prob_p = n_prob_s = n_dist_fallback_p = n_dist_fallback_s = 0
     with open(config.phs_file(cfg), "w") as f:
         for idx, ed in enumerate(event_dirs):
             eid = os.path.basename(ed)
             ev = catalog.get(eid)
             if ev is None:
                 continue
+            picks_lookup = _load_picks_csv(cfg, eid) if scheme == "probability" else {}
             la_d, la_m = _deg_min_hundredths(ev["lat"])
             lo_d, lo_m = _deg_min_hundredths(ev["lon"])
             f.write(f"{eid}00{la_d}N{str(la_m).zfill(4)}{lo_d}E{str(lo_m).zfill(4)}\n")
@@ -94,7 +143,14 @@ def write_phs(cfg):
                 comp = tr.stats.channel[-1]
                 if comp == "Z" and sta not in seen_p and s.get("a", -12345.0) != -12345.0:
                     epi = gps2dist_azimuth(s.evla, s.evlo, s.stla, s.stlo)[0] / 1000.0
-                    pw = _weight(bins, epi, "P")
+                    if scheme == "probability":
+                        prob = picks_lookup.get((sta, "P"))
+                        if prob is not None:
+                            pw = _weight_prob(prob, prob_bins); n_prob_p += 1
+                        else:
+                            pw = _weight(dist_bins, epi, "P"); n_dist_fallback_p += 1
+                    else:
+                        pw = _weight(dist_bins, epi, "P")
                     ot = tr.stats.starttime - s.b + s.a
                     f.write(f"{sta.ljust(5)}{net.ljust(4)}{chan3.ljust(4)}{'IP'.ljust(3)}{pw}"
                             f"{ot.year}{str(ot.month).zfill(2)}{str(ot.day).zfill(2)}"
@@ -103,7 +159,14 @@ def write_phs(cfg):
                     seen_p.add(sta)
                 if comp in ("N", "E") and sta not in seen_s and s.get("t0", -12345.0) != -12345.0:
                     epi = gps2dist_azimuth(s.evla, s.evlo, s.stla, s.stlo)[0] / 1000.0
-                    sw = _weight(bins, epi, "S")
+                    if scheme == "probability":
+                        prob = picks_lookup.get((sta, "S"))
+                        if prob is not None:
+                            sw = _weight_prob(prob, prob_bins); n_prob_s += 1
+                        else:
+                            sw = _weight(dist_bins, epi, "S"); n_dist_fallback_s += 1
+                    else:
+                        sw = _weight(dist_bins, epi, "S")
                     ot = tr.stats.starttime - s.b + s.t0
                     f.write(f"{sta.ljust(5)}{net.ljust(4)}{chan3.ljust(4)}    "
                             f"{ot.year}{str(ot.month).zfill(2)}{str(ot.day).zfill(2)}"
@@ -112,6 +175,10 @@ def write_phs(cfg):
                             f"{'ES'.ljust(3)}{sw}\n")
                     seen_s.add(sta)
             f.write(" " * 66 + "200" + str(idx).zfill(3) + "\n")
+    if scheme == "probability":
+        print(f"[write_phs] {cfg.name}: probability-weighted "
+              f"P {n_prob_p} prob + {n_dist_fallback_p} dist-fallback, "
+              f"S {n_prob_s} prob + {n_dist_fallback_s} dist-fallback")
     return config.phs_file(cfg)
 
 
@@ -124,14 +191,26 @@ def _write_crh(path, header, rows):
 
 
 def _provision_crh(cfg, vmodel):
+    """Materialise <model>_{p,s}.crh under the run's velmodel dir.
+
+    If `vmodel.source_dir` is set AND the source file exists, symlink it (byte-identical
+    inputs vs the baseline source-cluster runs). Otherwise fall back to writing the CRH
+    from the in-config `p_rows` / `s_rows` -- this is what auto-scaffolded PocketQuake
+    clusters need, since the source-root they generate doesn't carry a hand-curated
+    `1.HypoInv/<model>/` tree. Previously the `if vmodel.source_dir:` check was a string
+    truthiness test, so an absent source produced a *broken symlink*; hyp1.40 then printed
+    `*** ERROR - CRUST FILE DOES NOT EXIST` and silently fell through with no velocity
+    model, which mis-located shallow tight clusters like chungju.
+    """
     d = config.assert_writable(config.velmodel_dir(cfg, vmodel.name))
     os.makedirs(d, exist_ok=True)
     for suf, rows, lbl in (("_p.crh", vmodel.p_rows, "P"), ("_s.crh", vmodel.s_rows, "S")):
         dst = os.path.join(d, vmodel.name + suf)
-        if vmodel.source_dir:
-            src = os.path.join(vmodel.source_dir, vmodel.name + suf)
-            if os.path.lexists(dst):
-                os.remove(dst)
+        src = (os.path.join(vmodel.source_dir, vmodel.name + suf)
+               if vmodel.source_dir else None)
+        if os.path.lexists(dst):
+            os.remove(dst)
+        if src and os.path.isfile(src):
             os.symlink(src, dst)
         else:
             _write_crh(dst, f"{vmodel.name} {lbl} wave velocity", rows)
