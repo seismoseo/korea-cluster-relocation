@@ -43,8 +43,19 @@ def load_model(weights="stead", device="cpu"):
 # ------------------------------------------------------------- per-event pick
 def pick_event(cfg, model, used_table, ev) -> list[dict]:
     pw = cfg.pick_window
-    evdp, vp, vs = pw["evdp"], pw["vp"], pw["vs"]
-    win_p_off, win_s_off = pw.get("p_off", -1.0), pw.get("s_off", 4.0)
+    # per-event focal depth from the catalog (km); fall back to the cluster default if the catalog
+    # entry is missing / non-positive. The old behaviour was a single global evdp (default 15 km) for
+    # every event in the cluster — which mis-aligned the per-station picking window (window starts at
+    # origin + sqrt(epi^2 + evdp^2)/Vp + p_off) for events at different depths, especially at close
+    # stations where the depth term dominates. PocketQuake chungju (catalog depths 6-9 km) had P
+    # windows starting ~1 s AFTER true P at close stations, so the picker landed on S or coda.
+    ev_depth = ev.get("depth")
+    evdp = float(ev_depth) if ev_depth and float(ev_depth) > 0 else float(pw["evdp"])
+    vp, vs = pw["vp"], pw["vs"]
+    # widened defaults (was -1.0 / +4.0) absorb residual depth/velocity uncertainty without forcing
+    # the picker to re-classify — the window only post-filters its picks, so a wider window can't
+    # introduce mispicks, it can only let true picks through.
+    win_p_off, win_s_off = pw.get("p_off", -2.0), pw.get("s_off", 6.0)
     bp = cfg.pick_bandpass
     eid = ev["event_id"]
     wf = config.event_wf_dir(cfg, eid)
@@ -109,8 +120,11 @@ def pick_event_pnplus(cfg, model, used_table, ev) -> list[dict]:
     stage). P+polarity and S both come from the 3-component station record."""
     from pipeline.core import eqnet_backend
     pw = cfg.pick_window
-    evdp, vp, vs = pw["evdp"], pw["vp"], pw["vs"]
-    win_p_off, win_s_off = pw.get("p_off", -1.0), pw.get("s_off", 4.0)
+    # per-event focal depth (see comment in `pick_event` above); same widened offsets.
+    ev_depth = ev.get("depth")
+    evdp = float(ev_depth) if ev_depth and float(ev_depth) > 0 else float(pw["evdp"])
+    vp, vs = pw["vp"], pw["vs"]
+    win_p_off, win_s_off = pw.get("p_off", -2.0), pw.get("s_off", 6.0)
     eid = ev["event_id"]
     wf = config.event_wf_dir(cfg, eid)
 
