@@ -170,17 +170,23 @@ class _MaxData0Overflow(RuntimeError):
     limit has been exceeded. Caught by `_exec_hypodd` to auto-fallback to LSQR."""
 
 
-def _exec_hypodd_once(d):
+def _exec_hypodd_once(d, timeout=None):
     """Run hypoDD once in directory `d` (which must already hold hypoDD.inp + inputs),
     capture stdout to hypoDD.sum, archive per-iteration *.reloc.0* into reloc/, and
     guard against an empty reloc. Returns the hypoDD.reloc path.
 
     Raises `_MaxData0Overflow` specifically for the SVD-array-limit failure (so
     `_exec_hypodd` can transparently retry with LSQR); plain `RuntimeError` for any
-    other empty-reloc cause."""
+    other empty-reloc cause.
+
+    `timeout` (seconds, default None = unbounded) caps the subprocess wall-clock and
+    raises `subprocess.TimeoutExpired` on overrun — bootstrap callers catch that to
+    drop pathological resampled replicas that send LSQR into an infinite damping loop
+    (see `bootstrap_relocation._one`). Real calls keep `timeout=None` so a slow but
+    valid run is never killed mid-iteration."""
     os.makedirs(os.path.join(d, "reloc"), exist_ok=True)
     proc = subprocess.run(["hypoDD", "hypoDD.inp"], cwd=d,
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, timeout=timeout)
     # Capture BOTH stdout and stderr into hypoDD.sum — hypoDD's STOP/ERROR messages
     # (including 'STOP >>> Increase MAXDATA0') go to stderr, while the normal progress
     # output goes to stdout. Without stderr we can't detect why the run aborted.
@@ -555,6 +561,13 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
     # initial absolute location (e.g. a shallow, large-azimuthal-gap event). ISTART=1 reads event.dat.
     seeded_event_dat = _seed_event_dat(os.path.join(bdir, "event.dat"), main)
 
+    # Per-replica wall-clock cap. A direct HypoDD inversion of a calibrated cluster runs in
+    # seconds; some bootstrap resamples land on rank-deficient dt subsets where LSQR enters
+    # an infinite damping loop. Without a cap, one such replica pins a worker thread forever
+    # and the whole bootstrap stalls. 120 s is ~50× the expected-good time for the largest
+    # cluster we run, so this only fires on the genuinely pathological cases the existing
+    # `except Exception: return {}` clause is already designed to absorb.
+    boot_timeout_s = 120
     def _one(i):
         rng = np.random.default_rng(seed + i)
         d = tempfile.mkdtemp(prefix=f"boot_{cfg.name}_{branch}_")
@@ -568,13 +581,13 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
             for fn, blk in base_blocks.items():
                 _write_dt_blocks(os.path.join(d, fn), _resample_global(blk, rng))
             try:                                            # a pathological resample can fail / overflow
-                rl = _exec_hypodd_once(d)                   # ('********' Fortran overflow) -> drop it
+                rl = _exec_hypodd_once(d, timeout=boot_timeout_s)  # ('********' overflow OR hang) -> drop
                 df = sumio.read_reloc(rl)
                 for c in ("x", "y", "z"):
                     df[c] = pd.to_numeric(df[c], errors="coerce")
                 df = df.dropna(subset=["x", "y", "z"])
                 return {int(r.id): (float(r.x), float(r.y), float(r.z)) for r in df.itertuples()}
-            except Exception:                               # noqa: BLE001
+            except (Exception, subprocess.TimeoutExpired):  # noqa: BLE001
                 return {}
         finally:
             shutil.rmtree(d, ignore_errors=True)
