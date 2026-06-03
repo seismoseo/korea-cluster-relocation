@@ -49,9 +49,10 @@ def load_catalog(cfg) -> list[dict]:
 # ----------------------------------------------------------- per-event gather
 def gather_event(cfg, used_table, ev) -> list[str]:
     """Copy + header-inject one event's selected-sensor SAC; return written paths."""
-    raw_dir = os.path.join(stations.raw_archive_root(cfg), ev["event_id"])
-    if not os.path.isdir(raw_dir):
+    raw_dir = stations.event_raw_dir(cfg, ev["event_id"])
+    if raw_dir is None:
         return []
+    layout = stations.event_layout(cfg, raw_dir)  # per-event for mixed; identity otherwise
     out_dir = config.assert_writable(config.event_wf_dir(cfg, ev["event_id"]))
     os.makedirs(out_dir, exist_ok=True)
 
@@ -60,9 +61,9 @@ def gather_event(cfg, used_table, ev) -> list[str]:
     o = ev["origin"]
     written = []
     for sensor in cfg.sensor_priority:
-        pat = stations.wf_glob(cfg, sensor, "*")
+        pat = stations.wf_glob(cfg, sensor, "*", layout=layout)
         for src in glob(os.path.join(raw_dir, pat)):
-            net, code, chan = stations.parse_sac_name(cfg, os.path.basename(src))
+            net, code, chan = stations.parse_sac_name(cfg, os.path.basename(src), layout=layout)
             if sensor_of.get(code) != sensor:
                 continue
             tr = read(src)[0]

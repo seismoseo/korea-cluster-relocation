@@ -95,3 +95,76 @@ def kma_cluster(name, region, src_root, epicenter, region_bounds,
         hypodd_dtcc_variants=_dtcc_variants(dtct_isolv),
         mainshock_event_id=mainshock_event_id, cuspid_offset=200000, num_cores=10,
     )
+
+
+# STP-fetched SAC per-event tree (matches the Gyeongju 2017 hand-assembled cluster). Used by
+# PocketQuake's auto-scaffold when --source stp is selected (older events that NECIS no longer
+# serves as event-segment downloads but that STP at mara.snu.ac.kr can still pull).
+STP_GLOB = {"HH": "HH/*HH{comp}*.sac",
+            "HG": "HG/*HG{comp}*.sac",
+            "EL": "EL/*EL{comp}*.sac"}
+
+
+def stp_cluster(name, region, src_root, epicenter, region_bounds,
+                station_masters=("KS_station.csv",), mainshock_event_id=None,
+                extra_velmodels=(), dtct_isolv=1):
+    """Same defaults as kma_cluster but routed through wf_source='stp_sac'. The per-event SAC
+    tree is expected at <src_root>/stp_download/SAC/<event_id>/{HH,HG,EL}/<ts>.<NET>.<CODE>.<CHAN>.sac
+    -- matching what PocketQuake's stp_bridge produces (and what the 2017 Gyeongju notebook
+    produced before PocketQuake existed). All other params identical so per-cluster behavior
+    only differs in the fetch backend, not in picking / location / mechanism."""
+    hyp = os.path.join(src_root, "1.HypoInv")
+    return ClusterConfig(
+        name=name, region=region, src_root=src_root,
+        event_catalog_csv=os.path.join(src_root, "event_catalog", "event_catalog.csv"),
+        station_master_csvs=tuple(os.path.join(src_root, "station_table", m)
+                                  for m in station_masters),
+        epicenter=epicenter, radius_km=100.0, region_bounds=region_bounds, kst_offset_hours=9,
+        wf_source="stp_sac", kma_archive_glob={},
+        stp_sac_root=os.path.join(src_root, "stp_download", "SAC"),
+        stp_sac_glob=dict(STP_GLOB),
+        sensor_priority=("HH", "HG", "EL"), target_sampling_hz=100.0,
+        picker_weights="stead", p_threshold=0.2, s_threshold=0.2, sp_max_gap_s=15.0,
+        pick_window=dict(evdp=15.0, vp=5.9, vs=3.0),
+        hyp_control=STD_HYP,
+        velocity_models=(*_kim_models(hyp), *extra_velmodels),
+        ph2dt=STD_PH2DT, hypodd_dtct=_dtct_inp(dtct_isolv),
+        hypodd_dtcc_variants=_dtcc_variants(dtct_isolv),
+        mainshock_event_id=mainshock_event_id, cuspid_offset=200000, num_cores=10,
+    )
+
+
+def mixed_cluster(name, region, src_root, epicenter, region_bounds,
+                  station_masters=("KS_station.csv",), mainshock_event_id=None,
+                  extra_velmodels=(), dtct_isolv=1):
+    """Cluster whose catalog spans the STP/NECIS transition (events from both backends).
+
+    Layout on disk: BOTH `<src_root>/stp_download/SAC/<event_id>/{HH,HG,EL}/*` AND
+    `<src_root>/kma_waveforms/<event_id>/{a,v}/SAC/{HH,HG,EL}/*` can coexist. The PocketQuake
+    orchestrator routes each catalog event to one source at download time (try-STP-first with
+    NECIS fallback, or strict date cutoff); the eq-cycle gather stage then enumerates
+    BOTH trees via `stations._event_dirs(cfg)` and dispatches `parse_sac_name`/`wf_glob`
+    per-event based on which layout that event landed in (`stations.event_layout`).
+
+    Other parameters identical to kma_cluster/stp_cluster so the relocation behaviour does
+    not depend on the per-event source."""
+    hyp = os.path.join(src_root, "1.HypoInv")
+    return ClusterConfig(
+        name=name, region=region, src_root=src_root,
+        event_catalog_csv=os.path.join(src_root, "event_catalog", "event_catalog.csv"),
+        station_master_csvs=tuple(os.path.join(src_root, "station_table", m)
+                                  for m in station_masters),
+        epicenter=epicenter, radius_km=100.0, region_bounds=region_bounds, kst_offset_hours=9,
+        wf_source="mixed",
+        kma_archive_glob=dict(KMA_GLOB),
+        stp_sac_root=os.path.join(src_root, "stp_download", "SAC"),
+        stp_sac_glob=dict(STP_GLOB),
+        sensor_priority=("HH", "HG", "EL"), target_sampling_hz=100.0,
+        picker_weights="stead", p_threshold=0.2, s_threshold=0.2, sp_max_gap_s=15.0,
+        pick_window=dict(evdp=15.0, vp=5.9, vs=3.0),
+        hyp_control=STD_HYP,
+        velocity_models=(*_kim_models(hyp), *extra_velmodels),
+        ph2dt=STD_PH2DT, hypodd_dtct=_dtct_inp(dtct_isolv),
+        hypodd_dtcc_variants=_dtcc_variants(dtct_isolv),
+        mainshock_event_id=mainshock_event_id, cuspid_offset=200000, num_cores=10,
+    )
