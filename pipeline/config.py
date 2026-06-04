@@ -64,20 +64,21 @@ CLUSTER_NAMES = ("gwangyang", "kimcheon", "jangsung", "gyeongju", "changnyeong",
 SEISBENCH_MODELS = frozenset({"stead", "original", "instance", "ethz", "scedc", "geofon", "neic"})
 EQNET_MODELS = frozenset({"phasenet_plus"})
 
-# ---- external tools (NOT vendored — like the hyp1.40/hypoDD/ph2dt binaries). Override
-#      with environment variables so a clone on another machine stays portable. ----
+# ---- external tools (NOT vendored — like the hyp1.40/hypoDD/ph2dt binaries). Set via
+#      environment variables. Unset = feature disabled; call sites raise a clear error
+#      when the feature is actually used, so unrelated workflows are unaffected. ----
 # EQNet (AI4EPS) clone providing PhaseNet+ (needed only when picker_weights="phasenet_plus").
-EQNET_DIR = os.environ.get("EQNET_DIR", "/home/msseo/works/14.EQNet/EQNet")
-EQNET_WEIGHTS = os.environ.get(
-    "EQNET_WEIGHTS", os.path.join(EQNET_DIR, "docs", "model_phasenet_plus", "model_99.pth"))
+EQNET_DIR = os.environ.get("EQNET_DIR")
+EQNET_WEIGHTS = os.environ.get("EQNET_WEIGHTS") or (
+    os.path.join(EQNET_DIR, "docs", "model_phasenet_plus", "model_99.pth") if EQNET_DIR else None)
 PNPLUS_MIN_PROB = float(os.environ.get("PNPLUS_MIN_PROB", "0.3"))   # EQNet default pick threshold
 PNPLUS_HIGHPASS = float(os.environ.get("PNPLUS_HIGHPASS", "0.0"))   # Hz; 0 = raw (PhaseNet+ wants raw)
 PNPLUS_NT = int(os.environ.get("PNPLUS_NT", str(1024 * 36)))        # samples per inference patch
 # SKHASH focal-mechanism tool (needed only for the focal_mechanism stage).
-SKHASH_DIR = os.environ.get("SKHASH_DIR", "/home/msseo/works/44.SKHASH/SKHASH/SKHASH")
+SKHASH_DIR = os.environ.get("SKHASH_DIR")
 # Optional Helvetica fonts for plot text (viz.py registers them if present; falls back to the
 # matplotlib default sans-serif otherwise, so a public clone never breaks).
-HELVETICA_DIR = os.environ.get("HELVETICA_DIR", "/home/msseo/Downloads/Helvetica")
+HELVETICA_DIR = os.environ.get("HELVETICA_DIR")
 
 
 # ----------------------------------------------------------- parameter blocks

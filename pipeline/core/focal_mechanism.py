@@ -177,6 +177,10 @@ def run_focal_mechanism(cfg, velmodel=None, num_cpus=1) -> dict:
             f.write(f"${k}\n{v}\n\n")
 
     # ---- run SKHASH ----
+    if not config.SKHASH_DIR:
+        raise RuntimeError(
+            "Focal-mechanism stage requires SKHASH_DIR. Set SKHASH_DIR=/path/to/SKHASH "
+            "in your .env. See docs/EXTERNAL_TOOLS.md in PocketQuake for where to obtain it.")
     proc = subprocess.run([sys.executable, os.path.join(config.SKHASH_DIR, "SKHASH.py"), ctl],
                           cwd=config.SKHASH_DIR, text=True, capture_output=True)
     if not os.path.exists(outfile1):

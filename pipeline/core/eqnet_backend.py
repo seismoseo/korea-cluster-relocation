@@ -25,6 +25,11 @@ from pipeline import config
 
 
 def _ensure_eqnet_on_path():
+    if not config.EQNET_DIR:
+        raise RuntimeError(
+            "EQNet (PhaseNet+) requires EQNET_DIR. Set EQNET_DIR=/path/to/EQNet (and "
+            "optionally EQNET_WEIGHTS=/path/to/model_99.pth) in your .env. See "
+            "docs/EXTERNAL_TOOLS.md in PocketQuake for where to obtain EQNet.")
     if config.EQNET_DIR not in sys.path:
         sys.path.insert(0, config.EQNET_DIR)
 
