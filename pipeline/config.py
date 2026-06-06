@@ -221,6 +221,33 @@ class ClusterConfig:
     hypodd_dtct: Optional[HypoDDInp] = None
     hypodd_dtcc_variants: dict = field(default_factory=dict)
 
+    # Relocation backend selection. Default is the legacy Fortran chain (hyp1.40 +
+    # hypoDD + ph2dt). Set to the Python equivalents to opt out of the Fortran
+    # dependency entirely. Both backends produce the same on-disk artifacts
+    # (`<Region>.sum`, `hypoDD.reloc`) so downstream stages don't know the difference.
+    loc_backend: str = "hypoinverse"          # "hypoinverse" | "hyposvi"
+    reloc_backend: str = "hypodd"             # "hypodd" | "relocdd_py"
+    # HypoSVI: trained EikoNet checkpoint paths per phase. Required when
+    # loc_backend == "hyposvi". A model is per-velocity-model (kim1983 / kim2011);
+    # see pipeline/velocity_models/eikonet_kim1983/.
+    # If None, the backend auto-discovers bundled weights under
+    # pipeline/velocity_models/eikonet_<velmodel>/ (fetch via `python -m
+    # pipeline.core.fetch_eikonet`); env HYPOSVI_EIKONET_P/_S override.
+    hyposvi_eikonet_p: Optional[str] = None
+    hyposvi_eikonet_s: Optional[str] = None
+    hyposvi_velmodel: Optional[str] = None    # which velmodel's EikoNet to use (default: 1st velocity model)
+    hyposvi_device: str = "auto"              # "auto" (GPU if available, else CPU) | "cpu" | "cuda:N"
+    hyposvi_epochs: int = 175                 # SVGD iterations per event batch
+    # SVGD particles initialise inside region_bounds (+ margin), NOT the full EikoNet
+    # domain — otherwise particles scatter across all-Korea and never converge
+    # (symptom: +/-20-30 km "uncertainty", biased depth). Generic across clusters: the
+    # box is derived from each cluster's own region_bounds.
+    hyposvi_box_margin_deg: float = 0.15      # pad region_bounds before seeding particles
+    hyposvi_depth_max_km: float = 25.0        # particle-init depth range is 0..this
+    # relocDD-py clone path. Required when reloc_backend == "relocdd_py". Resolved
+    # by the backend module from this field or $RELOCDD_PY_DIR.
+    relocdd_py_dir: Optional[str] = None
+
     # cross-correlation (dt.cc)
     xcorr: dict = field(
         default_factory=lambda: dict(

@@ -93,11 +93,19 @@ def run_cluster(cfg, stage_from="stations", through="dtct",
                 f"(relative-relocation stages need >=2 events)")
             todo -= _relative_stages
     if "ph2dt" in todo:
-        with _time("ph2dt"):
-            hypodd.prep_ph2dt(cfg, velmodel=arc_velmodel)
-            hypodd.run_ph2dt(cfg)
-        res["ph2dt"] = "ok"
-        log(f"ph2dt: dt.ct / event.dat written  ({timings['ph2dt']:.1f}s)")
+        if getattr(cfg, "reloc_backend", "hypodd") == "relocdd_py":
+            # relocDD-py rebuilds dt.ct/event.dat from the located .sum + SAC picks in its
+            # own dtct/dtcc stages (run_relocdd_py_full), so the Fortran ph2dt stage is
+            # skipped. It would otherwise fail for the HypoSVI path, which produces no
+            # HYPOINVERSE .arc for prep_ph2dt/ncsn2pha to consume.
+            res["ph2dt"] = "skipped (relocdd_py rebuilds dt.ct from the .sum)"
+            log("ph2dt: skipped — relocdd_py backend rebuilds dt.ct from the .sum")
+        else:
+            with _time("ph2dt"):
+                hypodd.prep_ph2dt(cfg, velmodel=arc_velmodel)
+                hypodd.run_ph2dt(cfg)
+            res["ph2dt"] = "ok"
+            log(f"ph2dt: dt.ct / event.dat written  ({timings['ph2dt']:.1f}s)")
     if "dtct" in todo:
         with _time("dtct"):
             res["dtct"] = hypodd.run_dtct(cfg)

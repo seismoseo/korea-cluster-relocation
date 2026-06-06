@@ -263,7 +263,17 @@ def run_hypoinverse_model(cfg, vmodel):
 
 
 def run_hypoinverse(cfg, velmodels=None, write_inputs=True) -> dict:
-    """Write STA + PHS (once) and locate over the requested velocity models."""
+    """Write STA + PHS (once) and locate over the requested velocity models.
+
+    Dispatches on cfg.loc_backend: "hypoinverse" (Fortran hyp1.40, default) or
+    "hyposvi" (Python). The hyposvi adapter is not wired yet — fail loudly rather
+    than silently producing Fortran results, so --loc-backend hyposvi never lies."""
+    backend = getattr(cfg, "loc_backend", "hypoinverse")
+    if backend == "hyposvi":
+        from pipeline.core import hyposvi_backend
+        return hyposvi_backend.run_hyposvi(cfg, velmodels=velmodels)
+    if backend != "hypoinverse":
+        raise ValueError(f"unknown loc_backend {backend!r} (expected 'hypoinverse' | 'hyposvi')")
     if write_inputs:
         write_sta(cfg)
         write_phs(cfg)

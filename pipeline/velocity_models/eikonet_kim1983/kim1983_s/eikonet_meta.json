@@ -1,0 +1,20 @@
+{
+  "velmodel": "kim1983",
+  "phase": "S",
+  "csv": "kim1983_s.csv",
+  "xmin": [
+    125.0,
+    33.0,
+    0.0
+  ],
+  "xmax": [
+    131.0,
+    40.0,
+    50.0
+  ],
+  "projection": "+proj=utm +zone=52 +ellps=WGS84 +units=km",
+  "best_checkpoint": "Model_Epoch_00190_ValLoss_0.004393070889636874.pt",
+  "best_val_loss": 0.004393070889636874,
+  "normalisation": "OffsetMinMax",
+  "residual_blocks": 10
+}

@@ -368,7 +368,15 @@ def _exec_hypodd(d, inp, adapt_damping=False, cnd_range=(40.0, 80.0), max_attemp
 
 
 def run_dtct(cfg):
-    """Catalog-only (dt.ct) HypoDD relocation; returns the hypoDD.reloc path."""
+    """Catalog-only (dt.ct) HypoDD relocation; returns the hypoDD.reloc path.
+    Dispatches on cfg.reloc_backend: "hypodd" (legacy Fortran) or "relocdd_py"."""
+    backend = getattr(cfg, "reloc_backend", "hypodd")
+    if backend == "relocdd_py":
+        from pipeline.core import relocdd_py_backend
+        # Fortran-free: rebuild phase.dat + dt.ct from the located .sum (works for any
+        # loc backend, and ensures a HypoSVI .sum actually drives the relocation rather
+        # than reusing the HYPOINVERSE-derived Fortran 00.ph2dt output).
+        return relocdd_py_backend.run_relocdd_py_full(cfg, velmodel="kim1983")
     src = config.ph2dt_dir(cfg)
     d = config.assert_writable(config.dtct_dir(cfg))
     os.makedirs(d, exist_ok=True)
@@ -396,11 +404,31 @@ def _event_cuspid(cfg, event_id, velmodel="kim1983"):
 def run_dtcc(cfg, variant="default"):
     """Cross-correlation (dt.cc) HypoDD relocation for one variant; returns hypoDD.reloc.
 
+    Dispatches on cfg.reloc_backend: "hypodd" (legacy Fortran) or "relocdd_py".
     Requires `core.xcorr.run_xcorr` to have written the cc file (e.g. dt.cc_0.7_combined)
     into 02.dt.cc/. The "default" variant runs in 02.dt.cc/ itself; named variants
     (no_main, kim2011, ...) run in a 02.dt.cc/<variant>/ subdir. A variant whose
     event_file is "event.sel" relocates WITHOUT the mainshock: we rebuild event.sel from
     event.dat dropping the mainshock cuspid (ph2dt's own event.sel means something else)."""
+    backend = getattr(cfg, "reloc_backend", "hypodd")
+    if backend == "relocdd_py":
+        from pipeline.core import relocdd_py_backend
+        # Use the Fortran-FREE path (same as run_dtct): rebuild phase.dat/dt.ct from the located
+        # .sum + SAC picks and run relocDD-py's own ph2dt+hypoDD, here augmented with the xcorr
+        # dt.cc. (run_relocdd_py_dtcc fed the Fortran ph2dt event.dat, which relocDD-py's parser
+        # can't read.) This also leaves the calibrated control file + resampling inputs under
+        # <dtcc_dir>/_relocdd_py_full/ so relocdd_py_backend.bootstrap_relocation can re-invert.
+        base = config.dtcc_dir(cfg)
+        out_dir = base if variant == "default" else os.path.join(base, variant)
+        os.makedirs(out_dir, exist_ok=True)
+        ccf = cfg.hypodd_dtcc_variants[variant].cc_file
+        cc_path = os.path.join(base, ccf) if ccf else None
+        if cc_path and not os.path.exists(cc_path):
+            raise FileNotFoundError(
+                f"cross-correlation file {cc_path} not found — run the xcorr stage first.")
+        return relocdd_py_backend.run_relocdd_py_full(
+            cfg, velmodel=cfg.fm_velmodel, cc_file=cc_path,
+            out_dir_override=out_dir, dtcc_variant=variant)
     inp = cfg.hypodd_dtcc_variants[variant]
     base = config.dtcc_dir(cfg)
     d = config.assert_writable(base if variant == "default" else os.path.join(base, variant))

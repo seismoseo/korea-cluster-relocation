@@ -29,3 +29,13 @@ __pycache__/
 
 # ---- scratch / smoke artifacts ----
 pipeline/notebooks/_smoke_*.ipynb
+
+# HypoSVI EikoNet checkpoints — large (~95 MB each), regenerable via
+# `python -m pipeline.core.eikonet_train` (see docs/python_backend/README.md).
+# The training recipe + velocity CSV + eikonet_meta.json ARE tracked; the weights
+# are not (keep the repo lean, weights are deterministic to retrain).
+pipeline/velocity_models/*/**/*.pt
+pipeline/velocity_models/*/Xp.npy
+pipeline/velocity_models/*/Yp.npy
+pipeline/velocity_models/**/Xp.npy
+pipeline/velocity_models/**/Yp.npy
