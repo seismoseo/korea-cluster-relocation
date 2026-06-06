@@ -132,47 +132,30 @@ structures converge once the cross-correlations drive the relocation.
 `dt.ct`/`dt.cc`/`event.dat` (same control file), the relocations agree to **1.3 m
 horizontal / 2.5 m depth relative**. relocDD-py is a faithful port of `hypoDD`'s
 inversion; the adapter only hardens its clone against real-data implementation bugs
-(see Gotchas).
+(see *For developers* below).
 
 **Bootstrap uncertainty** — the headline 95% error bars come from bootstrapping the
 differential times and re-inverting (same procedure as the Fortran workflow; HypoDD's
 formal LSQR errors underestimate). Fortran vs relocDD-py bootstrap agree on chungju
 (~6/18 m vs ~7/22 m horizontal/vertical 95%).
 
-## Gotchas baked into the code (don't re-discover them)
+## For developers — implementation notes
 
-1. **EikoNet projection MUST be `+units=km`.** EikoNet projects lon/lat→UTM without
-   dividing by 1000, while depth/velocity are km / km·s⁻¹. A metres projection makes
-   the eikonal loss unit-inconsistent by 1000× → travel times ~1000× too large →
-   HypoSVI returns NaN. (`eikonet_train.py` hardcodes `+units=km`.)
-2. **EikoNet training leaks the autograd graph per epoch — on CPU only.** Peak *CPU*
-   RAM scales with samples/epoch (500k → ~230 GB, thrashes a shared box), so for CPU
-   training the recipe caps to 150k samples and pins threads (`EIKONET_THREADS`,
-   default 16; run under `taskset -c 0-15`). On **GPU** the graph lives in VRAM and the
-   blowup does not occur (~1 GB at 150k) — prefer `--device auto`/`cuda:0`, which also
-   makes 200 epochs cheap (a few minutes/phase).
-3. **Restrict the SVGD init box to the cluster.** EikoNet covers all-Korea, but
-   seeding particles across that 600×700 km domain prevents convergence (±20–30 km
-   "uncertainty", biased depth). The adapter re-seeds particles inside the cluster's
-   `region_bounds` + `hyposvi_box_margin_deg` (depth 0..`hyposvi_depth_max_km`).
-   This is automatic and generic across clusters.
-4. **relocDD-py hardening** — `relocdd_py_backend._ensure_relocdd_patches()` idempotently
-   fixes upstream bugs on the clone (no subrepo edits) so it reproduces Fortran `hypoDD`
-   on real, densely-linked data. The key one: the event-pair **observation counter is
-   `int8`, which overflows at 127** — a single pair routinely has >127 differential times,
-   so the count wraps negative and corrupts clustering (→ `int32`). Also: divide-by-zero
-   guards in the residual-statistics routines (Fortran rides IEEE NaN/Inf through, Python
-   raises), the SVD `resstat()` arg fix, an empty-`.reloc` fallback to the last
-   per-iteration file, and the `ISTART=1` real-data path. The adapter renders **`ISTART=2`**
-   (mathematically equivalent to Fortran's `ISTART=1` for *relative* locations, and
-   relocDD-py's robust path) and **`ISOLV=1` (SVD)**, auto-switching to **LSQR with the
-   adaptive condition-number damping** above the SVD `MAXDATA0` limit (10000 diff-times,
-   probed from the binary) — exactly the Fortran SVD→LSQR fallback.
-5. **I/O details**: `phase.dat` seconds are emitted PACKED (`3456` = 34.56 s); ph2dt writes
-   `dte.ct` which is copied to the `dt.ct` name hypoDD expects; the Fortran `event.dat`
-   time field is space-padded `i8` (relocDD-py's parser needs it zero-padded to 8) — so the
-   adapter rebuilds `dt.ct`/`event.dat` from the `.sum` rather than reusing Fortran ph2dt
-   output (this also means `run_dtct`/`run_dtcc` need no HYPOINVERSE `.arc`).
+You don't need these to *run* the backend (everything below is automatic); they matter only
+if you modify it. Full rationale lives in the code comments of
+`pipeline/core/{hyposvi_backend,relocdd_py_backend}.py`.
+
+- **EikoNet uses `+units=km`** (lon/lat→UTM is *not* divided by 1000, while depth/velocity are
+  km) — a metres projection makes travel times ~1000× too large and HypoSVI returns NaN.
+- **SVGD particles seed inside the cluster** (`region_bounds` + margin), not EikoNet's
+  all-Korea domain, or they don't converge. Automatic, per-cluster.
+- **relocDD-py is hardened on the clone** by `_ensure_relocdd_patches()` (no upstream edits) so
+  it reproduces Fortran `hypoDD` on real data — chiefly an `int8` event-pair counter that
+  overflows at 127 (→ `int32`), plus divide-by-zero guards and a few real-data edge cases. The
+  adapter renders `ISTART=2` (equivalent to Fortran `ISTART=1` for *relative* locations) and
+  `ISOLV=1` (SVD), auto-switching to LSQR + adaptive damping above `MAXDATA0` (10000 diff-times).
+- **GPU**: location auto-detects CUDA. EikoNet *training* leaks the autograd graph per epoch on
+  **CPU only** — cap samples or just use `--device auto`.
 
 ## Bundled models
 
