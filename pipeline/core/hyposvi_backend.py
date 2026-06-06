@@ -236,7 +236,15 @@ def _events_dict(cfg):
                 t = tr.stats.starttime - s.b + s.t0
                 rows.append((net, sta, "S", pd.Timestamp(t.datetime), 0.2))
                 seen_s.add(sta)
-        if not rows:
+        if len(rows) < 2:
+            # HypoSVI's log-likelihood forms differential times between observation
+            # PAIRS (location.py: T_obs[:,pairs]), so it needs >=2 observations; a
+            # single pick leaves T_obs 1-D and raises IndexError mid-LocateEvents,
+            # killing the whole run. Skip the under-determined event with a note —
+            # same outcome as a no-pick event (absent from the .sum), no crash.
+            if rows:
+                print(f"[hyposvi] skipping event {cuspid}: only {len(rows)} observation(s) "
+                      f"— under-determined (HypoSVI needs >=2)")
             continue
         picks = pd.DataFrame(rows, columns=["Network", "Station", "PhasePick", "DT", "PickError"])
         evts[str(cuspid)] = {"Picks": picks}

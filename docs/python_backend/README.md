@@ -154,8 +154,13 @@ if you modify it. Full rationale lives in the code comments of
   overflows at 127 (→ `int32`), plus divide-by-zero guards and a few real-data edge cases. The
   adapter renders `ISTART=2` (equivalent to Fortran `ISTART=1` for *relative* locations) and
   `ISOLV=1` (SVD), auto-switching to LSQR + adaptive damping above `MAXDATA0` (10000 diff-times).
-- **GPU**: location auto-detects CUDA. EikoNet *training* leaks the autograd graph per epoch on
-  **CPU only** — cap samples or just use `--device auto`.
+- **GPU (recommended)**: location auto-detects a *usable* CUDA device (`hyposvi_device="auto"`
+  smoke-tests a real op and falls back to CPU if the GPU is too new for the installed PyTorch, so
+  it never crashes). It's a pure acceleration — locations match CPU within SVGD's own run-to-run
+  scatter (~6 m depth on chungju) — and **~10–20× faster**: ~3.5 s/event vs ~37 s on CPU, i.e.
+  ~15 h vs ~1–2 weeks for a 15k-event catalog. Install a CUDA wheel matching your card from
+  <https://pytorch.org/get-started/locally/> (e.g. `cu128` for Blackwell sm_120). EikoNet
+  *training* leaks the autograd graph per epoch on **CPU only** — cap samples or use `--device auto`.
 
 ## Bundled models
 
