@@ -17,9 +17,19 @@ def read_sum(path) -> pd.DataFrame:
     Columns: id, time (UTCDateTime), lat, lon, depth, num, gap, rms, erh, erz, qual.
     The raw header is comma-separated and space-padded, e.g.
         `   DATE     TIME, SEC ,   LAT  ,   LON   , DEPTH,...,QASR,    ID-NUM,...`
+
+    Returns an empty frame (right columns) for a missing or header-only `.sum` — e.g. a
+    HYPOINVERSE run that located 0 events (no waveforms / no picks) — so callers report
+    "no events" rather than crash on `df.apply` over an empty frame.
     """
-    df = pd.read_csv(path)
+    cols = ["id", "time", "lat", "lon", "depth", "num", "gap", "rms", "erh", "erz", "qual"]
+    try:
+        df = pd.read_csv(path)
+    except (pd.errors.EmptyDataError, FileNotFoundError):
+        return pd.DataFrame(columns=cols)
     df.columns = df.columns.str.strip()
+    if len(df) == 0:                                  # header-only .sum (0 located events)
+        return pd.DataFrame(columns=cols)
     datecol = next(c for c in df.columns if c.startswith("DATE"))  # "DATE     TIME"
 
     def _mk_time(row):

@@ -38,6 +38,33 @@ from obspy.geodetics import gps2dist_azimuth
 from pipeline import config
 
 
+def _auto_device():
+    """Return 'cuda:0' only if torch can ACTUALLY run on the GPU, else 'cpu'.
+
+    A trivial GPU op is the reliable test: `torch.cuda.is_available()` returns True even for a
+    GPU too NEW for the installed CUDA wheel (e.g. RTX PRO 6000 Blackwell = sm_120 on a PyTorch
+    that tops out at sm_90), where every real kernel then raises 'no kernel image available'.
+    We fall back to CPU with a one-line note instead of crashing mid-locate."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return "cpu"
+        try:
+            _ = (torch.zeros(8, device="cuda:0") + 1.0).sum().item()   # smoke test
+            return "cuda:0"
+        except Exception as e:                                          # noqa: BLE001
+            try:
+                name = torch.cuda.get_device_name(0)
+            except Exception:                                          # noqa: BLE001
+                name = "?"
+            print(f"[hyposvi] GPU present ({name}) but unusable by this PyTorch build "
+                  f"({type(e).__name__}) — using CPU. Install a CUDA wheel matching your GPU's "
+                  f"compute capability (https://pytorch.org/get-started/locally/) to enable it.")
+            return "cpu"
+    except Exception:                                                  # noqa: BLE001
+        return "cpu"
+
+
 # --------------------------------------------------------------- EikoNet loading
 def _ensure_on_path(env_var, default_hint):
     """Put a repo clone on sys.path from an env var (EikoNet / HypoSVI live outside PyPI)."""
@@ -288,15 +315,14 @@ def run_hyposvi(cfg, velmodels=None) -> dict:
     The EikoNet pair already encodes one velocity model; we write the .sum under
     each requested velmodel name (default: the meta's velmodel) so downstream
     stages that key off a specific velmodel name find it. Returns {vmname: sum_path}."""
-    # Device: cfg.hyposvi_device wins; otherwise auto-detect a GPU (HypoSVI/EikoNet are pure
-    # torch, so the SVGD locate is far faster on CUDA — minutes -> seconds). Falls back to CPU.
+    # Device: cfg.hyposvi_device wins; otherwise auto-detect a USABLE GPU (HypoSVI/EikoNet are
+    # pure torch, so the SVGD locate is far faster on CUDA). "auto" smoke-tests the GPU and
+    # falls back to CPU if torch can't actually run on it — e.g. a GPU NEWER than the installed
+    # CUDA wheel (RTX PRO 6000 Blackwell = sm_120 on a PyTorch that tops out at sm_90), where
+    # torch.cuda.is_available() is True but every kernel raises "no kernel image available".
     device = getattr(cfg, "hyposvi_device", None)
     if not device or device == "auto":
-        try:
-            import torch as _torch
-            device = "cuda:0" if _torch.cuda.is_available() else "cpu"
-        except Exception:                                       # noqa: BLE001
-            device = "cpu"
+        device = _auto_device()
     print(f"[hyposvi] device: {device}")
     epochs = int(getattr(cfg, "hyposvi_epochs", 175))
     p_ckpt, s_ckpt = _resolve_eikonet_paths(cfg)

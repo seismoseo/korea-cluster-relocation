@@ -68,8 +68,22 @@ def run_cluster(cfg, stage_from="stations", through="dtct",
     if "waveforms" in todo:
         with _time("waveforms"):
             res["waveforms"] = waveforms.run_waveforms(cfg, events=events)
-        log(f"waveforms: gathered {sum(res['waveforms'].values())} files / "
+        n_wf = sum(res["waveforms"].values())
+        log(f"waveforms: gathered {n_wf} files / "
             f"{len(res['waveforms'])} events  ({timings['waveforms']:.1f}s)")
+        # Guard: 0 gathered means no source SAC for this backend — almost always the WRONG
+        # --source (e.g. a pre-2020 / STP cluster re-run as the default NECIS, which reads
+        # kma_waveforms/ instead of stp_download/SAC/). Refuse to proceed: otherwise the
+        # downstream stages silently ride a PRIOR run's cached outputs and report a stale
+        # "success". Fail clearly with the likely fix.
+        if n_wf == 0:
+            sub = "stp_download/SAC" if getattr(cfg, "wf_source", "") == "stp_sac" else "kma_waveforms"
+            raise RuntimeError(
+                f"0 waveforms gathered for '{cfg.name}' (wf_source={getattr(cfg, 'wf_source', '?')}): "
+                f"no SAC found under {cfg.src_root}/{sub}.\n"
+                f"  - Pre-2020 events are STP-served — re-run with `--source stp` (or `mixed`).\n"
+                f"  - Or you used --skip-download with nothing downloaded — drop it to fetch.\n"
+                f"Refusing to continue on possibly-stale cached outputs in runs/{cfg.name}/.")
     if "picking" in todo:
         with _time("picking"):
             res["picking"] = picking.run_picking(cfg, events=events, device=device)

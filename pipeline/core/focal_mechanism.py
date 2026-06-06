@@ -75,6 +75,10 @@ def run_focal_mechanism(cfg, velmodel=None, num_cpus=1) -> dict:
     if not os.path.exists(sumf):
         raise FileNotFoundError(f"missing {sumf} — run the hypoinverse stage first")
     sm = sumio.read_sum(sumf)
+    if len(sm) == 0:                       # 0 located events (no waveforms / no picks)
+        print(f"(focal_mechanism) {cfg.name}/{velmodel}: 0 located events in the .sum — "
+              f"nothing to do, skipping.")
+        return {}
     cusp2eid = _cuspid_maps(cfg)
     cat_mag = {e["event_id"]: e.get("mag", 0.0) for e in waveforms.load_catalog(cfg)}
     used = pd.read_csv(config.used_stations_csv(cfg))
