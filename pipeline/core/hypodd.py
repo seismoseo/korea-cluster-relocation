@@ -367,16 +367,17 @@ def _exec_hypodd(d, inp, adapt_damping=False, cnd_range=(40.0, 80.0), max_attemp
     return reloc
 
 
-def run_dtct(cfg):
+def run_dtct(cfg, velmodel="kim1983"):
     """Catalog-only (dt.ct) HypoDD relocation; returns the hypoDD.reloc path.
-    Dispatches on cfg.reloc_backend: "hypodd" (legacy Fortran) or "relocdd_py"."""
+    Dispatches on cfg.reloc_backend: "hypodd" (legacy Fortran) or "relocdd_py".
+    `velmodel` selects which located .sum drives the relocation (default kim1983)."""
     backend = getattr(cfg, "reloc_backend", "hypodd")
     if backend == "relocdd_py":
         from pipeline.core import relocdd_py_backend
         # Fortran-free: rebuild phase.dat + dt.ct from the located .sum (works for any
         # loc backend, and ensures a HypoSVI .sum actually drives the relocation rather
         # than reusing the HYPOINVERSE-derived Fortran 00.ph2dt output).
-        return relocdd_py_backend.run_relocdd_py_full(cfg, velmodel="kim1983")
+        return relocdd_py_backend.run_relocdd_py_full(cfg, velmodel=velmodel)
     src = config.ph2dt_dir(cfg)
     d = config.assert_writable(config.dtct_dir(cfg))
     os.makedirs(d, exist_ok=True)

@@ -122,7 +122,7 @@ def run_cluster(cfg, stage_from="stations", through="dtct",
             log(f"ph2dt: dt.ct / event.dat written  ({timings['ph2dt']:.1f}s)")
     if "dtct" in todo:
         with _time("dtct"):
-            res["dtct"] = hypodd.run_dtct(cfg)
+            res["dtct"] = hypodd.run_dtct(cfg, velmodel=arc_velmodel)
         log(f"dtct: {res['dtct'].split('/pipeline/')[-1]}  ({timings['dtct']:.1f}s)")
     if "rereference" in todo:
         with _time("rereference"):
