@@ -92,17 +92,23 @@ def _run_backend(backend, cluster, n_pairs, ncores):
     out_p = os.path.join(tmpdir, "P"); out_s = os.path.join(tmpdir, "S")
     os.makedirs(out_p, exist_ok=True); os.makedirs(out_s, exist_ok=True)
 
-    # GPU mode needs spawn context to avoid CUDA-in-fork failures.
-    mp_ctx = mp.get_context("spawn") if backend == "cctorch_gpu" else None
-
-    t0 = time.time()
-    with ProcessPoolExecutor(max_workers=ncores, initializer=xcorr._init_worker,
-                             initargs=(common, stations, eid, xc,
-                                       dict(cfg.xcorr_pair_overrides),
-                                       out_p, out_s, backend),
-                             mp_context=mp_ctx) as ex:
-        list(ex.map(xcorr._pair_P, pairs))
-    wall = time.time() - t0
+    if backend == "cctorch_gpu_batched":
+        # Single-process, VRAM-bounded, cross-pair executor (writes BOTH P and S).
+        t0 = time.time()
+        xcorr.run_xcorr_gpu_batched(common, stations, eid, xc,
+                                    dict(cfg.xcorr_pair_overrides), out_p, out_s, pairs)
+        wall = time.time() - t0
+    else:
+        # GPU mode needs spawn context to avoid CUDA-in-fork failures.
+        mp_ctx = mp.get_context("spawn") if backend == "cctorch_gpu" else None
+        t0 = time.time()
+        with ProcessPoolExecutor(max_workers=ncores, initializer=xcorr._init_worker,
+                                 initargs=(common, stations, eid, xc,
+                                           dict(cfg.xcorr_pair_overrides),
+                                           out_p, out_s, backend),
+                                 mp_context=mp_ctx) as ex:
+            list(ex.map(xcorr._pair_P, pairs))
+        wall = time.time() - t0
 
     rows = []
     for p in glob(os.path.join(out_p, "dt.cc_P_*")):
@@ -157,11 +163,15 @@ def main():
     print(f"  {len(r_obspy)} obs  wall={t_obspy:.1f}s", flush=True)
 
     print(f"\n--- cctorch_cpu backend ({ncores} workers) ---", flush=True)
-    r_cpu, t_cpu, td = _run_backend("cctorch_cpu", a.cluster, a.max_pairs, ncores)
-    tmpdirs.append(td)
-    print(f"  {len(r_cpu)} obs  wall={t_cpu:.1f}s  "
-          f"speedup={t_obspy/max(t_cpu,0.001):.1f}×", flush=True)
-    pass_cpu = _diff_report(r_obspy, r_cpu, "obspy ↔ cctorch_cpu")
+    try:
+        r_cpu, t_cpu, td = _run_backend("cctorch_cpu", a.cluster, a.max_pairs, ncores)
+        tmpdirs.append(td)
+        print(f"  {len(r_cpu)} obs  wall={t_cpu:.1f}s  "
+              f"speedup={t_obspy/max(t_cpu,0.001):.1f}×", flush=True)
+        pass_cpu = _diff_report(r_obspy, r_cpu, "obspy ↔ cctorch_cpu")
+    except Exception as e:                                   # the old per-pair path can OOM the pool
+        print(f"  cctorch_cpu FAILED ({type(e).__name__}: {e}) — skipping", flush=True)
+        pass_cpu = True
 
     pass_gpu = True
     if not a.skip_gpu:
@@ -178,6 +188,14 @@ def main():
             print(f"  {len(r_gpu)} obs  wall={t_gpu:.1f}s  "
                   f"speedup={t_obspy/max(t_gpu,0.001):.1f}×", flush=True)
             pass_gpu = _diff_report(r_obspy, r_gpu, "obspy ↔ cctorch_gpu")
+
+            print(f"\n--- cctorch_gpu_batched backend (single-process, VRAM-bounded) ---",
+                  flush=True)
+            r_gb, t_gb, td = _run_backend("cctorch_gpu_batched", a.cluster, a.max_pairs, 1)
+            tmpdirs.append(td)
+            print(f"  {len(r_gb)} obs  wall={t_gb:.1f}s  "
+                  f"speedup={t_obspy/max(t_gb,0.001):.1f}×", flush=True)
+            pass_gpu = _diff_report(r_obspy, r_gb, "obspy ↔ cctorch_gpu_batched") and pass_gpu
         else:
             print("\n(no CUDA; skipping cctorch_gpu)")
             pass_gpu = True

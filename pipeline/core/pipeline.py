@@ -131,7 +131,8 @@ def run_cluster(cfg, stage_from="stations", through="dtct",
             f"({timings['rereference']:.1f}s)")
     if "xcorr" in todo:
         with _time("xcorr"):
-            res["xcorr"] = xcorr.run_xcorr(cfg, velmodel=arc_velmodel, cores=cores)
+            res["xcorr"] = xcorr.run_xcorr(cfg, velmodel=arc_velmodel, cores=cores,
+                                           xcorr_backend=getattr(cfg, "xcorr_backend", "obspy"))
         log(f"xcorr: {res['xcorr']['pairs']} pairs x {res['xcorr']['stations']} stations  "
             f"({timings['xcorr']:.1f}s)")
     if "dtcc" in todo:

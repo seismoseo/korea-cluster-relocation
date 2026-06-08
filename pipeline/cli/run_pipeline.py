@@ -33,6 +33,9 @@ def main():
                     help="xcorr worker cap (default cfg.num_cores; always pin with taskset)")
     ap.add_argument("--picker", default=None,
                     help="override cfg.picker_weights (e.g. phasenet_plus for polarity/amplitude)")
+    ap.add_argument("--xcorr-backend", default=None,
+                    choices=["obspy", "cctorch_cpu", "cctorch_gpu", "cctorch_gpu_batched"],
+                    help="dt.cc xcorr kernel (default cfg.xcorr_backend = obspy CPU baseline)")
     ap.add_argument("--fm-velmodel", default=None,
                     help="velocity model whose .sum the focal_mechanism stage uses (default cfg.fm_velmodel)")
     args = ap.parse_args()
@@ -40,6 +43,8 @@ def main():
     cfg = config.load_cluster(args.cluster)
     if args.picker:
         cfg = config.tune(cfg, picker_weights=args.picker)
+    if args.xcorr_backend:
+        cfg = config.tune(cfg, xcorr_backend=args.xcorr_backend)
     events = args.events.split(",") if args.events else None
     velmodels = tuple(v for v in args.velmodels.split(",") if v)
     pipeline.run_cluster(cfg, stage_from=args.stage_from, through=args.through,

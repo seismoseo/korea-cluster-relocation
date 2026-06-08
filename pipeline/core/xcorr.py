@@ -366,6 +366,300 @@ def _measure_dispatch(tr1, tr2, hdr, pre, post, shift_samp, margin, step):
     raise ValueError(f"unknown xcorr backend: {_BACKEND!r}")
 
 
+# ============== cctorch_gpu_batched: memory-safe, cross-pair FFT xcorr ===============
+# A single-process executor that gathers EVERY (pair, phase, station[, comp]) task and
+# runs them through VRAM-sized batched FFT cross-correlations. The per-slide FFT result
+# reproduces obspy `correlate`/`xcorr_max` to ~1e-15 (irfft(rfft(ref)·conj(rfft(cand)))
+# /n_ref, lags [-nlag,+nlag]) — so dt.cc stays inside the validation tolerance — while
+# peak VRAM is bounded BY CONSTRUCTION: each batch is sized against LIVE free VRAM
+# (`mem_get_info`), a hard per-process cap (`set_per_process_memory_fraction`) turns any
+# overshoot into a *catchable* CUDA OOM, and the OOM handler halves+retries down to a CPU
+# fallback so a run ALWAYS completes. This replaces the per-pair grouped-conv1d path
+# whose cuDNN workspace was unbounded (the cause of the prior OOMs). The obspy CPU
+# baseline and the existing cctorch_cpu/cctorch_gpu paths are untouched.
+_VRAM_SAFE_FRACTION = 0.4    # size each FFT batch to <= this * FREE vram
+_VRAM_HARD_FRACTION = 0.9    # set_per_process_memory_fraction guard
+# Measured peak ≈ 1.8× the naive tensor sum (cuFFT workspace + transient intermediates), so the
+# per-task cost model carries a 2× safety factor; the OOM-retry path covers any residual misfit.
+_VRAM_TASK_OVERHEAD = 2.0
+
+
+def _gpu_free_bytes(device):
+    import torch
+    return int(torch.cuda.mem_get_info(device)[0])
+
+
+def _bytes_per_task(n_slides, n_ref, nlag):
+    """A-priori float64 GPU bytes for ONE (pair,phase,station) task (all its slides):
+    cand windows + rfft(cand) complex + irfft full-real + lag slice + scratch, ×overhead."""
+    L = n_ref + 2 * nlag
+    return int(_VRAM_TASK_OVERHEAD * n_slides
+               * (n_ref * 8 + (L // 2 + 1) * 16 + L * 8 + 4 * (2 * nlag + 1) * 8))
+
+
+def _max_tasks(device, n_slides, n_ref, nlag, fraction=_VRAM_SAFE_FRACTION):
+    return max(1, int(_gpu_free_bytes(device) * fraction
+                      / _bytes_per_task(n_slides, n_ref, nlag)))
+
+
+def _install_vram_guard(device, fraction=_VRAM_HARD_FRACTION):
+    import torch
+    try:
+        torch.cuda.set_per_process_memory_fraction(fraction, device.index or 0)
+    except Exception:                                   # noqa: BLE001 — guard is best-effort
+        pass
+
+
+def _znorm_t(x):
+    """z-score along the last axis (mean / std unbiased=False / eps*10) — matches
+    `_measure_cctorch`'s normalisation exactly."""
+    import torch
+    eps = torch.finfo(torch.float64).eps * 10.0
+    return (x - x.mean(dim=-1, keepdim=True)) / (x.std(dim=-1, unbiased=False, keepdim=True) + eps)
+
+
+def _build_one_task(e1, e2, sta, comp, hdr, pre, post, fmin, fmax, slides, sr):
+    """Reference window + per-slide candidate stack for one task, mirroring
+    `_build_pair_batch`'s index math. Returns (ref, cands, valid, n_ref) or None."""
+    tr1 = _full_trace(e1, sta, comp, fmin, fmax)
+    tr2 = _full_trace(e2, sta, comp, fmin, fmax)
+    p1, arr2 = _pick_time(tr1, hdr), _pick_time(tr2, hdr)
+    tr1_data = np.asarray(tr1.data, dtype=np.float64)
+    tr2_data = np.asarray(tr2.data, dtype=np.float64)
+    i0 = int(round((float(p1 - tr1.stats.starttime) - pre) * sr))
+    i1 = int(round((float(p1 - tr1.stats.starttime) + post) * sr))
+    if i0 < 0 or i1 >= len(tr1_data):
+        return None
+    ref = tr1_data[i0:i1 + 1]
+    n_ref = len(ref)
+    arr2_off = float(arr2 - tr2.stats.starttime)
+    starts = np.round((arr2_off - pre + slides) * sr).astype(np.int64)
+    valid = (starts >= 0) & (starts + n_ref <= len(tr2_data))
+    if not valid.any():
+        return None
+    cands = np.zeros((len(slides), n_ref), dtype=np.float64)
+    d = np.diff(starts)
+    if len(d) and np.all(d == d[0]) and d[0] != 0:           # uniform stride → as_strided view
+        vi = np.where(valid)[0]
+        a, b = vi[0], vi[-1] + 1
+        sub = np.lib.stride_tricks.as_strided(
+            tr2_data[starts[a]:], shape=(b - a, n_ref),
+            strides=(d[0] * tr2_data.strides[0], tr2_data.strides[0]))
+        cands[a:b] = sub
+    else:                                                    # rare: non-uniform → loop (exact)
+        for k in np.where(valid)[0]:
+            cands[k] = tr2_data[starts[k]:starts[k] + n_ref]
+    return ref, cands, valid, n_ref
+
+
+def _gpu_correlate_batch(refs, cands, valids, n_ref, nlag, slides, sr, device):
+    """Batched FFT xcorr for a homogeneous task batch. refs (B,n_ref), cands
+    (B,n_slides,n_ref), valids (B,n_slides) numpy. Returns (shift_s (B,), cc (B,)).
+    Reference FFT broadcasts over slides (no replication). Bit-exact-equivalent to the
+    obspy per-slide correlate/xcorr_max, then max over (slide, lag)."""
+    import torch
+    L = n_ref + 2 * nlag
+    R = torch.from_numpy(refs).to(device)
+    C = torch.from_numpy(cands).to(device)
+    R = _znorm_t(R)                                          # (B, n_ref)
+    C = _znorm_t(C)                                          # (B, n_slides, n_ref)
+    A = torch.fft.rfft(R, n=L).unsqueeze(1)                  # (B, 1, Lf)
+    Bf = torch.fft.rfft(C, n=L)                              # (B, n_slides, Lf)
+    full = torch.fft.irfft(A * torch.conj(Bf), n=L) / n_ref  # (B, n_slides, L)
+    cc = torch.cat([full[..., L - nlag:], full[..., :nlag + 1]], dim=-1)  # (B,n_s,2nlag+1)
+    vmask = torch.from_numpy(valids).to(device).unsqueeze(-1)
+    cc = cc.masked_fill(~vmask, float("-inf"))
+    B, n_slides = cc.shape[0], cc.shape[1]
+    flat = cc.reshape(B, -1)
+    best_cc, idx = flat.max(dim=1)
+    lag = (idx % (2 * nlag + 1)) - nlag
+    slide_idx = (idx // (2 * nlag + 1))
+    slides_t = torch.from_numpy(np.asarray(slides)).to(device)
+    shift_s = lag.double() / sr - slides_t[slide_idx]
+    out_shift = shift_s.cpu().numpy()
+    out_cc = best_cc.cpu().numpy()
+    del R, C, A, Bf, full, cc, flat
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return out_shift, out_cc
+
+
+def _process_batch_safe(batch, nlag, slides, sr, device, stats):
+    """Run one task batch on the GPU; on CUDA OOM empty_cache → halve & retry; a single
+    task that still OOMs falls back to CPU. Returns {key: (shift_s, cc)}. Never raises OOM."""
+    import torch
+    if not batch:
+        return {}
+    refs = np.stack([t["ref"] for t in batch])
+    cands = np.stack([t["cands"] for t in batch])
+    valids = np.stack([t["valid"] for t in batch])
+    n_ref = batch[0]["n_ref"]
+    try:
+        shifts, ccs = _gpu_correlate_batch(refs, cands, valids, n_ref, nlag, slides, sr, device)
+        stats["batches"] += 1
+        return {batch[i]["key"]: (float(np.round(shifts[i], 3)), float(ccs[i]))
+                for i in range(len(batch))}
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        if len(batch) == 1:                                 # last resort: CPU (always fits)
+            stats["cpu_fallback_tasks"] += 1
+            cpu = torch.device("cpu")
+            shifts, ccs = _gpu_correlate_batch(refs, cands, valids, n_ref, nlag, slides, sr, cpu)
+            return {batch[0]["key"]: (float(np.round(shifts[0], 3)), float(ccs[0]))}
+        stats["oom_retries"] += 1
+        mid = len(batch) // 2
+        out = _process_batch_safe(batch[:mid], nlag, slides, sr, device, stats)
+        out.update(_process_batch_safe(batch[mid:], nlag, slides, sr, device, stats))
+        return out
+
+
+def _interp_one_trace(key):
+    """Worker entry for the prep pool: interpolate+filter one (eid, sta, comp, fmin, fmax)
+    trace and return (key, trace) — or (key, None) if its SAC file is missing. The heavy
+    100→1000 Hz lanczos interpolation runs here, in parallel, instead of serially in the
+    single GPU process."""
+    try:
+        return key, _full_trace(*key)
+    except Exception:                                       # noqa: BLE001 — missing trace etc.
+        return key, None
+
+
+def run_xcorr_gpu_batched(common, stations, eid, xc, overrides, out_p, out_s, pairs,
+                          cores=None, vram_fraction=_VRAM_SAFE_FRACTION):
+    """Single-process, memory-bounded, cross-pair-batched FFT xcorr executor. Writes the
+    SAME per-pair dt.cc_{P,S}_<e1>_<e2> files as the obspy path (station order, S best-comp
+    selection identical), so `_filter_combine`/combine/`_drop_mainshock` are unchanged."""
+    import torch
+    from collections import defaultdict
+    _init_worker(common, stations, eid, xc, dict(overrides), out_p, out_s, "cctorch_gpu_batched")
+    device = torch.device("cuda:0")
+    _install_vram_guard(device)
+    sr = float(xc["interp_hz"]); nlag = int(xc["shift_samp"])
+    slides = np.arange(-xc["margin"], xc["margin"], xc["slide_step"])
+    n_slides = len(slides)
+    stats = {"oom_retries": 0, "cpu_fallback_tasks": 0, "batches": 0, "tasks": 0,
+             "peak_vram_gb": 0.0}
+    results = {p: {"P": {}, "S": {}} for p in pairs}        # pair -> phase -> {(sta,comp):(shift,cc)}
+
+    # (pre,post,fmin,fmax) per pair (overrides) — window/band drive n_ref.
+    win = {p: _window(p) for p in pairs}
+
+    # ---- parallel trace prep (the single-process bottleneck) -------------------------------
+    # _full_trace does a ~0.3 s/trace 100→1000 Hz lanczos interpolation; running it serially for
+    # every (event,station,comp,band) starves the GPU. Pre-build the trace cache in a CPU worker
+    # pool (no GPU → no contention / no OOM), then the task loop below hits a warm `_CACHE`.
+    import time as _time
+    # Prep is the dominant cost at scale (interpolation, ~0.3 s/trace) and is embarrassingly
+    # parallel and GPU-free — so use as many cores as available (capped at 32; IPC of returned
+    # traces gives diminishing returns beyond that). `cores` (from --cores) overrides.
+    ncores = cores or min(32, max(1, len(os.sched_getaffinity(0)) - 1))
+    if ncores > 1:
+        keys = set()
+        for pair in pairs:
+            pre, post, fmin, fmax = win[pair]
+            for sta in stations:
+                for comp in ("Z",) + tuple(xc["s_comps"]):
+                    keys.add((pair[0], sta, comp, fmin, fmax))
+                    keys.add((pair[1], sta, comp, fmin, fmax))
+        keys = list(keys)
+        t0 = _time.time(); got = 0
+        with ProcessPoolExecutor(max_workers=ncores, initializer=_init_worker,
+                                 initargs=(common, stations, eid, xc, dict(overrides),
+                                           out_p, out_s, "obspy")) as ex:
+            for key, tr in ex.map(_interp_one_trace, keys, chunksize=4):
+                if tr is not None:
+                    _CACHE[key] = tr; got += 1
+        print(f"[xcorr] gpu_batched: pre-interpolated {got}/{len(keys)} traces on {ncores} "
+              f"workers in {_time.time() - t0:.1f}s")
+
+    def _specs():
+        for pair in pairs:
+            for sta in stations:
+                yield (pair, "P", "a", sta, "Z")
+                for comp in xc["s_comps"]:
+                    yield (pair, "S", "t0", sta, comp)
+
+    torch.cuda.reset_peak_memory_stats(device)
+    batch, batch_nref, cap = [], None, None
+    for (pair, phase, hdr, sta, comp) in _specs():
+        pre, post, fmin, fmax = win[pair]
+        try:
+            built = _build_one_task(pair[0], pair[1], sta, comp, hdr, pre, post, fmin, fmax, slides, sr)
+        except Exception:                                   # noqa: BLE001 — missing trace etc.
+            built = None
+        if built is None:
+            continue
+        ref, cands, valid, n_ref = built
+        if batch_nref is None:
+            batch_nref = n_ref
+            cap = _max_tasks(device, n_slides, n_ref, nlag, vram_fraction)
+        if n_ref != batch_nref or len(batch) >= cap:        # flush on size/shape change
+            for k, v in _process_batch_safe(batch, nlag, slides, sr, device, stats).items():
+                results[k[0]][k[1]][(k[2], k[3])] = v
+            stats["tasks"] += len(batch)
+            batch, batch_nref = [], n_ref
+            cap = _max_tasks(device, n_slides, n_ref, nlag, vram_fraction)
+        batch.append(dict(key=(pair, phase, sta, comp), ref=ref, cands=cands,
+                          valid=valid, n_ref=n_ref))
+    for k, v in _process_batch_safe(batch, nlag, slides, sr, device, stats).items():
+        results[k[0]][k[1]][(k[2], k[3])] = v
+    stats["tasks"] += len(batch)
+    stats["peak_vram_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
+
+    # Write per-pair files — byte-identical layout to _pair_P / _pair_S.
+    for pair in pairs:
+        e1, e2 = pair
+        pre, post, fmin, fmax = win[pair]
+        # P
+        plines = [_header(e1, e2)]
+        for sta in stations:
+            r = results[pair]["P"].get((sta, "Z"))
+            if r is None:
+                continue
+            try:
+                shift, coeff = r
+                tr1 = _full_trace(e1, sta, "Z", fmin, fmax)
+                tr2 = _full_trace(e2, sta, "Z", fmin, fmax)
+                t1, ot1 = _pick_time(tr1, "a"), tr1.stats.starttime - tr1.stats.sac.b
+                t2, ot2 = _pick_time(tr2, "a"), tr2.stats.starttime - tr2.stats.sac.b
+                diff = (t1 + shift - ot1) - (t2 - ot2)
+                plines.append(_fmt(tr1.stats.network or sta[:0], sta, diff, coeff, "P"))
+            except Exception:                               # noqa: BLE001
+                pass
+        with open(os.path.join(out_p, f"dt.cc_P_{e1}_{e2}"), "w") as f:
+            f.writelines(plines)
+        # S — best comp per station (s_comps order, >= tie-break: last wins) like _pair_S
+        slines = [_header(e1, e2)]
+        for sta in stations:
+            best = None
+            for comp in xc["s_comps"]:
+                r = results[pair]["S"].get((sta, comp))
+                if r is None:
+                    continue
+                shift, coeff = r
+                if best is None or coeff >= best[0]:
+                    best = (coeff, shift, comp)
+            if best is None:
+                continue
+            try:
+                coeff, shift, comp = best
+                tr1 = _full_trace(e1, sta, comp, fmin, fmax)
+                tr2 = _full_trace(e2, sta, comp, fmin, fmax)
+                t1, ot1 = _pick_time(tr1, "t0"), tr1.stats.starttime - tr1.stats.sac.b
+                t2, ot2 = _pick_time(tr2, "t0"), tr2.stats.starttime - tr2.stats.sac.b
+                diff = (t1 + shift - ot1) - (t2 - ot2)
+                slines.append(_fmt(tr1.stats.network or sta[:0], sta, diff, coeff, "S"))
+            except Exception:                               # noqa: BLE001
+                pass
+        with open(os.path.join(out_s, f"dt.cc_S_{e1}_{e2}"), "w") as f:
+            f.writelines(slines)
+
+    print(f"[xcorr] gpu_batched: {stats['tasks']} tasks in {stats['batches']} batches | "
+          f"peak VRAM {stats['peak_vram_gb']:.1f} GB | OOM retries {stats['oom_retries']} | "
+          f"CPU fallbacks {stats['cpu_fallback_tasks']}")
+    return stats
+
+
 def _window(pair):
     """(pre, post, fmin, fmax) for a pair, applying any xcorr_pair_override."""
     pre, post = _XC["pre"], _XC["post"]
@@ -557,17 +851,30 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy") -> dic
     available, falls back to "obspy" with a warning. The CPU baseline never breaks.
 
     Returns {"pairs": n, "stations": n, "combined": path, "no_main": path|None}."""
-    # Sanity-check + fallback.
+    # Sanity-check + graceful fallback. Since `cctorch_gpu_batched` is the DEFAULT, this must
+    # degrade to the obspy CPU baseline on any machine without a *usable* GPU — including a card
+    # too new for the installed torch (reports available but errors at runtime, like the sm_120
+    # case handled in hyposvi_backend). The CPU baseline never breaks.
     if xcorr_backend != "obspy":
+        ok = False
         try:
             import torch
-            if xcorr_backend == "cctorch_gpu" and not torch.cuda.is_available():
-                print(f"[xcorr] WARN: cctorch_gpu requested but CUDA unavailable; "
+            if xcorr_backend == "cctorch_cpu":
+                ok = True
+            elif torch.cuda.is_available():
+                try:                                        # smoke-test a real GPU op
+                    (torch.zeros(8, device="cuda:0") + 1.0).sum().item()
+                    ok = True
+                except Exception as e:                      # noqa: BLE001 — too-new/broken GPU
+                    print(f"[xcorr] WARN: GPU unusable for {xcorr_backend} "
+                          f"({type(e).__name__}); falling back to obspy.")
+            else:
+                print(f"[xcorr] WARN: {xcorr_backend} requested but CUDA unavailable; "
                       f"falling back to obspy.")
-                xcorr_backend = "obspy"
         except ImportError:
             print(f"[xcorr] WARN: {xcorr_backend} requested but torch not importable; "
                   f"falling back to obspy.")
+        if not ok:
             xcorr_backend = "obspy"
     out = config.assert_writable(config.dtcc_dir(cfg))
     out_p, out_s = os.path.join(out, "dt.cc_P"), os.path.join(out, "dt.cc_S")
@@ -623,17 +930,24 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy") -> dic
                 ncores = 8
     print(f"[xcorr] {len(pairs)} pairs x {len(stations)} stations, {ncores} workers "
           f"(backend={xcorr_backend}, slide_step={xc['slide_step']}s, band={xc['bandpass']}Hz)")
-    # CUDA + 'fork' is unsafe — child can't inherit GPU state cleanly. Use 'spawn'
-    # for GPU mode; 'fork' (default) is fine for ObsPy and CCTorch-CPU.
-    import multiprocessing as _mp
-    mp_ctx = _mp.get_context("spawn") if xcorr_backend == "cctorch_gpu" else None
-    with ProcessPoolExecutor(max_workers=ncores, initializer=_init_worker,
-                             initargs=(common, stations, eid, xc,
-                                       dict(cfg.xcorr_pair_overrides), out_p, out_s,
-                                       xcorr_backend),
-                             mp_context=mp_ctx) as ex:
-        list(ex.map(_pair_P, pairs))
-        list(ex.map(_pair_S, pairs))
+    if xcorr_backend == "cctorch_gpu_batched":
+        # Single-process, memory-bounded, cross-pair-batched FFT executor (own dispatch;
+        # no ProcessPoolExecutor). Writes the same per-pair files, then falls through to
+        # the identical combine/threshold/no_main tail below.
+        run_xcorr_gpu_batched(common, stations, eid, xc,
+                              dict(cfg.xcorr_pair_overrides), out_p, out_s, pairs, cores=cores)
+    else:
+        # CUDA + 'fork' is unsafe — child can't inherit GPU state cleanly. Use 'spawn'
+        # for GPU mode; 'fork' (default) is fine for ObsPy and CCTorch-CPU.
+        import multiprocessing as _mp
+        mp_ctx = _mp.get_context("spawn") if xcorr_backend == "cctorch_gpu" else None
+        with ProcessPoolExecutor(max_workers=ncores, initializer=_init_worker,
+                                 initargs=(common, stations, eid, xc,
+                                           dict(cfg.xcorr_pair_overrides), out_p, out_s,
+                                           xcorr_backend),
+                                 mp_context=mp_ctx) as ex:
+            list(ex.map(_pair_P, pairs))
+            list(ex.map(_pair_S, pairs))
 
     thr = xc["cc_threshold"]
     p07, s07 = os.path.join(out, "dt.cc_P_0.7"), os.path.join(out, "dt.cc_S_0.7")

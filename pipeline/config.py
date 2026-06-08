@@ -227,6 +227,12 @@ class ClusterConfig:
     # (`<Region>.sum`, `hypoDD.reloc`) so downstream stages don't know the difference.
     loc_backend: str = "hypoinverse"          # "hypoinverse" | "hyposvi"
     reloc_backend: str = "hypodd"             # "hypodd" | "relocdd_py"
+    # dt.cc cross-correlation kernel. Default "cctorch_gpu_batched" = single-process,
+    # VRAM-bounded, cross-pair FFT executor (memory-safe, bit-exact vs obspy, ~3-6× faster on
+    # GPU). It AUTO-FALLS-BACK to "obspy" (the CPU baseline) when no usable CUDA/torch is found
+    # (a GPU smoke-test in run_xcorr), so CPU-only machines and others' runs are unaffected.
+    # "cctorch_cpu"/"cctorch_gpu" = the older per-pair batched PyTorch paths.
+    xcorr_backend: str = "cctorch_gpu_batched"   # "obspy" | "cctorch_cpu" | "cctorch_gpu" | "cctorch_gpu_batched"
     # HypoSVI: trained EikoNet checkpoint paths per phase. Required when
     # loc_backend == "hyposvi". A model is per-velocity-model (kim1983 / kim2011);
     # see pipeline/velocity_models/eikonet_kim1983/.
