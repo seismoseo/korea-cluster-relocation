@@ -233,6 +233,10 @@ class ClusterConfig:
     # (a GPU smoke-test in run_xcorr), so CPU-only machines and others' runs are unaffected.
     # "cctorch_cpu"/"cctorch_gpu" = the older per-pair batched PyTorch paths.
     xcorr_backend: str = "cctorch_gpu_batched"   # "obspy" | "cctorch_cpu" | "cctorch_gpu" | "cctorch_gpu_batched"
+    # Cache interpolated+filtered traces on disk (runs/<cluster>/wf_interp_cache/) so RE-RUNS skip
+    # the dominant ~0.3 s/trace 100→1000 Hz interpolation. Deterministic + keyed by source mtime +
+    # interp/band params → bit-exact and self-invalidating. Used by the cctorch_gpu_batched path.
+    xcorr_interp_cache: bool = True
     # HypoSVI: trained EikoNet checkpoint paths per phase. Required when
     # loc_backend == "hyposvi". A model is per-velocity-model (kim1983 / kim2011);
     # see pipeline/velocity_models/eikonet_kim1983/.

@@ -51,13 +51,16 @@ _COMMON = _STATIONS = _EID = _XC = _OVR = _OUTP = _OUTS = None
 _BACKEND = "obspy"           # set per-run by run_xcorr → _init_worker
 _TORCH_DEVICE = None         # lazy per-worker torch.device handle
 _CACHE: dict = {}
+_INTERP_CACHE_DIR = None      # optional on-disk cache for interpolated+filtered traces
 
 
-def _init_worker(common, stations, eid, xc, ovr, outp, outs, backend="obspy"):
-    global _COMMON, _STATIONS, _EID, _XC, _OVR, _OUTP, _OUTS, _BACKEND, _CACHE
+def _init_worker(common, stations, eid, xc, ovr, outp, outs, backend="obspy",
+                 interp_cache_dir=None):
+    global _COMMON, _STATIONS, _EID, _XC, _OVR, _OUTP, _OUTS, _BACKEND, _CACHE, _INTERP_CACHE_DIR
     _COMMON, _STATIONS, _EID, _XC, _OVR, _OUTP, _OUTS = \
         common, stations, eid, xc, ovr, outp, outs
     _BACKEND = backend
+    _INTERP_CACHE_DIR = interp_cache_dir
     _CACHE = {}
     # PyTorch defaults to multi-threaded BLAS — with N ProcessPoolExecutor workers
     # this oversubscribes (N × threads_per_worker), causing massive slowdown. Pin
@@ -71,22 +74,63 @@ def _init_worker(common, stations, eid, xc, ovr, outp, outs, backend="obspy"):
 
 
 # ------------------------------------------------------------- window selection
+def _interp_cache_path(src, fmin, fmax):
+    """On-disk cache filename for one interpolated+filtered trace, keyed by the source file
+    (+mtime) and the EXACT interpolation/filter params — so a changed SAC or band re-computes,
+    and only genuinely identical inputs hit. Returns None when caching is off."""
+    if not _INTERP_CACHE_DIR:
+        return None
+    import hashlib
+    try:
+        sig = f"{src}|{os.path.getmtime(src):.0f}|{os.path.getsize(src)}|{_XC['interp_hz']}|{fmin}|{fmax}"
+    except OSError:
+        return None
+    return os.path.join(_INTERP_CACHE_DIR, hashlib.md5(sig.encode()).hexdigest() + ".pkl")
+
+
 def _full_trace(eid, station, comp, fmin, fmax):
-    """Interpolated + filtered full trace for (event, station, comp, band), cached."""
+    """Interpolated + filtered full trace for (event, station, comp, band).
+
+    In-process `_CACHE` first; then an OPTIONAL on-disk cache (`_INTERP_CACHE_DIR`) that survives
+    across runs — the 100→1000 Hz lanczos interpolation is deterministic and ~0.3 s/trace, so
+    re-runs (e.g. tuning cc_threshold/slide_step) load it in ms instead of recomputing. Disk hit
+    yields the byte-identical Trace, so dt.cc stays bit-exact."""
     key = (eid, station, comp, fmin, fmax)
     tr = _CACHE.get(key)
-    if tr is None:
-        fs = glob(os.path.join(_COMMON, eid, f"{eid}.*.{station}.*{comp}.sac"))
-        if not fs:
-            raise FileNotFoundError(f"{eid}/{station}/{comp}")
-        tr = (read(fs[0])[0]
-              .interpolate(sampling_rate=_XC["interp_hz"], method="lanczos", a=20)
-              .detrend("demean").taper(0.05)
-              .filter("bandpass", freqmin=fmin, freqmax=fmax, corners=4, zerophase=True)
-              .detrend("demean").taper(0.05))
-        if not tr.stats.network:                # canonical name is {eid}.{net}.{code}.{chan}.sac
-            tr.stats.network = os.path.basename(fs[0]).split(".")[1]
-        _CACHE[key] = tr
+    if tr is not None:
+        return tr
+    fs = glob(os.path.join(_COMMON, eid, f"{eid}.*.{station}.*{comp}.sac"))
+    if not fs:
+        raise FileNotFoundError(f"{eid}/{station}/{comp}")
+    src = fs[0]
+    cpath = _interp_cache_path(src, fmin, fmax)
+    if cpath and os.path.exists(cpath):
+        try:                                    # disk hit — skip the expensive interpolation
+            import pickle
+            with open(cpath, "rb") as fh:
+                tr = pickle.load(fh)
+            _CACHE[key] = tr
+            return tr
+        except Exception:                       # noqa: BLE001 — corrupt entry → recompute
+            pass
+    tr = (read(src)[0]
+          .interpolate(sampling_rate=_XC["interp_hz"], method="lanczos", a=20)
+          .detrend("demean").taper(0.05)
+          .filter("bandpass", freqmin=fmin, freqmax=fmax, corners=4, zerophase=True)
+          .detrend("demean").taper(0.05))
+    if not tr.stats.network:                    # canonical name is {eid}.{net}.{code}.{chan}.sac
+        tr.stats.network = os.path.basename(src).split(".")[1]
+    if cpath:
+        try:
+            import pickle
+            os.makedirs(_INTERP_CACHE_DIR, exist_ok=True)
+            tmp = cpath + f".tmp{os.getpid()}"  # atomic write (no torn file under parallel prep)
+            with open(tmp, "wb") as fh:
+                pickle.dump(tr, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, cpath)
+        except Exception:                       # noqa: BLE001 — cache write best-effort
+            pass
+    _CACHE[key] = tr
     return tr
 
 
@@ -525,13 +569,17 @@ def _interp_one_trace(key):
 
 
 def run_xcorr_gpu_batched(common, stations, eid, xc, overrides, out_p, out_s, pairs,
-                          cores=None, vram_fraction=_VRAM_SAFE_FRACTION):
+                          cores=None, vram_fraction=_VRAM_SAFE_FRACTION, interp_cache_dir=None):
     """Single-process, memory-bounded, cross-pair-batched FFT xcorr executor. Writes the
     SAME per-pair dt.cc_{P,S}_<e1>_<e2> files as the obspy path (station order, S best-comp
-    selection identical), so `_filter_combine`/combine/`_drop_mainshock` are unchanged."""
+    selection identical), so `_filter_combine`/combine/`_drop_mainshock` are unchanged.
+
+    `interp_cache_dir` (when set) caches interpolated+filtered traces on disk so re-runs skip
+    the dominant interpolation cost."""
     import torch
     from collections import defaultdict
-    _init_worker(common, stations, eid, xc, dict(overrides), out_p, out_s, "cctorch_gpu_batched")
+    _init_worker(common, stations, eid, xc, dict(overrides), out_p, out_s,
+                 "cctorch_gpu_batched", interp_cache_dir)
     device = torch.device("cuda:0")
     _install_vram_guard(device)
     sr = float(xc["interp_hz"]); nlag = int(xc["shift_samp"])
@@ -565,12 +613,13 @@ def run_xcorr_gpu_batched(common, stations, eid, xc, overrides, out_p, out_s, pa
         t0 = _time.time(); got = 0
         with ProcessPoolExecutor(max_workers=ncores, initializer=_init_worker,
                                  initargs=(common, stations, eid, xc, dict(overrides),
-                                           out_p, out_s, "obspy")) as ex:
+                                           out_p, out_s, "obspy", interp_cache_dir)) as ex:
             for key, tr in ex.map(_interp_one_trace, keys, chunksize=4):
                 if tr is not None:
                     _CACHE[key] = tr; got += 1
         print(f"[xcorr] gpu_batched: pre-interpolated {got}/{len(keys)} traces on {ncores} "
-              f"workers in {_time.time() - t0:.1f}s")
+              f"workers in {_time.time() - t0:.1f}s"
+              + (f" (cache {os.path.basename(interp_cache_dir)})" if interp_cache_dir else ""))
 
     def _specs():
         for pair in pairs:
@@ -934,8 +983,10 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy") -> dic
         # Single-process, memory-bounded, cross-pair-batched FFT executor (own dispatch;
         # no ProcessPoolExecutor). Writes the same per-pair files, then falls through to
         # the identical combine/threshold/no_main tail below.
-        run_xcorr_gpu_batched(common, stations, eid, xc,
-                              dict(cfg.xcorr_pair_overrides), out_p, out_s, pairs, cores=cores)
+        ic = (os.path.join(cfg.output_root, "wf_interp_cache")
+              if getattr(cfg, "xcorr_interp_cache", True) and cfg.output_root else None)
+        run_xcorr_gpu_batched(common, stations, eid, xc, dict(cfg.xcorr_pair_overrides),
+                              out_p, out_s, pairs, cores=cores, interp_cache_dir=ic)
     else:
         # CUDA + 'fork' is unsafe — child can't inherit GPU state cleanly. Use 'spawn'
         # for GPU mode; 'fork' (default) is fine for ObsPy and CCTorch-CPU.
