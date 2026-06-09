@@ -916,8 +916,14 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
     out_csv = os.path.join(bdir, "bootstrap_errors.csv")
     if cache and os.path.exists(out_csv):
         meta = _H._bootstrap_meta(out_csv)
+        # Backend match accepts the current `relocdd_py` tag OR a LEGACY header with no `backend=`
+        # field. Pre-tagging caches (and the Fortran bootstrap, whose procedure is identical) wrote
+        # no backend; they are valid bootstrap error bars for the same branch/n/seed. Requiring an
+        # exact `backend=relocdd_py` made every run miss a perfectly good cache and recompute all
+        # `n` inversions — which blew past the notebook's per-cell timeout. Reuse instead.
+        _bk = meta.get("backend")
         if (meta.get("n") == str(n) and meta.get("seed") == str(seed)
-                and meta.get("branch") == branch and meta.get("backend") == "relocdd_py"):
+                and meta.get("branch") == branch and _bk in ("relocdd_py", None)):
             return pd.read_csv(out_csv, comment="#")
 
     has_cc = branch == "dtcc" and os.path.exists(os.path.join(data_dir, "dt.cc"))
@@ -937,6 +943,12 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
     ph2dt_src = os.path.join(relocdd_dir, "sample_inputfiles", "ph2dt.inp")
     station_src = os.path.join(data_dir, "station.dat")
     boot_timeout_s = 120
+    # Pin every replica subprocess to a SINGLE BLAS/OpenMP thread. Without this each run.py spreads
+    # numpy/BLAS across all cores, so N concurrent replicas spawn N x (many) threads and thrash —
+    # the pool size below is then a TRUE core count rather than oversubscription.
+    one_thread_env = {**os.environ, "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+                      "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
+                      "VECLIB_MAXIMUM_THREADS": "1"}
 
     def _one(i):
         rng = np.random.default_rng(seed + i)
@@ -957,7 +969,8 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
             try:
                 subprocess.run([sys.executable, os.path.join(relocdd_dir, "run.py"),
                                 os.path.join(wi, "run.inp"), "0", "1"],
-                               cwd=d, capture_output=True, text=True, timeout=boot_timeout_s)
+                               cwd=d, capture_output=True, text=True, timeout=boot_timeout_s,
+                               env=one_thread_env)
                 raw = _resolve_raw_reloc(os.path.join(wo, "EDD", "tradouts"))
                 if not os.path.exists(raw) or not os.path.getsize(raw):
                     return {}
@@ -971,7 +984,10 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
-    cores = cores or getattr(cfg, "num_cores", 4) or 4
+    # With each replica pinned to one thread (one_thread_env), size the pool to dedicated cores
+    # (cfg.bootstrap_cores, default 30) — NOT cfg.num_cores (10). Never exceed the replica count.
+    cores = cores or getattr(cfg, "bootstrap_cores", None) or 30
+    cores = max(1, min(int(cores), n))
     with ThreadPoolExecutor(max_workers=int(cores)) as ex:
         replicas = list(ex.map(_one, range(n)))
 

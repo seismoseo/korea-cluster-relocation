@@ -52,8 +52,23 @@ CLUSTER_SRC_DIRS = (
     "Donghae_cluster",
     "Yeoju_cluster",
     "Jecheon_cluster",
-    "Yeongyang_cluster",)
-CLUSTER_NAMES = ("gwangyang", "kimcheon", "jangsung", "gyeongju", "changnyeong", "chungju", "sangju", "yesan", "west_gyeongju", "2019_changnyeong", "haman", "uiseong", "taean", "hampyeong", "buyeo", "yeoncheon", "youngcheon", "gwangju", "donghae", "yeoju", "jecheon", "yeongyang")
+    "Yeongyang_cluster",
+    "Kimcheon_updated_cluster",
+    "2019_suncheon_cluster",
+    "Gokseong_cluster",
+    "Gurye_cluster",
+    "Wanju_cluster",
+    "Jangsu_cluster",
+    "Namwon_cluster",
+    "Suncheon_cluster",
+    "Jeongseon_cluster",
+    "Jeongseon_ff_cluster",
+    "Geochang_cluster",
+    "Gwangyang_stp_cluster",
+    "Tongyeong_cluster",
+    "Goseong_cluster",
+    "Hongcheon_cluster",)
+CLUSTER_NAMES = ("gwangyang", "kimcheon", "jangsung", "gyeongju", "changnyeong", "chungju", "sangju", "yesan", "west_gyeongju", "2019_changnyeong", "haman", "uiseong", "taean", "hampyeong", "buyeo", "yeoncheon", "youngcheon", "gwangju", "donghae", "yeoju", "jecheon", "yeongyang", "kimcheon_updated", "2019_suncheon", "gokseong", "gurye", "wanju", "jangsu", "namwon", "suncheon", "jeongseon", "jeongseon_ff", "geochang", "gwangyang_stp", "tongyeong", "goseong", "hongcheon")
 
 
 # ------------------------------------------------- picker backends (by model)
@@ -270,6 +285,9 @@ class ClusterConfig:
 
     cuspid_offset: int = 200000             # HypoDD cuspid = offset + catalog index
     num_cores: int = 10
+    bootstrap_cores: int = 30               # worker pool for the relocation bootstrap (each replica
+                                            # subprocess is pinned to 1 BLAS thread, so this is a true
+                                            # core count, NOT multiplied by per-replica threads)
 
     def __post_init__(self):
         if not self.output_root:
