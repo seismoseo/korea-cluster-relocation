@@ -914,13 +914,18 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
     # bootstrap_samples.npz) so viz._load_bootstrap / location_table / the plot error bars
     # pick them up transparently — viz keys off these exact filenames, not the backend.
     out_csv = os.path.join(bdir, "bootstrap_errors.csv")
-    if cache and os.path.exists(out_csv):
+    # Freshness guard: a cache is only valid if it is at least as new as the relocation it bootstraps.
+    # If hypoDD.reloc was re-run since (different event set / coordinates), the old bars are STALE and
+    # MUST be recomputed — reusing them silently drops error bars for the new events (e.g. a 7-event
+    # cache reused against a 28-event reloc).
+    cache_fresh = (cache and os.path.exists(out_csv)
+                   and os.path.getmtime(out_csv) >= os.path.getmtime(reloc0))
+    if cache_fresh:
         meta = _H._bootstrap_meta(out_csv)
         # Backend match accepts the current `relocdd_py` tag OR a LEGACY header with no `backend=`
-        # field. Pre-tagging caches (and the Fortran bootstrap, whose procedure is identical) wrote
-        # no backend; they are valid bootstrap error bars for the same branch/n/seed. Requiring an
-        # exact `backend=relocdd_py` made every run miss a perfectly good cache and recompute all
-        # `n` inversions — which blew past the notebook's per-cell timeout. Reuse instead.
+        # field (pre-tagging / Fortran-written caches, whose bootstrap procedure is identical, are
+        # valid for the same branch/n/seed). Requiring an exact `backend=relocdd_py` made every run
+        # miss a perfectly good cache and recompute all `n` inversions.
         _bk = meta.get("backend")
         if (meta.get("n") == str(n) and meta.get("seed") == str(seed)
                 and meta.get("branch") == branch and _bk in ("relocdd_py", None)):
