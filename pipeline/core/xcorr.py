@@ -887,6 +887,34 @@ def _drop_mainshock(in_file, out_file, cuspid):
 
 
 # --------------------------------------------------------------- orchestration
+def probe_xcorr_backend(backend):
+    """Resolve an xcorr backend request to what will ACTUALLY run, smoke-testing the GPU.
+
+    Returns ``(effective_backend, status_msg)``. Pure check, no side effects — callable up
+    front (e.g. at run start) so a run can announce whether the GPU path is active or will
+    fall back to the obspy CPU baseline, and WHY. A GPU too new for the installed torch
+    (reports available but errors at runtime, e.g. Blackwell sm_120 on a cu124 wheel) is the
+    common fallback cause; the message points at the fix (the cu128 / pq-gpu env)."""
+    if backend == "obspy":
+        return "obspy", "obspy CPU baseline"
+    try:
+        import torch
+    except ImportError:
+        return "obspy", f"{backend} requested but torch not importable -> obspy CPU fallback"
+    if backend == "cctorch_cpu":
+        return backend, f"cctorch CPU (torch {torch.__version__}, no GPU)"
+    if not torch.cuda.is_available():
+        return "obspy", f"{backend} requested but CUDA unavailable -> obspy CPU fallback"
+    try:                                                # smoke-test a real GPU op
+        (torch.zeros(8, device="cuda:0") + 1.0).sum().item()
+    except Exception as e:                              # noqa: BLE001 — too-new/broken GPU
+        archs = ", ".join(torch.cuda.get_arch_list()[-3:])
+        return "obspy", (f"{backend} requested but the GPU is unusable in THIS env "
+                         f"({type(e).__name__}; torch {torch.__version__} supports {archs}) "
+                         f"-> obspy CPU fallback. Use the pq-gpu env (PyTorch cu128) for GPU xcorr.")
+    return backend, f"{backend} on {torch.cuda.get_device_name(0)} (torch {torch.__version__})"
+
+
 def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy") -> dict:
     """Measure dt.cc for all event pairs and build the threshold/combined/no_main files.
 
@@ -905,26 +933,10 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy") -> dic
     # too new for the installed torch (reports available but errors at runtime, like the sm_120
     # case handled in hyposvi_backend). The CPU baseline never breaks.
     if xcorr_backend != "obspy":
-        ok = False
-        try:
-            import torch
-            if xcorr_backend == "cctorch_cpu":
-                ok = True
-            elif torch.cuda.is_available():
-                try:                                        # smoke-test a real GPU op
-                    (torch.zeros(8, device="cuda:0") + 1.0).sum().item()
-                    ok = True
-                except Exception as e:                      # noqa: BLE001 — too-new/broken GPU
-                    print(f"[xcorr] WARN: GPU unusable for {xcorr_backend} "
-                          f"({type(e).__name__}); falling back to obspy.")
-            else:
-                print(f"[xcorr] WARN: {xcorr_backend} requested but CUDA unavailable; "
-                      f"falling back to obspy.")
-        except ImportError:
-            print(f"[xcorr] WARN: {xcorr_backend} requested but torch not importable; "
-                  f"falling back to obspy.")
-        if not ok:
-            xcorr_backend = "obspy"
+        eff, msg = probe_xcorr_backend(xcorr_backend)
+        if eff != xcorr_backend:
+            print(f"[xcorr] WARN: {msg}")
+        xcorr_backend = eff
     out = config.assert_writable(config.dtcc_dir(cfg))
     out_p, out_s = os.path.join(out, "dt.cc_P"), os.path.join(out, "dt.cc_S")
     os.makedirs(out_p, exist_ok=True)

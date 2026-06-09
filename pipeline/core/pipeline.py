@@ -62,6 +62,22 @@ def run_cluster(cfg, stage_from="stations", through="dtct",
         finally:
             timings[stage] = time.perf_counter() - t0
 
+    # Up-front xcorr backend notice — printed BEFORE the long picking stage so the user sees
+    # immediately whether the GPU path is active or will fall back to CPU (and why), instead of
+    # discovering it deep into the run at the xcorr stage.
+    if "xcorr" in todo:
+        _xb = getattr(cfg, "xcorr_backend", "obspy")
+        try:
+            eff, msg = xcorr.probe_xcorr_backend(_xb)
+            if eff.startswith("cctorch_gpu"):
+                log(f"GPU xcorr: ACTIVE — {msg}")
+            elif _xb.startswith("cctorch_gpu"):
+                log(f"GPU xcorr: UNAVAILABLE in this env → CPU fallback ({msg})")
+            else:
+                log(f"xcorr backend: {msg}")
+        except Exception as e:  # noqa: BLE001 — a probe failure must never block the run
+            log(f"xcorr backend: could not probe ({type(e).__name__})")
+
     if "stations" in todo:
         with _time("stations"):
             used = stations.run_stations(cfg)
