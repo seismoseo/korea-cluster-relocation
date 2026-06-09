@@ -23,8 +23,10 @@ from pipeline.core import (stations, waveforms, picking, hypoinverse, hypodd,
 
 # `focal_mechanism` is an OPT-IN tail stage (needs a phasenet_plus picking run for polarity);
 # it is appended last so the default through="dtct"/"dtcc" relocation chains never trigger it.
+# `report` is the final OPT-IN tail stage: it compiles the standard beamer PDF run summary
+# (pipeline.reporting) from whatever products already exist on disk — never fails the run.
 STAGES = ["stations", "waveforms", "picking", "hypoinverse", "ph2dt", "dtct",
-          "rereference", "xcorr", "dtcc", "focal_mechanism"]
+          "rereference", "xcorr", "dtcc", "focal_mechanism", "report"]
 
 
 def _count_located_events(cfg, velmodel: str) -> int:
@@ -147,6 +149,23 @@ def run_cluster(cfg, stage_from="stations", through="dtct",
         log(f"focal_mechanism: {len(res['focal_mechanism'])} mechanisms, "
             f"{nhi} high-confidence [{'/'.join(cfg.fm_quality_keep)}]  "
             f"({timings['focal_mechanism']:.1f}s)")
+    if "report" in todo:
+        # Compile the standard beamer PDF run summary from on-disk products. This is a
+        # convenience product, NOT the scientific output, so a failure here (missing
+        # tectonic, a bad figure) must never fail the run — log a warning and move on.
+        pdf = None
+        with _time("report"):
+            try:
+                from pipeline import reporting
+                pdf = reporting.make_run_summary(
+                    cfg.name, velmodel=arc_velmodel,
+                    fm_velmodel=fm_velmodel or getattr(cfg, "fm_velmodel", arc_velmodel))
+                res["report"] = pdf
+            except Exception as e:  # noqa: BLE001
+                res["report"] = f"skipped ({type(e).__name__})"
+                log(f"report: SKIPPED — {type(e).__name__}: {e}")
+        if pdf:
+            log(f"report: {pdf.split('/pipeline/')[-1]}  ({timings['report']:.1f}s)")
 
     # End-of-run timing summary (only if there's any timing — i.e. at least one stage ran)
     if verbose and timings:
