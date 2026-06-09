@@ -35,7 +35,8 @@ def main():
                     help="override cfg.picker_weights (e.g. phasenet_plus for polarity/amplitude)")
     ap.add_argument("--xcorr-backend", default=None,
                     choices=["obspy", "cctorch_cpu", "cctorch_gpu", "cctorch_gpu_batched"],
-                    help="dt.cc xcorr kernel (default cfg.xcorr_backend = obspy CPU baseline)")
+                    help="dt.cc xcorr kernel; overrides cfg.xcorr_backend (default "
+                         "cctorch_gpu_batched, auto-falls back to obspy without a usable GPU)")
     ap.add_argument("--fm-velmodel", default=None,
                     help="velocity model whose .sum the focal_mechanism stage uses (default cfg.fm_velmodel)")
     args = ap.parse_args()

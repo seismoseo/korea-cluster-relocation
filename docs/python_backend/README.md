@@ -161,6 +161,12 @@ if you modify it. Full rationale lives in the code comments of
   ~15 h vs ~1–2 weeks for a 15k-event catalog. Install a CUDA wheel matching your card from
   <https://pytorch.org/get-started/locally/> (e.g. `cu128` for Blackwell sm_120). EikoNet
   *training* leaks the autograd graph per epoch on **CPU only** — cap samples or use `--device auto`.
+- **dt.cc xcorr on GPU**: the `xcorr` stage mirrors this auto-fallback — it defaults to
+  `cfg.xcorr_backend="cctorch_gpu_batched"`, a GPU (PyTorch FFT) cross-correlation that batches
+  across event-pairs. It is **bit-exact** to the obspy CPU baseline (Δshift = 0, ΔCC = 0),
+  memory-safe (VRAM-aware batch sizing + OOM-retry), and **~3× faster** at scale; a GPU smoke-test
+  **falls back to obspy** when no usable CUDA device is present. GPU path uses the same `pq-gpu`
+  CUDA wheel as HypoSVI; override per run with `--xcorr-backend`.
 
 ## Bundled models
 

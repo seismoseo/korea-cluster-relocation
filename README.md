@@ -79,6 +79,13 @@ Stages: `stations waveforms picking hypoinverse ph2dt dtct rereference xcorr dtc
 `focal_mechanism`). The default `--through dtct` runs the catalog chain; the dt.cc branch is appended
 only when requested.
 
+**dt.cc xcorr backend.** `xcorr` defaults to `cfg.xcorr_backend = "cctorch_gpu_batched"`, a GPU
+(PyTorch FFT) executor that batches across event-pairs — **bit-exact** to the obspy CPU baseline,
+memory-safe (VRAM-aware batch sizing + OOM-retry), and **~3× faster** at scale. It **auto-falls-back
+to obspy** when no usable CUDA GPU is present, so CPU-only runs are unaffected. Override with
+`--xcorr-backend {obspy,cctorch_cpu,cctorch_gpu,cctorch_gpu_batched}`; the GPU path needs the
+`pq-gpu` env (PyTorch cu128).
+
 **Picker / focal mechanisms.** `--picker` (or `cfg.picker_weights`) selects `stead` (default, SeisBench
 PhaseNet) or `phasenet_plus` (EQNet PhaseNet+), the latter additionally emitting first-motion polarity +
 amplitude. The opt-in `focal_mechanism` stage feeds those into **SKHASH** (double-couple inversion; keeps
