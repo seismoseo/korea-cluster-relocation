@@ -280,6 +280,37 @@ def make_run_summary(cluster, velmodel="kim1983", fm_velmodel=None,
     if m:
         slides.append(("Cumulative seismicity", m, "Cumulative located-event count over time."))
 
+    # waveform similarity for the largest dt.cc sub-cluster: full-waveform (P+S+coda) gather + Z CC
+    # matrix (chronological + hierarchical) at the nearest station common to the events, 5-20 Hz.
+    try:
+        from pipeline.analysis import similarity as _simil
+        _groups = _simil.cluster_events_by_cid(cfg, min_events=4)
+        _single = len(_groups) == 1
+        for _cid in list(_groups)[:1]:                     # largest sub-cluster only (bounded deck)
+            _sfx = "" if _single else f" --- sub-cluster {_cid}"
+            g = _savefig(viz.plot_cluster_similarity_gather,
+                         os.path.join(figdir, f"05_simgather_cid{_cid}.png"),
+                         cfg=cfg, cid=_cid, show_cid=not _single)
+            if g:
+                slides.append((f"Waveform similarity{_sfx}", g,
+                               "Full-waveform (P+S+coda) gather at the nearest common station, P-aligned "
+                               "(red), S pick (blue), past (top) to present (bottom), 5-20 Hz; no stack."))
+            cc = _savefig(viz.plot_cluster_cc_matrix,
+                          os.path.join(figdir, f"05_ccmat_chrono_cid{_cid}.png"),
+                          cfg=cfg, cid=_cid, order="chrono", show_cid=not _single)
+            if cc:
+                slides.append((f"Waveform CC matrix --- chronological{_sfx}", cc,
+                               "Z full-waveform NCC matrix in time order; a bright block is a repeating family."))
+            ch = _savefig(viz.plot_cluster_cc_matrix,
+                          os.path.join(figdir, f"05_ccmat_cluster_cid{_cid}.png"),
+                          cfg=cfg, cid=_cid, order="cluster", show_cid=not _single)
+            if ch:
+                slides.append((f"Waveform CC matrix --- hierarchical{_sfx}", ch,
+                               "Same matrix reordered by hierarchical clustering (dendrogram); repeating "
+                               "sub-families gather into bright blocks."))
+    except Exception as e:  # noqa: BLE001
+        print(f"  [skip figure] waveform similarity: {type(e).__name__}: {e}")
+
     anim = None
     if animate:
         try:

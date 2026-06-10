@@ -758,6 +758,125 @@ def cc_histogram(cfg, threshold=0.7):
     return fig
 
 
+def _cid_tag(cid, show_cid):
+    """' cid N' when the run splits into >1 sub-cluster, else '' (single cid -> don't index it)."""
+    return f" cid {cid}" if (show_cid and cid is not None) else ""
+
+
+def plot_cluster_similarity_gather(cfg, cid=None, event_ids=None, station=None, comp="Z",
+                                   bandpass=(5, 20), pre=1.0, post=None, max_events=80, show_cid=True):
+    """Per dt.cc sub-cluster waveform gather for visual similarity assessment.
+
+    At the station nearest to (and common to) the cid's events, plot each event's **full** P-aligned
+    waveform (P + S + coda) as an offset wiggle — **no stack** — ordered **top = earliest -> bottom =
+    latest**, so a near-repeating family reads as near-identical rows. P is the red dashed line at t=0;
+    the **S pick** (if available) is a short **blue bar** per event. Bandpass `5-20 Hz` (the dt.cc band).
+    `post=None` auto-sizes the window from the hypocentral distance to the chosen station. Pass `cid`
+    (uses `cluster_events_by_cid`) or explicit `event_ids`; `show_cid=False` drops the 'cid N' label
+    when the run has a single sub-cluster. Returns the fig."""
+    from pipeline.analysis import similarity as simil
+    from obspy.geodetics.base import gps2dist_azimuth
+    if event_ids is None:
+        event_ids = simil.cluster_events_by_cid(cfg).get(int(cid), []) if cid is not None else []
+    tag = _cid_tag(cid, show_cid)
+    if not event_ids:
+        fig, ax = plt.subplots(figsize=(8, 3), dpi=130)
+        ax.set_title(f"{cfg.region}{tag}: no events"); return fig
+    station = station or simil.nearest_common_station(cfg, event_ids, comp=comp)
+    if post is None:
+        post = simil._auto_post(cfg, event_ids, station)
+    kept, wins, sps = simil._cluster_windows(cfg, event_ids, station, comp, bandpass, pre, post)
+    fig, ax = plt.subplots(figsize=(9, max(3.0, 0.24 * min(len(kept), max_events) + 1.0)), dpi=130)
+    if not kept:
+        ax.set_title(f"{cfg.region}{tag}: no {comp} windows at {station}"); return fig
+    kept, wins, sps = kept[:max_events], wins[:max_events], sps[:max_events]
+    cat = {e["event_id"]: e for e in waveforms.load_catalog(cfg)}
+    for k, (w, sp) in enumerate(zip(wins, sps)):
+        d = w.data.astype(float); d = d / (np.max(np.abs(d)) or 1.0)
+        t = w.times() - pre                                         # P at t=0
+        ax.plot(t, d * 0.45 + k, color="0.2", lw=0.4)
+        if sp is not None and 0 < sp < post:                        # S pick (short blue bar)
+            ax.plot([sp, sp], [k - 0.42, k + 0.42], color="b", lw=1.1, zorder=4)
+    ax.axvline(0, color="r", ls="--", lw=0.9, zorder=3)             # P arrival (aligned at t=0)
+    ax.plot([], [], color="r", ls="--", label="P"); ax.plot([], [], color="b", lw=1.1, label="S")
+    ax.legend(loc="upper right", fontsize=6, framealpha=0.85)
+    ax.set_yticks(range(len(kept)))
+    ax.set_yticklabels([cat[e]["origin"].strftime("%Y-%m-%d %H:%M") if e in cat else e for e in kept],
+                       fontsize=5)
+    ax.invert_yaxis()                                               # earliest at top
+    ax.margins(x=0, y=0.01); ax.set_xlabel("Time from P (s)")
+    try:
+        used = pd.read_csv(config.used_stations_csv(cfg)); co = {r.Code: (r.Latitude, r.Longitude) for r in used.itertuples()}
+        clat = np.mean([cat[e]["lat"] for e in kept if e in cat]); clon = np.mean([cat[e]["lon"] for e in kept if e in cat])
+        dkm = gps2dist_azimuth(clat, clon, *co[station])[0] / 1000.0
+    except Exception:                                              # noqa: BLE001
+        dkm = float("nan")
+    ax.set_title(f"{cfg.region}{tag} — {station} ({comp}), {len(kept)} events, "
+                 f"{bandpass[0]}-{bandpass[1]} Hz, ~{dkm:.0f} km\nP-aligned (t=0), full waveform "
+                 f"(P+S+coda, 0-{post:.0f} s), past (top) -> present (bottom); no stack", fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
+def plot_cluster_cc_matrix(cfg, cid=None, event_ids=None, station=None, comp="Z", bandpass=(5, 20),
+                           pre=1.0, post=None, order="chrono", show_cid=True):
+    """Per dt.cc sub-cluster waveform NCC matrix (full P+S+coda window, `comp`, 5-20 Hz).
+
+    `order="chrono"` (default) keeps the events in time order (shared with the gather); `order="cluster"`
+    reorders them by **hierarchical clustering** (average linkage on 1-NCC) and draws the dendrogram on
+    top — so repeating sub-families gather into bright blocks regardless of when they occurred. Returns
+    the fig."""
+    from pipeline.analysis import similarity as simil
+    if event_ids is None:
+        event_ids = simil.cluster_events_by_cid(cfg).get(int(cid), []) if cid is not None else []
+    tag = _cid_tag(cid, show_cid)
+    if not event_ids:
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=130); ax.set_title(f"{cfg.region}{tag}: no events"); return fig
+    station = station or simil.nearest_common_station(cfg, event_ids, comp=comp)
+    kept, M = simil.cluster_cc_matrix(cfg, event_ids, station, comp=comp, bandpass=bandpass,
+                                      pre=pre, post=post)
+    if len(kept) < 2:
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=130)
+        ax.set_title(f"{cfg.region}{tag}: <2 {comp} windows at {station}"); return fig
+    cat = {e["event_id"]: e for e in waveforms.load_catalog(cfg)}
+    labs = [cat[e]["origin"].strftime("%Y-%m-%d") if e in cat else e for e in kept]
+    dgram = None
+    if order == "cluster":
+        from scipy.cluster.hierarchy import linkage, dendrogram, leaves_list
+        from scipy.spatial.distance import squareform
+        D = np.clip(1.0 - M, 0, 2); np.fill_diagonal(D, 0.0)
+        Z = linkage(squareform(D, checks=False), method="average")
+        idx = leaves_list(Z)
+        M = M[np.ix_(idx, idx)]; labs = [labs[i] for i in idx]; dgram = Z
+        ordlab = "hierarchical clustering order"
+    else:
+        ordlab = "chronological"
+    title = (f"{cfg.region}{tag} — {station} ({comp}) waveform CC matrix\n"
+             f"{len(kept)} events, {bandpass[0]}-{bandpass[1]} Hz, full waveform ({ordlab})")
+    if dgram is not None:
+        fig = plt.figure(figsize=(6.2, 6.2), dpi=130)
+        axd = fig.add_axes([0.16, 0.71, 0.66, 0.13])
+        dendrogram(dgram, ax=axd, color_threshold=0, above_threshold_color="0.4",
+                   no_labels=True, link_color_func=lambda _k: "0.4")
+        axd.set_xticks([]); axd.set_yticks([])
+        for s in axd.spines.values():
+            s.set_visible(False)
+        ax = fig.add_axes([0.16, 0.10, 0.66, 0.58])
+        cax = fig.add_axes([0.845, 0.10, 0.025, 0.58])
+        fig.suptitle(title, y=0.965, fontsize=9)
+    else:
+        fig, ax = plt.subplots(figsize=(6.0, 5.2), dpi=130); cax = None
+    im = ax.imshow(M, vmin=0, vmax=1, cmap="viridis", origin="upper")
+    fig.colorbar(im, cax=cax, ax=(None if cax is not None else ax),
+                 label="waveform NCC", shrink=0.82)
+    step = max(1, len(kept) // 20); ticks = range(0, len(kept), step)
+    ax.set_xticks(list(ticks)); ax.set_xticklabels([labs[i] for i in ticks], rotation=90, fontsize=5)
+    ax.set_yticks(list(ticks)); ax.set_yticklabels([labs[i] for i in ticks], fontsize=5)
+    if dgram is None:
+        ax.set_title(title, fontsize=9)
+    return fig
+
+
 def _load_mechanisms(path):
     """Read mechanisms.csv and keep ONE row per event — SKHASH's **preferred** solution. A
     multi-solution event has several rows of the same quality; SKHASH plots (and we should report)
