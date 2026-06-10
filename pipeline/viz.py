@@ -808,6 +808,11 @@ def map_mechanisms(cfg, velmodel=None, quality_keep=("A", "B"), ax=None):
         return ax.figure
     from obspy.imaging.beachball import beach
     m = _load_mechanisms(path)
+    if m is None or len(m) == 0:                      # mechanisms.csv present but empty (0 mechanisms)
+        ax.set_title(f"{cfg.region} — no focal mechanisms\n"
+                     f"(focal_mechanism produced 0 — too few polarities)", fontsize=10)
+        ax.set_axis_off()
+        return ax.figure
 
     norm = mpl.colors.Normalize(vmin=float(m.origin_depth_km.min()),
                                 vmax=float(m.origin_depth_km.max()))
