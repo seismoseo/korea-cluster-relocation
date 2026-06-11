@@ -1502,11 +1502,11 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
         ax.add_collection(beach((ref["strike"], ref["dip"], ref["rake"]),
                                 xy=(-0.78 * pad, 0.78 * pad), width=0.34 * pad,
                                 facecolor="0.45", edgecolor="k", linewidth=0.8, zorder=5))
-    for sgn, lab in ((1, "A'"), (-1, "A")):                      # along-strike ends
-        ax.text(sgn * 0.97 * pad * su, sgn * 0.97 * pad * du, lab, fontsize=18, fontweight="bold",
+    for sgn, lab in ((1, "A'"), (-1, "A")):                      # along-strike ends (inset from the frame)
+        ax.text(sgn * 0.86 * pad * su, sgn * 0.86 * pad * du, lab, fontsize=18, fontweight="bold",
                 ha="center", va="center", zorder=6)
-    for sgn, lab in ((1, "B"), (-1, "B'")):                      # across-strike ends
-        ax.text(sgn * 0.97 * pad * du, -sgn * 0.97 * pad * su, lab, fontsize=18, fontweight="bold",
+    for sgn, lab in ((1, "B"), (-1, "B'")):                      # across-strike ends (inset from the frame)
+        ax.text(sgn * 0.86 * pad * du, -sgn * 0.86 * pad * su, lab, fontsize=18, fontweight="bold",
                 ha="center", va="center", zorder=6)
     ax.set(xlim=(-pad, pad), ylim=(-pad, pad), xlabel="E (km)", ylabel="N (km)",
            title="Fault-plane map view"); _style(ax)
@@ -1740,11 +1740,11 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
         ax.add_collection(beach((ref["strike"], ref["dip"], ref["rake"]),
                                 xy=(-0.78 * pad, 0.78 * pad), width=0.34 * pad,
                                 facecolor="0.45", edgecolor="k", linewidth=0.8, zorder=5))
-    for sgn, lab in ((1, "A'"), (-1, "A")):
-        ax.text(sgn * 0.97 * pad * su, sgn * 0.97 * pad * du, lab, fontsize=18, fontweight="bold",
+    for sgn, lab in ((1, "A'"), (-1, "A")):                      # along-strike ends (inset from the frame)
+        ax.text(sgn * 0.86 * pad * su, sgn * 0.86 * pad * du, lab, fontsize=18, fontweight="bold",
                 ha="center", va="center", zorder=6)
-    for sgn, lab in ((1, "B"), (-1, "B'")):
-        ax.text(sgn * 0.97 * pad * du, -sgn * 0.97 * pad * su, lab, fontsize=18, fontweight="bold",
+    for sgn, lab in ((1, "B"), (-1, "B'")):                      # across-strike ends (inset from the frame)
+        ax.text(sgn * 0.86 * pad * du, -sgn * 0.86 * pad * su, lab, fontsize=18, fontweight="bold",
                 ha="center", va="center", zorder=6)
     ax.set(xlim=(-pad, pad), ylim=(-pad, pad), xlabel="E (km)", ylabel="N (km)",
            title="Fault-plane map view"); _style(ax)
