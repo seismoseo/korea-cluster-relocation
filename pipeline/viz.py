@@ -126,6 +126,24 @@ def _mag_size(mags, smin=20.0, smax=1200.0):
     return np.clip(5.0 * np.exp(2.0 * m), smin, smax)
 
 
+def _mag_legend(ax, mags, *, smin=20.0, smax=1200.0, loc="lower left", title="Local magnitude"):
+    """Marker-size key for the map view: hollow grey circles at a few round magnitudes spanning the
+    data, sized with the SAME `_mag_size(smin, smax)` as the panel's markers so the legend is honest."""
+    from matplotlib.lines import Line2D
+    m = np.asarray(mags, dtype=float); m = m[np.isfinite(m)]
+    if not len(m):
+        return
+    lvl = sorted({int(round(x)) for x in np.linspace(np.floor(m.min()), np.ceil(m.max()), 3)})
+    handles = [Line2D([], [], marker="o", linestyle="none",
+                      markersize=float(np.sqrt(_mag_size(np.array([float(v)]), smin=smin, smax=smax)[0])),
+                      markerfacecolor="none", markeredgecolor="0.35", markeredgewidth=1.2, label=f"M {v}")
+               for v in lvl]
+    leg = ax.legend(handles=handles, loc=loc, title=title, fontsize=7, title_fontsize=7,
+                    labelspacing=1.4, handletextpad=1.0, borderpad=0.7, framealpha=0.85)
+    ax.add_artist(leg)
+    return leg
+
+
 def _mag_for(cfg, ids):
     """Magnitude array aligned to `ids` (cuspids) from `_event_magnitudes` (NaN where unmatched)."""
     mg = _event_magnitudes(cfg)
@@ -1510,6 +1528,7 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
                 ha="center", va="center", zorder=6)
     ax.set(xlim=(-pad, pad), ylim=(-pad, pad), xlabel="E (km)", ylabel="N (km)",
            title="Fault-plane map view"); _style(ax)
+    _mag_legend(ax, mag, smin=25, smax=1500, loc="lower left")
 
     # panel 2 — along-strike depth section (A–A')
     ax = axes[1]
@@ -1748,6 +1767,7 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
                 ha="center", va="center", zorder=6)
     ax.set(xlim=(-pad, pad), ylim=(-pad, pad), xlabel="E (km)", ylabel="N (km)",
            title="Fault-plane map view"); _style(ax)
+    _mag_legend(ax, mag, smin=25, smax=1500, loc="lower left")
 
     # Panel 2 — along-strike depth section
     ax = axes[1]
@@ -1807,18 +1827,20 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
     times_dt = times                                          # list of datetime
     mag_for_tm = np.where(np.isfinite(mag), mag, np.nanmin(mag) if np.isfinite(mag).any() else 0.0)
     ax_tm.scatter(times_dt, mag_for_tm, s=18, facecolor="0.82", edgecolor="0.62",
-                   linewidth=0.4, zorder=2)
-    sc_tm = ax_tm.scatter([], [], s=[], facecolors="none", edgecolors=[], linewidth=1.4, zorder=4)
+                   linewidth=0.4, zorder=2, clip_on=False)
+    sc_tm = ax_tm.scatter([], [], s=[], facecolors="none", edgecolors=[], linewidth=1.4, zorder=4,
+                          clip_on=False)
     cursor = ax_tm.axvline(times_dt[0], color="0.25", lw=1.0, ls=":", zorder=3)
     # Y-range padding so M~0 events are visible and M~5+ doesn't clip
     _mlo = float(np.nanmin(mag_for_tm) - 0.3)
     _mhi = float(np.nanmax(mag_for_tm) + 0.3)
     if not (_mhi > _mlo):
         _mhi = _mlo + 1.0
-    ax_tm.set_xlim(times_dt[0], times_dt[-1])
+    _tpad = (times_dt[-1] - times_dt[0]) * 0.03            # x-margin so the first/last circles aren't clipped
+    ax_tm.set_xlim(times_dt[0] - _tpad, times_dt[-1] + _tpad)
     ax_tm.set_ylim(_mlo, _mhi)
     ax_tm.set_facecolor("#FAFAFA"); ax_tm.grid(True, linestyle=":", alpha=0.7)
-    ax_tm.set_ylabel("KMA magnitude", fontsize=11)
+    ax_tm.set_ylabel("Local magnitude", fontsize=11)
     ax_tm.set_title("Time vs magnitude  (gray = all events, coloured = cumulative through current frame)",
                     fontsize=10, loc="left")
     # Format the date axis: just enough ticks for readability
