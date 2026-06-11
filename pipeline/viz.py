@@ -1335,7 +1335,8 @@ def _center_row(cfg, d, ref, prefer):
 
 def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
                    frame_from="auto", mech_select="highest_quality",
-                   center_on="mainshock", show_bootstrap=False):
+                   center_on="mainshock", show_bootstrap=False,
+                   source_radius=None, source_label=None):
     """Relocated seismicity in fault coordinates — a 2×2 figure styled after the original dt.cc
     notebooks: (1) fault-plane map view, (2) along-strike depth section, (3) across-strike depth
     section (with the dashed fault-dip line), (4) fault-plane (along-dip) view.
@@ -1374,6 +1375,12 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
 
     Markers coloured by origin time, sized by magnitude. Reads the headline dt.cc relocation
     (dt.ct fallback).
+
+    `source_radius`: optional callable mapping the per-event magnitude array → source radius in
+    **metres**. When given, every event is drawn as a hollow circle of that radius **to scale** in
+    the (equal-aspect) fault frame instead of a magnitude-scaled marker — so rupture size is directly
+    comparable to inter-event spacing. `source_label` is appended to the title (e.g. the stress-drop /
+    Mw assumption). Same style as the default view; the magnitude size-legend is suppressed.
     """
     import matplotlib.dates as mdates
     import matplotlib.colors as mcolors
@@ -1496,6 +1503,23 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
         cmap = plt.get_cmap("viridis_r"); cbar_label = "Depth (km)"
     rgba = cmap(norm(cv))
 
+    # markers — hollow circles, either magnitude-scaled (default) or drawn at the physical SOURCE
+    # RADIUS to scale when `source_radius` is given (a callable mapping the magnitude array -> radius
+    # in metres). The fault-frame panels are equal-aspect (`_style`), so the circles are true to scale.
+    _circ_km = (np.asarray(source_radius(np.asarray(mag, float)), float) / 1000.0
+                if source_radius is not None else None)
+
+    def _markers(ax, X, Y):
+        if _circ_km is None:
+            ax.scatter(X, Y, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
+        else:
+            from matplotlib.collections import PatchCollection
+            from matplotlib.patches import Circle
+            X, Y = np.asarray(X, float), np.asarray(Y, float)
+            ax.add_collection(PatchCollection(
+                [Circle((X[i], Y[i]), _circ_km[i]) for i in range(len(X))],
+                facecolors="none", edgecolors=rgba, linewidths=1.4, zorder=4))
+
     def _style(ax):
         ax.set_aspect("equal", "box"); ax.grid(True, linestyle=":", alpha=0.7)
         ax.set_facecolor("#FAFAFA"); ax.tick_params(labelsize=11)
@@ -1512,8 +1536,7 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     if boot is not None:
         ax.errorbar(rx / 1000.0, ry / 1000.0, xerr=sig_e, yerr=sig_n, fmt="none", ecolor="0.55",
                     elinewidth=0.6, capsize=1.5, zorder=3)
-    ax.scatter(rx / 1000.0, ry / 1000.0, s=sz, facecolors="none", edgecolors=rgba,
-               linewidth=1.8, zorder=4)
+    _markers(ax, rx / 1000.0, ry / 1000.0)
     ax.plot([-pad * su, pad * su], [-pad * du, pad * du], color="0.35", lw=1.1, ls="-", zorder=2)
     ax.plot([pad * du, -pad * du], [-pad * su, pad * su], color="0.35", lw=1.1, ls="--", zorder=2)
     if ref and not np.isnan(ref["rake"]):
@@ -1528,14 +1551,15 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
                 ha="center", va="center", zorder=6)
     ax.set(xlim=(-pad, pad), ylim=(-pad, pad), xlabel="E (km)", ylabel="N (km)",
            title="Fault-plane map view"); _style(ax)
-    _mag_legend(ax, mag, smin=25, smax=1500, loc="lower left")
+    if _circ_km is None:
+        _mag_legend(ax, mag, smin=25, smax=1500, loc="lower left")
 
     # panel 2 — along-strike depth section (A–A')
     ax = axes[1]
     if boot is not None:
         ax.errorbar(along, dep, xerr=sig_al, yerr=sig_dp, fmt="none", ecolor="0.55",
                     elinewidth=0.6, capsize=1.5, zorder=3)
-    ax.scatter(along, dep, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
+    _markers(ax, along, dep)
     ax.text(-0.92 * R, -0.88 * R, "A", fontsize=16, fontweight="bold")
     ax.text(0.86 * R, -0.88 * R, "A'", fontsize=16, fontweight="bold")
     ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Along-strike distance (km)",
@@ -1551,7 +1575,7 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     if boot is not None:
         ax.errorbar(across, dep, xerr=sig_ac, yerr=sig_dp, fmt="none", ecolor="0.55",
                     elinewidth=0.6, capsize=1.5, zorder=3)
-    ax.scatter(across, dep, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
+    _markers(ax, across, dep)
     # In the (across, depth) section the chosen plane's normal projects to
     #   (n_across, n_down) = (-sin(dip), -cos(dip))
     # (derivation: a plane with strike S and dip δ has normal (cos S sin δ, -sin S sin δ, -cos δ)
@@ -1590,7 +1614,7 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     if boot is not None:
         ax.errorbar(along, along_dip, xerr=sig_al, yerr=sig_ad, fmt="none", ecolor="0.55",
                     elinewidth=0.6, capsize=1.5, zorder=3)
-    ax.scatter(along, along_dip, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
+    _markers(ax, along, along_dip)
     ax.text(-0.92 * R, -0.88 * R, "A", fontsize=16, fontweight="bold")
     ax.text(0.86 * R, -0.88 * R, "A'", fontsize=16, fontweight="bold")
     ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Along-strike distance (km)",
@@ -1619,9 +1643,11 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
                 + (f" (M{center_mag:.1f})" if np.isfinite(center_mag) else ""))
     else:
         ctxt = "  •  centred on cloud centroid"
+    srtxt = ("  •  circles = source radius to scale" + (f" ({source_label})" if source_label else "")
+             if _circ_km is not None else "")
     fig.suptitle(f"{cfg.region} — relocated seismicity in fault coordinates ({branch}){btxt}\n"
                  f"section: strike {used_strike:.0f}°, dip {used_dip:.0f}° [{used_source}]"
-                 f"{fmtxt}{ctxt}",
+                 f"{fmtxt}{ctxt}{srtxt}",
                  fontsize=13)
     return fig
 
