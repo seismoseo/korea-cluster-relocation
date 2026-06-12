@@ -174,7 +174,10 @@ def write_phs(cfg):
                             f"{str(ot.second).zfill(2)}{str(ot.microsecond).zfill(6)[:2]}"
                             f"{'ES'.ljust(3)}{sw}\n")
                     seen_s.add(sta)
-            f.write(" " * 66 + "200" + str(idx).zfill(3) + "\n")
+            # Cuspid = cuspid_offset + sorted-dir index. Byte-identical to the old
+            # '200'+zfill(3) form for idx <= 999, but doesn't cap there — dense
+            # sequences (e.g. Buan 2024) exceed 999 events per cluster.
+            f.write(" " * 66 + str(cfg.cuspid_offset + idx) + "\n")
     if scheme == "probability":
         print(f"[write_phs] {cfg.name}: probability-weighted "
               f"P {n_prob_p} prob + {n_dist_fallback_p} dist-fallback, "
