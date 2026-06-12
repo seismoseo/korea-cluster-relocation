@@ -91,10 +91,35 @@ def _pnplus_infer(net, meta, min_prob):
     return dict(picks=picks, events=events)
 
 
+# Anti-alias guard: EQNet's read_mseed down-samples to 100 Hz with plain LINEAR interpolation and
+# NO anti-alias lowpass (`trace.interpolate(sr, method="linear")`), so for a station recorded above
+# the target rate the >Nyquist energy folds back onto the P/S onsets (aliasing) — worst for close,
+# high-corner sources on high-rate nodal/geophone stations. We down-sample correctly HERE, before
+# the trace ever reaches EQNet, so that branch never runs. The lowpass corner is left a guard band
+# below the new Nyquist; zero-phase filtering keeps onset times put (a causal lowpass would delay
+# every onset and bias picks late). No-op at or below the target rate (incl. upsampling, where linear
+# interpolation is already alias-free).
+ANTIALIAS_CORNER_FRAC = 0.9                              # corner = 0.9 * (target/2), e.g. 45 Hz for 100 Hz
+
+
+def _antialias_resample(tr, target_sr):
+    """Down-sample `tr` to `target_sr` in place with a proper anti-alias lowpass first. Returns `tr`
+    unchanged when its rate is already <= target_sr (so 100 Hz archive data is untouched)."""
+    if tr.stats.sampling_rate <= target_sr * 1.001:
+        return tr
+    tr.detrend("demean")
+    tr.taper(max_percentage=0.05, max_length=1.0, type="cosine")     # cap edge taper at 1 s
+    tr.filter("lowpass", freq=ANTIALIAS_CORNER_FRAC * 0.5 * target_sr, corners=4, zerophase=True)
+    tr.resample(target_sr, no_filter=True)                           # lowpass already applied above
+    return tr
+
+
 # --------------------------------------------------------------- event driver
-def _sac_to_mseed(sac_path, out_dir):
+def _sac_to_mseed(sac_path, out_dir, target_sr=100.0):
     """Read one gathered SAC and write a MiniSEED copy with NET.STA.LOC.CHAN taken from the
-    filename `<eid>.<net>.<sta>.<chan>.sac` (robust regardless of SAC header completeness)."""
+    filename `<eid>.<net>.<sta>.<chan>.sac` (robust regardless of SAC header completeness).
+    Down-samples above-target-rate traces with an anti-alias lowpass (see `_antialias_resample`)
+    so EQNet receives `target_sr` data and never hits its no-lowpass linear-interpolation path."""
     from obspy import read
     base = os.path.basename(sac_path)
     parts = base.split(".")
@@ -102,6 +127,7 @@ def _sac_to_mseed(sac_path, out_dir):
     net, sta, chan = parts[1], parts[2], parts[3]
     tr = read(sac_path)[0]
     tr.stats.network, tr.stats.station, tr.stats.location, tr.stats.channel = net, sta, "", chan
+    _antialias_resample(tr, target_sr)
     out = os.path.join(out_dir, f"{net}.{sta}.{chan}.mseed")
     tr.write(out, format="MSEED")
     return out
@@ -128,7 +154,7 @@ def pick_event_pnplus(net, comp_files, min_prob=None, highpass=None, sampling_ra
 
     rows = []
     with tempfile.TemporaryDirectory() as td:
-        mseeds = [_sac_to_mseed(f, td) for f in comp_files]
+        mseeds = [_sac_to_mseed(f, td, target_sr=sampling_rate) for f in comp_files]
         list_path = os.path.join(td, "data_list.txt")
         with open(list_path, "w") as fh:
             fh.write(",".join(mseeds))            # all stations of this event on one line
