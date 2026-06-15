@@ -1029,18 +1029,22 @@ def _polinfo_for_event(cfg, velmodel, event_id):
 def _lower_hemisphere_xy(azimuth_deg, takeoff_deg, r_unit=1.0):
     """Equal-area lower-hemisphere projection of a take-off vector.
 
-    SKHASH convention: takeoff is measured from the **downward** vertical (0 = straight
-    down, 180 = straight up). Lower-hemisphere projection plots only the downgoing
-    rays directly; upgoing rays are mapped antipodally to the opposite side of the
-    sphere with the same polarity sense. Returns (x, y) on a unit-radius circle:
-    north = +y, east = +x.
+    SKHASH writes takeoff angles in **HASH notation** (`flip_takeoff=False`, the default):
+    **0 = upgoing, 90 = horizontal, 180 = downgoing**. The lower hemisphere plots the
+    **downgoing** rays (takeoff > 90) directly; **upgoing** rays (takeoff < 90) are mapped
+    antipodally (azimuth + 180) to the opposite side of the sphere, carrying the same
+    first-motion polarity. Returns (x, y) on a unit-radius circle: north = +y, east = +x.
+
+    NOTE: an earlier version assumed the opposite sense (0 = down), which point-reflected
+    every polarity / S-P marker through the centre — visible as first motions landing in
+    the wrong quadrants for steep (near-source) rays. Fixed to the actual HASH convention.
     """
     az = np.deg2rad(np.asarray(azimuth_deg))
     th = np.deg2rad(np.asarray(takeoff_deg))
-    # antipodal flip for upgoing rays (takeoff > 90 deg)
-    up = th > np.pi / 2
-    th_eff = np.where(up, np.pi - th, th)
-    az_eff = np.where(up, az + np.pi, az)
+    # HASH: downgoing = takeoff > 90 (plotted directly); upgoing < 90 (antipodal flip)
+    down = th > np.pi / 2
+    th_eff = np.where(down, np.pi - th, th)
+    az_eff = np.where(down, az, az + np.pi)
     r = r_unit * np.sqrt(2.0) * np.sin(th_eff / 2.0)
     return r * np.sin(az_eff), r * np.cos(az_eff)
 
@@ -1154,7 +1158,7 @@ def plot_custom_beachball(cfg, event_id, velmodel=None, ax=None,
             # along the station's effective azimuth (antipodal-flipped for upgoing rays).
             labelled = pol[np.abs(pol.p_polarity) >= label_min_weight]
             for _, p in labelled.iterrows():
-                az_eff = np.deg2rad(float(p.azimuth)) + (np.pi if float(p.takeoff) > 90 else 0.0)
+                az_eff = np.deg2rad(float(p.azimuth)) + (0.0 if float(p.takeoff) > 90 else np.pi)
                 lx, ly = 1.09 * np.sin(az_eff), 1.09 * np.cos(az_eff)
                 rot = -np.degrees(az_eff)                          # tangent to the circle
                 if rot < -90: rot += 180
