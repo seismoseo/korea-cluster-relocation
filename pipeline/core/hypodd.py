@@ -186,7 +186,7 @@ def _exec_hypodd_once(d, timeout=None):
     valid run is never killed mid-iteration."""
     os.makedirs(os.path.join(d, "reloc"), exist_ok=True)
     proc = subprocess.run(["hypoDD", "hypoDD.inp"], cwd=d,
-                          capture_output=True, text=True, timeout=timeout)
+                          capture_output=True, text=True, errors="replace", timeout=timeout)
     # Capture BOTH stdout and stderr into hypoDD.sum — hypoDD's STOP/ERROR messages
     # (including 'STOP >>> Increase MAXDATA0') go to stderr, while the normal progress
     # output goes to stdout. Without stderr we can't detect why the run aborted.
