@@ -627,18 +627,19 @@ def run_xcorr_gpu_batched(common, stations, eid, xc, overrides, out_p, out_s, pa
                     keys.add((pair[1], sta, comp, fmin, fmax))
         keys = list(keys)
         t0 = _time.time(); got = 0
-        # 'spawn', not the default 'fork': the executor forks workers LAZILY during submit, while
-        # its queue-feeder thread may hold the result-queue lock — the forked child inherits the
-        # locked lock and deadlocks in _sendback_result (observed 2026-07: uf_2016_qc hung 2.5 h,
-        # all workers idle in queues.put, parent blocked in submit). Workers get all state via
-        # initargs (pickled), so spawn is functionally identical — same reason the non-batched
-        # GPU path below already uses spawn.
+        # multiprocessing.Pool, NOT ProcessPoolExecutor: with ~10^5 keys, executor.map() floods one
+        # submit per chunk into the wakeup pipe while workers are still being spawned LAZILY; the
+        # pipe fills, submit blocks, and workers block sending results into a queue nobody drains —
+        # a hard deadlock observed twice on uf_2016_qc (2026-07: 2.5 h + 1.8 h hangs; py-spy showed
+        # parent in submit->_send, workers in _sendback_result->put, under BOTH fork and spawn).
+        # Pool pre-spawns all workers at construction and streams tasks with no per-future wakeup
+        # pipe, which removes the failure mode structurally. 'spawn' start method: no fork-inherited
+        # locks; workers get all state via initargs (pickled), same as before.
         import multiprocessing as _mp
-        with ProcessPoolExecutor(max_workers=ncores, initializer=_init_worker,
-                                 initargs=(common, stations, eid, xc, dict(overrides),
-                                           out_p, out_s, "obspy", interp_cache_dir),
-                                 mp_context=_mp.get_context("spawn")) as ex:
-            for key, ok in ex.map(_interp_one_trace, keys, chunksize=4):
+        with _mp.get_context("spawn").Pool(processes=ncores, initializer=_init_worker,
+                                           initargs=(common, stations, eid, xc, dict(overrides),
+                                                     out_p, out_s, "obspy", interp_cache_dir)) as pool:
+            for key, ok in pool.imap_unordered(_interp_one_trace, keys, chunksize=16):
                 if ok:                                      # disk cache warmed; do NOT hoard in parent
                     got += 1
         print(f"[xcorr] gpu_batched: pre-interpolated {got}/{len(keys)} traces on {ncores} "
