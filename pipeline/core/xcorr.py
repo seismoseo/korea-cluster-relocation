@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 from glob import glob
 from itertools import combinations
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -50,8 +51,20 @@ _PICK = {"P": "a", "S": "t0"}
 _COMMON = _STATIONS = _EID = _XC = _OVR = _OUTP = _OUTS = None
 _BACKEND = "obspy"           # set per-run by run_xcorr → _init_worker
 _TORCH_DEVICE = None         # lazy per-worker torch.device handle
-_CACHE: dict = {}
+_CACHE = OrderedDict()        # LRU in-memory trace cache (capped; on-disk cache backs evictions)
+_CACHE_CAP = int(os.environ.get("XCORR_TRACE_CACHE", "20000") or "20000")
 _INTERP_CACHE_DIR = None      # optional on-disk cache for interpolated+filtered traces
+
+
+def _cache_put(key, tr):
+    """Insert into the LRU trace cache, evicting least-recently-used entries past the cap so a
+    whole-region all-pairs run can't grow the in-memory cache without bound. The on-disk interp
+    cache backs any eviction (a re-load is ~ms and byte-identical), so correctness is unchanged."""
+    _CACHE[key] = tr
+    _CACHE.move_to_end(key)
+    while len(_CACHE) > _CACHE_CAP:
+        _CACHE.popitem(last=False)
+    return tr
 
 
 def _init_worker(common, stations, eid, xc, ovr, outp, outs, backend="obspy",
@@ -61,7 +74,7 @@ def _init_worker(common, stations, eid, xc, ovr, outp, outs, backend="obspy",
         common, stations, eid, xc, ovr, outp, outs
     _BACKEND = backend
     _INTERP_CACHE_DIR = interp_cache_dir
-    _CACHE = {}
+    _CACHE = OrderedDict()
     # PyTorch defaults to multi-threaded BLAS — with N ProcessPoolExecutor workers
     # this oversubscribes (N × threads_per_worker), causing massive slowdown. Pin
     # each worker to 1 BLAS thread so wall-time scales linearly with N.
@@ -98,6 +111,7 @@ def _full_trace(eid, station, comp, fmin, fmax):
     key = (eid, station, comp, fmin, fmax)
     tr = _CACHE.get(key)
     if tr is not None:
+        _CACHE.move_to_end(key)             # LRU touch
         return tr
     fs = glob(os.path.join(_COMMON, eid, f"{eid}.*.{station}.*{comp}.sac"))
     if not fs:
@@ -109,8 +123,7 @@ def _full_trace(eid, station, comp, fmin, fmax):
             import pickle
             with open(cpath, "rb") as fh:
                 tr = pickle.load(fh)
-            _CACHE[key] = tr
-            return tr
+            return _cache_put(key, tr)
         except Exception:                       # noqa: BLE001 — corrupt entry → recompute
             pass
     tr = (read(src)[0]
@@ -130,8 +143,7 @@ def _full_trace(eid, station, comp, fmin, fmax):
             os.replace(tmp, cpath)
         except Exception:                       # noqa: BLE001 — cache write best-effort
             pass
-    _CACHE[key] = tr
-    return tr
+    return _cache_put(key, tr)
 
 
 def _pick_time(tr, hdr):
@@ -558,14 +570,18 @@ def _process_batch_safe(batch, nlag, slides, sr, device, stats):
 
 
 def _interp_one_trace(key):
-    """Worker entry for the prep pool: interpolate+filter one (eid, sta, comp, fmin, fmax)
-    trace and return (key, trace) — or (key, None) if its SAC file is missing. The heavy
-    100→1000 Hz lanczos interpolation runs here, in parallel, instead of serially in the
-    single GPU process."""
+    """Worker entry for the prep pool: build the ON-DISK interpolated/filtered cache for one
+    (eid, sta, comp, fmin, fmax) and return (key, ok). The heavy 100→1000 Hz lanczos
+    interpolation runs here in parallel. It deliberately does NOT return the trace payload:
+    the parent must not hoard all traces (a whole-region all-pairs run has ~40k traces ≈ 38 GB,
+    which OOMs the host). The main GPU loop reloads each trace from the warm disk cache on demand
+    into the LRU-capped in-memory cache."""
     try:
-        return key, _full_trace(*key)
+        _full_trace(*key)                                   # side effect: warm the on-disk cache
+        _CACHE.pop(key, None)                               # don't retain in worker RAM (disk has it)
+        return key, True
     except Exception:                                       # noqa: BLE001 — missing trace etc.
-        return key, None
+        return key, False
 
 
 def run_xcorr_gpu_batched(common, stations, eid, xc, overrides, out_p, out_s, pairs,
@@ -611,12 +627,20 @@ def run_xcorr_gpu_batched(common, stations, eid, xc, overrides, out_p, out_s, pa
                     keys.add((pair[1], sta, comp, fmin, fmax))
         keys = list(keys)
         t0 = _time.time(); got = 0
+        # 'spawn', not the default 'fork': the executor forks workers LAZILY during submit, while
+        # its queue-feeder thread may hold the result-queue lock — the forked child inherits the
+        # locked lock and deadlocks in _sendback_result (observed 2026-07: uf_2016_qc hung 2.5 h,
+        # all workers idle in queues.put, parent blocked in submit). Workers get all state via
+        # initargs (pickled), so spawn is functionally identical — same reason the non-batched
+        # GPU path below already uses spawn.
+        import multiprocessing as _mp
         with ProcessPoolExecutor(max_workers=ncores, initializer=_init_worker,
                                  initargs=(common, stations, eid, xc, dict(overrides),
-                                           out_p, out_s, "obspy", interp_cache_dir)) as ex:
-            for key, tr in ex.map(_interp_one_trace, keys, chunksize=4):
-                if tr is not None:
-                    _CACHE[key] = tr; got += 1
+                                           out_p, out_s, "obspy", interp_cache_dir),
+                                 mp_context=_mp.get_context("spawn")) as ex:
+            for key, ok in ex.map(_interp_one_trace, keys, chunksize=4):
+                if ok:                                      # disk cache warmed; do NOT hoard in parent
+                    got += 1
         print(f"[xcorr] gpu_batched: pre-interpolated {got}/{len(keys)} traces on {ncores} "
               f"workers in {_time.time() - t0:.1f}s"
               + (f" (cache {os.path.basename(interp_cache_dir)})" if interp_cache_dir else ""))
@@ -956,6 +980,21 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy") -> dic
     stations = sorted({os.path.basename(f).split(".")[2]
                        for e in events for f in glob(os.path.join(common, e, "*.sac"))})
     pairs = list(combinations(events, 2))
+    all_pairs = pairs                              # FULL pair set — combine must cover all, even on resume
+
+    # Resume (env XCORR_RESUME=1): skip pairs whose per-pair dt.cc files already exist. Each pair's
+    # P and S files are written atomically at chunk end, so they are a durable checkpoint — a crash
+    # or an OOM (e.g. collateral on a shared box) costs at most the in-flight chunk; relaunching with
+    # resume continues from where it stopped instead of recomputing millions of finished pairs.
+    # NOTE: this reduces `pairs` to the pairs still to COMPUTE; the ≥threshold COMBINE below must
+    # iterate `all_pairs` (the full set) or a resumed run would drop every reused pair's cc links.
+    if os.environ.get("XCORR_RESUME"):
+        before = len(pairs)
+        pairs = [p for p in pairs
+                 if not (os.path.exists(os.path.join(out_p, f"dt.cc_P_{p[0]}_{p[1]}"))
+                         and os.path.exists(os.path.join(out_s, f"dt.cc_S_{p[0]}_{p[1]}")))]
+        print(f"[xcorr] resume: {before - len(pairs):,} pairs already done, {len(pairs):,} remain "
+              f"of {before:,}", flush=True)
 
     xc = dict(interp_hz=1000, bandpass=(5, 20), pre=0.5, post=0.5, margin=0.5,
               cc_threshold=0.7, p_comp="Z", s_comps=("N", "E"), shift_samp=500,
@@ -997,8 +1036,19 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy") -> dic
         # the identical combine/threshold/no_main tail below.
         ic = (os.path.join(cfg.output_root, "wf_interp_cache")
               if getattr(cfg, "xcorr_interp_cache", True) and cfg.output_root else None)
-        run_xcorr_gpu_batched(common, stations, eid, xc, dict(cfg.xcorr_pair_overrides),
-                              out_p, out_s, pairs, cores=cores, interp_cache_dir=ic)
+        # Process pairs in chunks: the per-run `results` dict is O(pairs x stations) host RAM, so a
+        # whole-region all-pairs run (millions of pairs) would OOM if held all at once. Each chunk
+        # builds results for its slice, writes the per-pair files, then frees them. Output is
+        # identical (same per-pair files); only host-memory peak is bounded. Env-tunable.
+        chunk = int(os.environ.get("XCORR_PAIR_CHUNK", "200000") or "200000")
+        ovr = dict(cfg.xcorr_pair_overrides)
+        nchunks = (len(pairs) + chunk - 1) // chunk
+        for ci in range(0, len(pairs), chunk):
+            sub = pairs[ci:ci + chunk]
+            if nchunks > 1:
+                print(f"[xcorr] gpu_batched chunk {ci // chunk + 1}/{nchunks}: {len(sub):,} pairs", flush=True)
+            run_xcorr_gpu_batched(common, stations, eid, xc, ovr,
+                                  out_p, out_s, sub, cores=cores, interp_cache_dir=ic)
     else:
         # CUDA + 'fork' is unsafe — child can't inherit GPU state cleanly. Use 'spawn'
         # for GPU mode; 'fork' (default) is fine for ObsPy and CCTorch-CPU.
@@ -1014,8 +1064,8 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy") -> dic
 
     thr = xc["cc_threshold"]
     p07, s07 = os.path.join(out, "dt.cc_P_0.7"), os.path.join(out, "dt.cc_S_0.7")
-    _filter_combine(out_p, pairs, "P", thr, p07)
-    _filter_combine(out_s, pairs, "S", thr, s07)
+    _filter_combine(out_p, all_pairs, "P", thr, p07)   # ALL pairs (incl. resumed/reused), not just newly computed
+    _filter_combine(out_s, all_pairs, "S", thr, s07)
     combined = os.path.join(out, "dt.cc_0.7_combined")
     with open(combined, "w") as o:
         for f in (p07, s07):
