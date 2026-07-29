@@ -39,17 +39,19 @@ def rereference_origins(cfg, velmodel="kim1983") -> int:
     """Rewrite every run-tree event's SAC origin (nz*) + picks (a/t0) to the
     `<velmodel>.sum` solution. Returns the number of events re-referenced."""
     sumdf = sumio.read_sum(config.sum_file(cfg, velmodel))
-    origin_of = {int(r.id) % cfg.cuspid_offset: r.time for r in sumdf.itertuples()}
+    origin_of = {int(r.id): r.time for r in sumdf.itertuples()}
 
     wf_root = config.assert_writable(config.waveforms_dir(cfg))
-    dirs = sorted(glob(os.path.join(wf_root, "20*")))
+    from pipeline.core import evmap
+    dir_of = evmap.dir_of_cuspid(cfg)               # canonical id -> event dir (manifest-aware)
 
     n_ev = n_files = 0
-    for idx, origin in sorted(origin_of.items()):
-        if idx >= len(dirs):
-            print(f"[rereference] WARN cuspid index {idx} >= {len(dirs)} event dirs — skipped")
+    for cusp, origin in sorted(origin_of.items()):
+        eid = dir_of.get(cusp)
+        if eid is None:
+            print(f"[rereference] WARN cuspid {cusp} has no event dir — skipped")
             continue
-        for f in glob(os.path.join(dirs[idx], "*.sac")):
+        for f in glob(os.path.join(wf_root, eid, "*.sac")):
             tr = read(f)[0]
             s = tr.stats.sac
             ref = tr.stats.starttime - s.b          # current reference (origin)

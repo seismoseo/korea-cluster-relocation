@@ -968,14 +968,14 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy") -> dic
     os.makedirs(out_s, exist_ok=True)
     common = config.waveforms_dir(cfg)
 
-    # events (by cuspid) + stations + pairs
+    # events (by cuspid) + stations + pairs — id -> dir via the canonical evmap (manifest-aware)
+    from pipeline.core import evmap
     sumdf = sumio.read_sum(config.sum_file(cfg, velmodel))
-    dirs = sorted(glob(os.path.join(common, "20*")))
+    dir_of = evmap.dir_of_cuspid(cfg)
     events, eid = [], {}
     for r in sumdf.itertuples():
-        idx = int(r.id) % cfg.cuspid_offset
-        if idx < len(dirs):
-            e = os.path.basename(dirs[idx])
+        e = dir_of.get(int(r.id))
+        if e is not None:
             events.append(e)
             eid[e] = int(r.id)
     stations = sorted({os.path.basename(f).split(".")[2]

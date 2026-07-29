@@ -31,9 +31,9 @@ from pipeline.core import sumio, waveforms
 
 
 def _cuspid_maps(cfg):
-    """{cuspid -> event_id}, replicating hypoinverse.write_phs (enumerate sorted event dirs)."""
-    event_dirs = sorted(glob.glob(os.path.join(config.waveforms_dir(cfg), "20*")))
-    return {cfg.cuspid_offset + i: os.path.basename(ed) for i, ed in enumerate(event_dirs)}
+    """{cuspid -> event_id} via the canonical evmap (manifest-aware; legacy = sorted-dir index)."""
+    from pipeline.core import evmap
+    return evmap.dir_of_cuspid(cfg)
 
 
 def _vmodel_depth_vp(cfg, velmodel):

@@ -108,9 +108,8 @@ def _event_magnitudes(cfg):
             t = UTCDateTime(int(r.year), int(r.month), int(r.day), int(r.hour), int(r.minute),
                             int(r.second)) - cfg.kst_offset_hours * 3600
             eid2mag[t.strftime("%Y%m%d%H%M%S")] = float(r.magnitude)
-        dirs = sorted(glob.glob(os.path.join(config.waveforms_dir(cfg), "20*")))
-        return {cfg.cuspid_offset + i: eid2mag[os.path.basename(d)]
-                for i, d in enumerate(dirs) if os.path.basename(d) in eid2mag}
+        from pipeline.core import evmap
+        return {c: eid2mag[e] for c, e in evmap.dir_of_cuspid(cfg).items() if e in eid2mag}
     except Exception:                                # noqa: BLE001
         return {}
 
@@ -153,8 +152,8 @@ def _mag_for(cfg, ids):
 def _cuspid_event_ids(cfg):
     """{cuspid: event_id (UTC YYYYMMDDHHMMSS)} from the sorted waveform dirs — the cuspid scheme
     (cuspid = cfg.cuspid_offset + index). The inverse of the `id` carried through reloc/mechanisms."""
-    dirs = sorted(glob.glob(os.path.join(config.waveforms_dir(cfg), "20*")))
-    return {cfg.cuspid_offset + i: os.path.basename(d) for i, d in enumerate(dirs)}
+    from pipeline.core import evmap
+    return evmap.dir_of_cuspid(cfg)
 
 
 # bootstrap-flagged "under-constrained" events are dropped from the dt.cc views: their relative location
@@ -1340,6 +1339,8 @@ def _center_row(cfg, d, ref, prefer):
 def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
                    frame_from="auto", mech_select="highest_quality",
                    center_on="mainshock", show_bootstrap=False,
+                   drop_underconstrained=True, flag_underconstrained=False, lim_km=None,
+                   point_colors=None, legend_handles=None,
                    source_radius=None, source_label=None):
     """Relocated seismicity in fault coordinates — a 2×2 figure styled after the original dt.cc
     notebooks: (1) fault-plane map view, (2) along-strike depth section, (3) across-strike depth
@@ -1377,14 +1378,32 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     earlier v1.x default was always-on bootstrap; this v1.4.6+ default makes the simple
     relocation the headline view and treats bootstrap as an opt-in diagnostic.
 
+    `drop_underconstrained` (default True): only meaningful with `show_bootstrap=True`. When
+    True the bootstrap-flagged under-constrained events are removed (the headline behaviour).
+    Set it **False** to keep every event but still draw the 95 % bars — the right mode for
+    asking "are the outer scattered events genuinely off-fault, or just poorly located?":
+    small bars on a far event ⇒ a real broad-source-volume event; bars that reach the core ⇒
+    unresolved. Nothing is dropped, so the scatter is shown honestly with its uncertainty.
+
+    `flag_underconstrained` (default False): the *transparent* view — keep **every** event (forces
+    `drop_underconstrained=False`) and draw the bootstrap-flagged under-constrained events' 95 % bars in
+    **red** instead of gray, so you can objectively see which positions are unreliable rather than having
+    them hidden. The well-constrained events keep gray bars. Pair with `show_bootstrap=True`.
+
+    `lim_km`: optional half-window (km). When given, all four panels are set to ±`lim_km`
+    and the A/B/A'/B' section labels + fault/dip guide lines are placed at that window scale,
+    so a zoom stays self-consistent (labels never fall outside the frame). When None the
+    window auto-fits the cloud as before. Pass e.g. `lim_km=0.4` to focus on a ~0.8 km core.
+
     Markers coloured by origin time, sized by magnitude. Reads the headline dt.cc relocation
     (dt.ct fallback).
 
     `source_radius`: optional callable mapping the per-event magnitude array → source radius in
-    **metres**. When given, every event is drawn as a hollow circle of that radius **to scale** in
-    the (equal-aspect) fault frame instead of a magnitude-scaled marker — so rupture size is directly
-    comparable to inter-event spacing. `source_label` is appended to the title (e.g. the stress-drop /
-    Mw assumption). Same style as the default view; the magnitude size-legend is suppressed.
+    **metres**. When given, events are drawn as hollow circles of that radius **to scale** — but ONLY
+    in the fault-plane (along-dip) panel, where rupture size is directly comparable to inter-event
+    spacing on the fault surface. The map view and the two depth sections keep the usual
+    magnitude-scaled markers (with the size legend). `source_label` is appended to the title (e.g. the
+    stress-drop / Mw assumption).
     """
     import matplotlib.dates as mdates
     import matplotlib.colors as mcolors
@@ -1397,8 +1416,11 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     if not os.path.exists(reloc):
         axes[0].set_title(f"{cfg.region}: no HypoDD reloc (run ph2dt→dtcc first)"); return fig
     d = sumio.read_reloc(reloc).reset_index(drop=True)
-    # SOTA default: show every event in hypoDD.reloc. Drops are opt-in via show_bootstrap=True.
-    if show_bootstrap:
+    # SOTA default: show every event in hypoDD.reloc. Drops are opt-in via show_bootstrap=True,
+    # and can be suppressed with drop_underconstrained=False (keep all, still draw the bars).
+    if flag_underconstrained:                 # transparent view: keep everyone, flag the unreliable ones
+        drop_underconstrained = False
+    if show_bootstrap and drop_underconstrained:
         ndrop = int(d.id.isin(_boot_underconstrained(cfg, branch)).sum())
         d = d[~d.id.isin(_boot_underconstrained(cfg, branch))].reset_index(drop=True)
     else:
@@ -1491,6 +1513,24 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
                 sig_dp[i], sig_ad[i] = _pct_hw(s, v_z) / 1000.0, _pct_hw(s, v_ad) / 1000.0
                 sig_e[i], sig_n[i] = _pct_hw(s, v_e) / 1000.0, _pct_hw(s, v_n) / 1000.0
 
+    # under-constrained mask (aligned with `d`) for the transparent flag: red bars on these events
+    uc_mask = (d.id.isin(_boot_underconstrained(cfg, branch)).to_numpy()
+               if (flag_underconstrained and boot is not None) else None)
+    n_uc = int(uc_mask.sum()) if uc_mask is not None else 0
+
+    def _ebars(ax, X, Y, xerr, yerr):
+        """error bars, split into well-constrained (gray) vs under-constrained (red) when flagging."""
+        if uc_mask is None:
+            ax.errorbar(X, Y, xerr=xerr, yerr=yerr, fmt="none", ecolor="0.55",
+                        elinewidth=0.6, capsize=1.5, zorder=3); return
+        X, Y = np.asarray(X, float), np.asarray(Y, float)
+        for m, col, lw in ((~uc_mask, "0.55", 0.6), (uc_mask, "tab:red", 0.9)):
+            if not np.any(m): continue
+            xe = xerr[m] if xerr is not None else None
+            ye = yerr[m] if yerr is not None else None
+            ax.errorbar(X[m], Y[m], xerr=xe, yerr=ye, fmt="none", ecolor=col,
+                        elinewidth=lw, capsize=1.5, zorder=3, alpha=0.9)
+
     # --- colour (origin time by default) + KMA-magnitude-scaled hollow markers (reloc mag is 0) ---
     mag = _mag_for(cfg, d.id)                      # KMA local magnitude per event (NaN if unmatched)
     sz = _mag_size(mag, smin=25, smax=1500)
@@ -1506,15 +1546,35 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
         cv = d.depth.to_numpy(); norm = mcolors.Normalize(vmin=np.nanmin(cv), vmax=np.nanmax(cv))
         cmap = plt.get_cmap("viridis_r"); cbar_label = "Depth (km)"
     rgba = cmap(norm(cv))
+    # categorical override: colour each event by a caller-supplied {event_id: colour} map (e.g. NND
+    # family / background). Keeps the SOTA hollow magnitude-scaled markers + bars; the continuous
+    # colour bar is replaced by `legend_handles` below. Unmapped events fall back to gray.
+    # NOTE: `d.id` from the raw hypoDD.reloc are HypoDD *cuspids* (e.g. 200000), NOT the real 14-digit
+    # event_ids most callers key by — translate via _cuspid_event_ids first, then fall back to the
+    # cuspid key itself, then gray. (Without the translation EVERY event mis-falls-back to gray, so the
+    # whole cluster reads as one category — the bug that hid the NND families.)
+    if point_colors is not None:
+        try:
+            _c2e = _cuspid_event_ids(cfg)               # cuspid -> real event_id (str)
+        except Exception:
+            _c2e = {}
+        def _pcolor(e):
+            e = int(e)
+            ev = _c2e.get(e)
+            if ev is not None and point_colors.get(int(ev)) is not None:
+                return point_colors[int(ev)]
+            return point_colors.get(e, "0.6")           # direct cuspid key, else gray
+        rgba = np.array([mcolors.to_rgba(_pcolor(e)) for e in d.id])
 
-    # markers — hollow circles, either magnitude-scaled (default) or drawn at the physical SOURCE
-    # RADIUS to scale when `source_radius` is given (a callable mapping the magnitude array -> radius
-    # in metres). The fault-frame panels are equal-aspect (`_style`), so the circles are true to scale.
+    # markers — hollow circles. Default: magnitude-scaled (every panel). When `source_radius` is given
+    # (a callable mapping the magnitude array -> radius in metres), the physical SOURCE RADIUS circles
+    # are drawn ONLY in the fault-plane (along-dip) panel via `circles=True` — the equal-aspect fault
+    # frame makes them true to scale there; the other three panels stay magnitude-scaled.
     _circ_km = (np.asarray(source_radius(np.asarray(mag, float)), float) / 1000.0
                 if source_radius is not None else None)
 
-    def _markers(ax, X, Y):
-        if _circ_km is None:
+    def _markers(ax, X, Y, circles=False):
+        if not (circles and _circ_km is not None):
             ax.scatter(X, Y, s=sz, facecolors="none", edgecolors=rgba, linewidth=1.8, zorder=4)
         else:
             from matplotlib.collections import PatchCollection
@@ -1528,18 +1588,25 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
         ax.set_aspect("equal", "box"); ax.grid(True, linestyle=":", alpha=0.7)
         ax.set_facecolor("#FAFAFA"); ax.tick_params(labelsize=11)
 
+    # source-radius circles appear only in the along-dip panel (which uses the shared range R), so pad
+    # R by the largest radius to keep those circles inside; the map view (pad) needs no such padding
+    rmax = float(np.nanmax(_circ_km)) if (_circ_km is not None and len(_circ_km)) else 0.0
     L = (max(np.ptp(rx), np.ptp(ry)) / 1000.0) or 0.2            # km, cloud half-extent
     pad = 1.25 * L
     su, du = np.sin(np.deg2rad(used_strike)), np.cos(np.deg2rad(used_strike))
     # one symmetric square range for all section panels so equal-aspect panels pack uniformly
     R = 1.15 * max(np.nanmax(np.abs(along)), np.nanmax(np.abs(across)),
-                   np.nanmax(np.abs(dep)), np.nanmax(np.abs(along_dip)), 1e-3)
+                   np.nanmax(np.abs(dep)), np.nanmax(np.abs(along_dip)), 1e-3) + rmax
+    # Explicit zoom window: scale axes AND label/guide-line positions together so a focused
+    # view stays self-consistent (the A/B labels are placed at fractions of pad/R, so they
+    # must follow the same window — otherwise clipping the axes afterward throws them out).
+    if lim_km is not None:
+        pad = R = float(lim_km)
 
     # panel 1 — fault-plane map view (relative E–N km), with fault lines + section labels
     ax = axes[0]
     if boot is not None:
-        ax.errorbar(rx / 1000.0, ry / 1000.0, xerr=sig_e, yerr=sig_n, fmt="none", ecolor="0.55",
-                    elinewidth=0.6, capsize=1.5, zorder=3)
+        _ebars(ax, rx / 1000.0, ry / 1000.0, sig_e, sig_n)
     _markers(ax, rx / 1000.0, ry / 1000.0)
     ax.plot([-pad * su, pad * su], [-pad * du, pad * du], color="0.35", lw=1.1, ls="-", zorder=2)
     ax.plot([pad * du, -pad * du], [-pad * su, pad * su], color="0.35", lw=1.1, ls="--", zorder=2)
@@ -1555,14 +1622,12 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
                 ha="center", va="center", zorder=6)
     ax.set(xlim=(-pad, pad), ylim=(-pad, pad), xlabel="E (km)", ylabel="N (km)",
            title="Fault-plane map view"); _style(ax)
-    if _circ_km is None:
-        _mag_legend(ax, mag, smin=25, smax=1500, loc="lower left")
+    _mag_legend(ax, mag, smin=25, smax=1500, loc="lower left")   # map view is always magnitude-scaled
 
     # panel 2 — along-strike depth section (A–A')
     ax = axes[1]
     if boot is not None:
-        ax.errorbar(along, dep, xerr=sig_al, yerr=sig_dp, fmt="none", ecolor="0.55",
-                    elinewidth=0.6, capsize=1.5, zorder=3)
+        _ebars(ax, along, dep, sig_al, sig_dp)
     _markers(ax, along, dep)
     ax.text(-0.92 * R, -0.88 * R, "A", fontsize=16, fontweight="bold")
     ax.text(0.86 * R, -0.88 * R, "A'", fontsize=16, fontweight="bold")
@@ -1577,8 +1642,7 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     # whenever the mechanism plane disagreed with the SVD plane.
     ax = axes[2]
     if boot is not None:
-        ax.errorbar(across, dep, xerr=sig_ac, yerr=sig_dp, fmt="none", ecolor="0.55",
-                    elinewidth=0.6, capsize=1.5, zorder=3)
+        _ebars(ax, across, dep, sig_ac, sig_dp)
     _markers(ax, across, dep)
     # In the (across, depth) section the chosen plane's normal projects to
     #   (n_across, n_down) = (-sin(dip), -cos(dip))
@@ -1616,23 +1680,30 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     # panel 4 — fault-plane (along-dip) view
     ax = axes[3]
     if boot is not None:
-        ax.errorbar(along, along_dip, xerr=sig_al, yerr=sig_ad, fmt="none", ecolor="0.55",
-                    elinewidth=0.6, capsize=1.5, zorder=3)
-    _markers(ax, along, along_dip)
+        _ebars(ax, along, along_dip, sig_al, sig_ad)
+    _markers(ax, along, along_dip, circles=True)   # 10 MPa source-radius circles here only
     ax.text(-0.92 * R, -0.88 * R, "A", fontsize=16, fontweight="bold")
     ax.text(0.86 * R, -0.88 * R, "A'", fontsize=16, fontweight="bold")
     ax.set(xlim=(-R, R), ylim=(-R, R), xlabel="Along-strike distance (km)",
            ylabel="Along-dip distance (km)", title="Fault-plane view (along-dip)")
     _style(ax); ax.invert_yaxis()
 
-    # shared colour bar (origin time formatted as dates)
-    sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
-    cbar = fig.colorbar(sm, ax=axes.tolist(), shrink=0.85)
-    cbar.set_label(cbar_label)
-    if color_by == "time":
-        ticks = np.linspace(norm.vmin, norm.vmax, 5)
-        cbar.set_ticks(ticks)
-        cbar.set_ticklabels([mdates.num2date(t).strftime("%Y-%m-%d") for t in ticks])
+    # shared colour bar (origin time formatted as dates) — replaced by a categorical legend when the
+    # markers are coloured by `point_colors` (no meaningful continuous scale then).
+    if point_colors is None:
+        sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
+        cbar = fig.colorbar(sm, ax=axes.tolist(), shrink=0.85)
+        cbar.set_label(cbar_label)
+        if color_by == "time":
+            ticks = np.linspace(norm.vmin, norm.vmax, 5)
+            cbar.set_ticks(ticks)
+            cbar.set_ticklabels([mdates.num2date(t).strftime("%Y-%m-%d") for t in ticks])
+    elif legend_handles is not None:
+        # keep the magnitude-size legend (panel 0, lower-left) AND add the category legend (upper-left)
+        _mag_leg = axes[0].get_legend()
+        axes[0].legend(handles=legend_handles, loc="upper left", fontsize=7.5, framealpha=0.9)
+        if _mag_leg is not None:
+            axes[0].add_artist(_mag_leg)
 
     # `mechanism NP1=…` makes it unambiguous that the listed strike/dip is NP1 (the
     # SKHASH-reported plane); the section may be drawn with NP2 (the conjugate) when the
@@ -1640,8 +1711,12 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     # asking "why does the section dip differ from the mechanism dip?".
     fmtxt = (f"; mechanism NP1={ref['strike']:.0f}°/{ref['dip']:.0f}° ({ref['quality']})"
              if ref else "")
-    btxt = ("  (bars = 95% bootstrap" + (f"; {ndrop} under-constrained dropped)" if ndrop else ")")
-            if boot is not None else "")
+    if boot is not None and uc_mask is not None:
+        btxt = f"  (gray bars = 95% bootstrap; RED bars = {n_uc} under-constrained, all events shown)"
+    elif boot is not None:
+        btxt = "  (bars = 95% bootstrap" + (f"; {ndrop} under-constrained dropped)" if ndrop else ")")
+    else:
+        btxt = ""
     if center_cuspid is not None:
         ctxt = (f"  •  centred on {eff_center} event {center_cuspid}"
                 + (f" (M{center_mag:.1f})" if np.isfinite(center_mag) else ""))
@@ -1974,6 +2049,158 @@ def compare_epicenters(cfg, velmodel="kim1983", variant="default"):
         ax.set_aspect("equal", "datalim")
         _format_lonlat(ax)
     fig.tight_layout()
+    return fig
+
+
+def compare_seed_final(cfg, velmodel="kim1983", show_errors=True, drop_underconstrained=False):
+    """Seed-vs-final comparison: HypoSVI absolute locations (left) vs the dt.cc double-difference
+    relocation (right), in three projections — map (lon-lat), longitude-depth, latitude-depth.
+
+    The honest-collapse view the regional-bias concern calls for: **only events common to both**
+    are shown (matched by id), and **each row's two panels share identical axis limits**, so any
+    apparent tightening is a true change of position, not an artefact of dt.cc dropping events or of
+    independent autoscaling. The seed `.sum` and the dt.cc `.reloc` live in the same id space.
+
+    `show_errors=True` draws 95% error bars on BOTH columns — the seed gets the HypoSVI absolute
+    uncertainty (`1.96·erh` horizontal, `1.96·erz` depth, per-axis ~95% to match the bootstrap
+    convention), the dt.cc panels get the 95% bootstrap half-widths. Bars are drawn ATOP the filled
+    circles so they stay visible when smaller than the marker. `drop_underconstrained=True` removes
+    bootstrap-flagged events from BOTH columns so the same set is compared after the quality cut;
+    default keeps every relocated event (transparent)."""
+    seed = sumio.read_sum(config.sum_file(cfg, velmodel))
+    path, branch = _reloc_path(cfg)
+    fin = sumio.read_reloc(path)
+    if drop_underconstrained:
+        drop = _boot_underconstrained(cfg, branch)
+        fin = fin[~fin.id.isin(drop)]
+    common = sorted(set(seed.id.astype(int)) & set(fin.id.astype(int)))
+    s = seed[seed.id.astype(int).isin(common)].copy()
+    f = fin[fin.id.astype(int).isin(common)].copy()
+    if not len(common):
+        raise ValueError("no events common to the HypoSVI seed and the dt.cc relocation")
+
+    def _rms3d(df):                                   # 3-D RMS spread about the centroid (km)
+        kx = 111.195 * np.cos(np.deg2rad(float(df.lat.mean())))
+        dx = (df.lon - df.lon.mean()) * kx
+        dy = (df.lat - df.lat.mean()) * 111.195
+        dz = df.depth - df.depth.mean()
+        return float(np.sqrt((dx**2 + dy**2 + dz**2).mean()))
+
+    boot = _load_bootstrap(cfg, branch) if show_errors else None
+    sz_s = _mag_size(_mag_for(cfg, s.id))
+    sz_f = _mag_size(_mag_for(cfg, f.id))
+    # shared, padded limits per coordinate (over BOTH seed and final) — the load-bearing fairness device
+    def _lim(a, b, frac=0.08):
+        lo = float(min(a.min(), b.min())); hi = float(max(a.max(), b.max()))
+        pad = (hi - lo) * frac or 1e-3
+        return lo - pad, hi + pad
+    xlon = _lim(s.lon, f.lon); ylat = _lim(s.lat, f.lat); zdep = _lim(s.depth, f.depth)
+    dnorm = mpl.colors.Normalize(vmin=min(s.depth.min(), f.depth.min()),
+                                 vmax=max(s.depth.max(), f.depth.max()))
+
+    fig, ax = plt.subplots(3, 2, figsize=(10.5, 13.5), dpi=110)
+    cols = [(s, sz_s, "HypoSVI seed (absolute)", False),
+            (f, sz_f, f"dt.cc relocated ({branch})", True)]
+    for j, (df, sz, lab, is_final) in enumerate(cols):
+        # --- row 0: map (lon-lat), depth-coloured, equal aspect ---
+        a = ax[0, j]
+        sc = a.scatter(df.lon, df.lat, c=df.depth, s=sz, cmap="viridis_r", norm=dnorm,
+                       edgecolor="k", linewidth=0.4, zorder=3)
+        a.set(xlim=xlon, ylim=ylat, xlabel="Longitude", ylabel="Latitude",
+              title=f"{lab}\n{len(df)} events  ·  3-D RMS {_rms3d(df):.2f} km")
+        a.set_aspect("equal", "box"); _format_lonlat(a)
+        plt.colorbar(sc, ax=a, label="Depth (km)", shrink=0.85)
+        # --- row 1: longitude-depth ; row 2: latitude-depth ---
+        a1, a2 = ax[1, j], ax[2, j]
+        a1.scatter(df.lon, df.depth, s=sz, c="steelblue", edgecolor="k", linewidth=0.4, zorder=3)
+        a2.scatter(df.lat, df.depth, s=sz, c="steelblue", edgecolor="k", linewidth=0.4, zorder=3)
+        a1.set(xlim=xlon, ylim=zdep[::-1], xlabel="Longitude", ylabel="Depth (km)",
+               title="Longitude-depth")
+        a2.set(xlim=ylat, ylim=zdep[::-1], xlabel="Latitude", ylabel="Depth (km)",
+               title="Latitude-depth")
+        for axx in (a1, a2):
+            _format_lonlat(axx)
+        if show_errors:
+            # bars drawn ATOP the filled circles (zorder 6 > scatter zorder 3) so they remain
+            # visible when smaller than the marker. seed = HypoSVI absolute 95% (1.96·erh/erz);
+            # final = 95% bootstrap percentile half-widths.
+            EB = dict(fmt="none", ecolor="0.45", elinewidth=0.5, capsize=1.5,
+                      alpha=0.55, zorder=6)
+            for r in df.itertuples():
+                cosl = 111320.0 * np.cos(np.deg2rad(r.lat))
+                if is_final:
+                    if not boot or int(r.id) not in boot:
+                        continue
+                    hw = _pct_hw(boot[int(r.id)])     # (E, N, Z) metres
+                    xe = hw[0] / cosl; ye = hw[1] / 111320.0; ze = hw[2] / 1000.0
+                else:
+                    erh, erz = getattr(r, "erh", np.nan), getattr(r, "erz", np.nan)
+                    if not (np.isfinite(erh) and np.isfinite(erz)):
+                        continue
+                    eh = 1.96 * float(erh) * 1000.0   # km -> m, per-axis ~95%
+                    xe = eh / cosl; ye = eh / 111320.0; ze = 1.96 * float(erz)
+                a.errorbar(r.lon, r.lat, xerr=xe, yerr=ye, **EB)
+                a1.errorbar(r.lon, r.depth, xerr=xe, yerr=ze, **EB)
+                a2.errorbar(r.lat, r.depth, xerr=ye, yerr=ze, **EB)
+    fig.suptitle(f"{cfg.region} — HypoSVI seed vs dt.cc relocation "
+                 f"(n={len(common)} common events, shared axes)", y=1.005, fontsize=12)
+    fig.tight_layout()
+    return fig
+
+
+def relocation_displacement(cfg, velmodel="kim1983", drop_underconstrained=False):
+    """How far each event moved from its HypoSVI seed to its dt.cc relocation — arrows from the
+    absolute (seed) position to the relocated position, in three projections (map, lon-depth,
+    lat-depth). Hollow grey circle = seed, filled dot = final; the connecting arrow is coloured by
+    3-D displacement magnitude (m). Only events common to both are drawn (matched by id); panels share
+    no axes here (each projection autoscales to its arrows). `drop_underconstrained=True` hides
+    bootstrap-flagged events. The companion to `compare_seed_final` — it makes the *motion* explicit
+    rather than the before/after spreads."""
+    from matplotlib.cm import ScalarMappable
+    seed = sumio.read_sum(config.sum_file(cfg, velmodel))
+    path, branch = _reloc_path(cfg)
+    fin = sumio.read_reloc(path)
+    if drop_underconstrained:
+        fin = fin[~fin.id.isin(_boot_underconstrained(cfg, branch))]
+    common = sorted(set(seed.id.astype(int)) & set(fin.id.astype(int)))
+    if not common:
+        raise ValueError("no events common to the HypoSVI seed and the dt.cc relocation")
+    s = seed.set_index(seed.id.astype(int)).loc[common]
+    f = fin.set_index(fin.id.astype(int)).loc[common]
+    kx = 111.195 * np.cos(np.deg2rad(float(s.lat.mean())))    # km per deg lon at this latitude
+    dx = (f.lon.values - s.lon.values) * kx * 1000.0
+    dy = (f.lat.values - s.lat.values) * 111.195 * 1000.0
+    dz = (f.depth.values - s.depth.values) * 1000.0
+    d3 = np.sqrt(dx**2 + dy**2 + dz**2)                       # 3-D displacement (m)
+    norm = mpl.colors.Normalize(vmin=0.0, vmax=float(np.nanmax(d3)) or 1.0)
+    cmap = plt.get_cmap("plasma")
+
+    fig, (a0, a1, a2) = plt.subplots(1, 3, figsize=(16, 5), dpi=110)
+    proj = [(a0, s.lon.values, s.lat.values, f.lon.values, f.lat.values, "Longitude", "Latitude", False),
+            (a1, s.lon.values, s.depth.values, f.lon.values, f.depth.values, "Longitude", "Depth (km)", True),
+            (a2, s.lat.values, s.depth.values, f.lat.values, f.depth.values, "Latitude", "Depth (km)", True)]
+    for ax, sx, sy, fx, fy, xl, yl, isdep in proj:
+        for i in range(len(common)):
+            ax.annotate("", xy=(fx[i], fy[i]), xytext=(sx[i], sy[i]),
+                        arrowprops=dict(arrowstyle="-|>", color=cmap(norm(d3[i])),
+                                        lw=1.0, shrinkA=0, shrinkB=0), zorder=3)
+        ax.scatter(sx, sy, s=26, facecolor="none", edgecolor="0.45", linewidth=0.9,
+                   zorder=4, label="HypoSVI seed")
+        ax.scatter(fx, fy, s=14, c="0.1", zorder=5, label="dt.cc relocated")
+        ax.set(xlabel=xl, ylabel=yl)
+        _format_lonlat(ax)
+        if isdep:
+            ax.invert_yaxis()
+        else:
+            ax.set_aspect("equal", "datalim")
+    a0.set_title("Map (lon-lat)"); a1.set_title("Longitude-depth"); a2.set_title("Latitude-depth")
+    a0.legend(loc="best", fontsize=8)
+    sm = ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
+    cb = fig.colorbar(sm, ax=[a0, a1, a2], shrink=0.85, pad=0.02)
+    cb.set_label("Seed -> dt.cc displacement (m)")
+    fig.suptitle(f"{cfg.region} — relocation displacement, HypoSVI seed -> dt.cc "
+                 f"(n={len(common)}; median {np.median(d3):.0f} m, max {np.nanmax(d3):.0f} m)",
+                 y=1.02, fontsize=12)
     return fig
 
 

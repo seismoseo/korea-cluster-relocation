@@ -120,13 +120,19 @@ def write_phs(cfg):
     prob_bins = getattr(cfg, "phs_prob_weight_bins", ())
     os.makedirs(config.assert_writable(config.phs_dir(cfg)), exist_ok=True)
     event_dirs = sorted(glob(os.path.join(config.waveforms_dir(cfg), "20*")))
+    # cuspid per event dir via the canonical map (manifest-aware). A dir with no cuspid (stale
+    # leftover not in the manifest) contributes NO event — under the legacy enumerate scheme such a
+    # dir silently shifted every subsequent id instead (the 2011 off-by-one).
+    from pipeline.core import evmap
+    cusp_of = evmap.cuspid_of_dir(cfg)
 
     n_prob_p = n_prob_s = n_dist_fallback_p = n_dist_fallback_s = 0
     with open(config.phs_file(cfg), "w") as f:
-        for idx, ed in enumerate(event_dirs):
+        for ed in event_dirs:
             eid = os.path.basename(ed)
             ev = catalog.get(eid)
-            if ev is None:
+            cuspid = cusp_of.get(eid)
+            if ev is None or cuspid is None:
                 continue
             picks_lookup = _load_picks_csv(cfg, eid) if scheme == "probability" else {}
             la_d, la_m = _deg_min_hundredths(ev["lat"])
@@ -174,10 +180,9 @@ def write_phs(cfg):
                             f"{str(ot.second).zfill(2)}{str(ot.microsecond).zfill(6)[:2]}"
                             f"{'ES'.ljust(3)}{sw}\n")
                     seen_s.add(sta)
-            # Cuspid = cuspid_offset + sorted-dir index. Byte-identical to the old
-            # '200'+zfill(3) form for idx <= 999, but doesn't cap there — dense
-            # sequences (e.g. Buan 2024) exceed 999 events per cluster.
-            f.write(" " * 66 + str(cfg.cuspid_offset + idx) + "\n")
+            # Cuspid from the canonical evmap: legacy = offset + sorted-dir index (byte-identical
+            # to the old scheme, incl. >999-event clusters); manifest = offset + caller event_idx.
+            f.write(" " * 66 + str(cuspid) + "\n")
     if scheme == "probability":
         print(f"[write_phs] {cfg.name}: probability-weighted "
               f"P {n_prob_p} prob + {n_dist_fallback_p} dist-fallback, "

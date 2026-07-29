@@ -113,6 +113,23 @@ def run_ph2dt(cfg):
 
 
 # ------------------------------------------------------------- hypoDD.inp
+def _inp_force_lsqr(inp_path):
+    """Flip the solution-control line of an existing hypoDD.inp to ISOLV=2 (LSQR) in place. Used by the
+    bootstrap when the resampled dt set would overflow the binary's compiled SVD MAXDATA0 limit, so the
+    replicas use the SAME solver the main run fell back to (`_exec_hypodd`). No-op if already LSQR."""
+    with open(inp_path) as f:
+        lines = f.readlines()
+    for k, ln in enumerate(lines):
+        if "solution control" in ln.lower() and k + 1 < len(lines):
+            p = lines[k + 1].split()
+            if len(p) >= 3 and p[1] != "2":
+                p[1] = "2"
+                lines[k + 1] = "    " + "       ".join(p[:3]) + "\n"
+            break
+    with open(inp_path, "w") as f:
+        f.writelines(lines)
+
+
 def build_hypodd_inp(inp, iter_sets=None) -> str:
     """Render a hypoDD.inp string from a HypoDDInp. The first (cross-correlation)
     data line is left blank when inp.cc_file is None -> catalog-only relocation.
@@ -186,7 +203,7 @@ def _exec_hypodd_once(d, timeout=None):
     valid run is never killed mid-iteration."""
     os.makedirs(os.path.join(d, "reloc"), exist_ok=True)
     proc = subprocess.run(["hypoDD", "hypoDD.inp"], cwd=d,
-                          capture_output=True, text=True, timeout=timeout)
+                          capture_output=True, text=True, errors="replace", timeout=timeout)
     # Capture BOTH stdout and stderr into hypoDD.sum — hypoDD's STOP/ERROR messages
     # (including 'STOP >>> Increase MAXDATA0') go to stderr, while the normal progress
     # output goes to stdout. Without stderr we can't detect why the run aborted.
@@ -390,16 +407,11 @@ def run_dtct(cfg, velmodel="kim1983"):
 
 
 def _event_cuspid(cfg, event_id, velmodel="kim1983"):
-    """Map a UTC event_id (sorted-dir name) to its HypoDD cuspid via the .sum ID-NUM."""
-    from glob import glob as _glob
-    from pipeline.core import sumio
+    """Map a UTC event_id (waveform-dir name) to its HypoDD cuspid via the canonical evmap."""
+    from pipeline.core import sumio, evmap
     sumdf = sumio.read_sum(config.sum_file(cfg, velmodel))
-    dirs = sorted(_glob(os.path.join(config.waveforms_dir(cfg), "20*")))
-    for r in sumdf.itertuples():
-        idx = int(r.id) % cfg.cuspid_offset
-        if idx < len(dirs) and os.path.basename(dirs[idx]) == event_id:
-            return int(r.id)
-    return None
+    cusp = evmap.cuspid_of_dir(cfg).get(event_id)
+    return cusp if cusp is not None and cusp in set(sumdf.id.astype(int)) else None
 
 
 def run_dtcc(cfg, variant="default"):
@@ -597,6 +609,65 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
     # cluster we run, so this only fires on the genuinely pathological cases the existing
     # `except Exception: return {}` clause is already designed to absorb.
     boot_timeout_s = 120
+    # When the seeded (converged) start packs more dt within the distance cutoffs than the raw-catalog
+    # main run, the SVD array overflows MAXDATA0 here even if the main run fit SVD. Then every replica
+    # must run LSQR, or they abort with _MaxData0Overflow -> n_boot=0. CRUCIAL: a naive isolv 1->2 flip is
+    # WRONG — it leaves SVD's tiny DAMP, which under-damps LSQR (CND >> 80) so weakly-tied events take wild
+    # steps and fall out of the .reloc (n_boot=0 for them). Instead we re-solve the un-resampled probe with
+    # PocketQuake's OWN adaptive-damping LSQR — the exact recipe run_dtcc uses for isolv=2 (cluster-scaled
+    # distance cutoffs + DAMP tuned to CND 40-80) — and reuse that ONE calibrated hypoDD.inp for every
+    # replica, so the solver method never changes which events are relocated. Small clusters that fit SVD
+    # never overflow, so this is a no-op for them.
+    use_lsqr = False
+    calibrated_lsqr_inp = None                                   # adaptive-damped LSQR inp, reused by replicas
+    _pd = tempfile.mkdtemp(prefix=f"bootprobe_{cfg.name}_")
+    try:
+        for a in aux:
+            s = os.path.join(bdir, a)
+            if os.path.exists(s):
+                shutil.copyfile(s, os.path.join(_pd, a))
+        with open(os.path.join(_pd, "event.dat"), "w") as f:
+            f.write(seeded_event_dat)
+        for fn, blk in base_blocks.items():
+            _write_dt_blocks(os.path.join(_pd, fn), blk)        # un-resampled probe
+        try:
+            _exec_hypodd_once(_pd, timeout=boot_timeout_s)
+        except _MaxData0Overflow:
+            use_lsqr = True
+        except Exception:                                       # noqa: BLE001 — other issues handled per-replica
+            pass
+        if use_lsqr:
+            try:
+                base_inp = (cfg.hypodd_dtcc_variants["default"] if branch == "dtcc" else cfg.hypodd_dtct)
+                # isolv=2 + adaptive DAMP ONLY. Deliberately do NOT apply run_dtcc's _scale_distance_cutoffs:
+                # that lever exists to drop spatially-peripheral events for a stable *point* solution, but the
+                # bootstrap must estimate errors for EXACTLY the events the main (SVD) reloc kept — tightening
+                # cutoffs would shed an event's longer-range links and zero its n_boot (the solver method must
+                # not change which events are relocated). DAMP tuning alone conditions LSQR; full cutoffs keep
+                # every event's links, matching SVD.
+                inp_lsqr = dataclasses.replace(base_inp, isolv=2)
+                _exec_hypodd(_pd, inp_lsqr, adapt_damping=True)  # tunes DAMP, writes calibrated hypoDD.inp
+                with open(os.path.join(_pd, "hypoDD.inp")) as f:
+                    calibrated_lsqr_inp = f.read()
+            except Exception as e:                              # noqa: BLE001 — fall back to a plain isolv flip
+                print(f"  [bootstrap] LSQR damping calibration failed ({e!r}); using plain isolv flip")
+    finally:
+        shutil.rmtree(_pd, ignore_errors=True)
+
+    def _force_lsqr_inp(inp_path):                              # calibrated inp if we have it, else isolv flip
+        if calibrated_lsqr_inp is not None:
+            with open(inp_path, "w") as f:
+                f.write(calibrated_lsqr_inp)
+        else:
+            _inp_force_lsqr(inp_path)
+
+    def _xyz(rl):
+        df = sumio.read_reloc(rl)
+        for c in ("x", "y", "z"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["x", "y", "z"])
+        return {int(r.id): (float(r.x), float(r.y), float(r.z)) for r in df.itertuples()}
+
     def _one(i):
         rng = np.random.default_rng(seed + i)
         d = tempfile.mkdtemp(prefix=f"boot_{cfg.name}_{branch}_")
@@ -605,17 +676,20 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
                 s = os.path.join(bdir, a)
                 if os.path.exists(s):
                     shutil.copyfile(s, os.path.join(d, a))
+            if use_lsqr:                                         # large dt set -> calibrated LSQR (matches main)
+                _force_lsqr_inp(os.path.join(d, "hypoDD.inp"))
             with open(os.path.join(d, "event.dat"), "w") as f:
                 f.write(seeded_event_dat)
             for fn, blk in base_blocks.items():
                 _write_dt_blocks(os.path.join(d, fn), _resample_global(blk, rng))
             try:                                            # a pathological resample can fail / overflow
-                rl = _exec_hypodd_once(d, timeout=boot_timeout_s)  # ('********' overflow OR hang) -> drop
-                df = sumio.read_reloc(rl)
-                for c in ("x", "y", "z"):
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-                df = df.dropna(subset=["x", "y", "z"])
-                return {int(r.id): (float(r.x), float(r.y), float(r.z)) for r in df.itertuples()}
+                return _xyz(_exec_hypodd_once(d, timeout=boot_timeout_s))
+            except _MaxData0Overflow:                       # SVD overflow on this replica -> retry LSQR
+                try:
+                    _force_lsqr_inp(os.path.join(d, "hypoDD.inp"))
+                    return _xyz(_exec_hypodd_once(d, timeout=boot_timeout_s))
+                except (Exception, subprocess.TimeoutExpired):  # noqa: BLE001
+                    return {}
             except (Exception, subprocess.TimeoutExpired):  # noqa: BLE001
                 return {}
         finally:
