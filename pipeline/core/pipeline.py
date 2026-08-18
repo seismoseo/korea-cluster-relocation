@@ -44,7 +44,7 @@ def _count_located_events(cfg, velmodel: str) -> int:
 def run_cluster(cfg, stage_from="stations", through="dtct",
                 velmodels=("kim1983", "kim2011"), arc_velmodel="kim1983",
                 device="cpu", events=None, dtcc_variant="default", cores=None,
-                fm_velmodel=None, verbose=True) -> dict:
+                fm_velmodel=None, xcorr_resume=False, verbose=True) -> dict:
     i0, i1 = STAGES.index(stage_from), STAGES.index(through)
     todo = set(STAGES[i0:i1 + 1])
     res = {}
@@ -150,7 +150,8 @@ def run_cluster(cfg, stage_from="stations", through="dtct",
     if "xcorr" in todo:
         with _time("xcorr"):
             res["xcorr"] = xcorr.run_xcorr(cfg, velmodel=arc_velmodel, cores=cores,
-                                           xcorr_backend=getattr(cfg, "xcorr_backend", "obspy"))
+                                           xcorr_backend=getattr(cfg, "xcorr_backend", "obspy"),
+                                           resume=xcorr_resume)
         log(f"xcorr: {res['xcorr']['pairs']} pairs x {res['xcorr']['stations']} stations  "
             f"({timings['xcorr']:.1f}s)")
     if "dtcc" in todo:

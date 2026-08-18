@@ -35,9 +35,17 @@ from pipeline.core import sumio
 UNDEF = -12345.0   # SAC "header not set" sentinel
 
 
-def rereference_origins(cfg, velmodel="kim1983") -> int:
+def rereference_origins(cfg, velmodel="kim1983", skip_tol_s=0.002) -> int:
     """Rewrite every run-tree event's SAC origin (nz*) + picks (a/t0) to the
-    `<velmodel>.sum` solution. Returns the number of events re-referenced."""
+    `<velmodel>.sum` solution. Returns the number of events re-referenced.
+
+    Files whose current reference already matches the `.sum` origin within
+    `skip_tol_s` are left untouched (no write). This preserves their mtimes — which
+    both the xcorr interp disk cache and augmentation's dt.cc pair reuse depend on —
+    and makes a repeat run with the same velmodel a true no-op. Tolerance rationale:
+    a previously re-referenced SAC differs from the `.sum` origin only by the nzmsec
+    1-ms quantization (<=0.5 ms), while a genuine origin change from a re-location is
+    quantized at 0.01 s in the `.sum` — 2 ms separates the two cleanly."""
     sumdf = sumio.read_sum(config.sum_file(cfg, velmodel))
     origin_of = {int(r.id): r.time for r in sumdf.itertuples()}
 
@@ -45,13 +53,17 @@ def rereference_origins(cfg, velmodel="kim1983") -> int:
     from pipeline.core import evmap
     dir_of = evmap.dir_of_cuspid(cfg)               # canonical id -> event dir (manifest-aware)
 
-    n_ev = n_files = 0
+    n_ev = n_files = n_skip = 0
     for cusp, origin in sorted(origin_of.items()):
         eid = dir_of.get(cusp)
         if eid is None:
             print(f"[rereference] WARN cuspid {cusp} has no event dir — skipped")
             continue
         for f in glob(os.path.join(wf_root, eid, "*.sac")):
+            hdr = read(f, headonly=True)[0].stats
+            if abs((hdr.starttime - hdr.sac.b) - origin) < skip_tol_s:
+                n_skip += 1
+                continue
             tr = read(f)[0]
             s = tr.stats.sac
             ref = tr.stats.starttime - s.b          # current reference (origin)
@@ -66,6 +78,7 @@ def rereference_origins(cfg, velmodel="kim1983") -> int:
             tr.write(f, format="SAC")
             n_files += 1
         n_ev += 1
-    print(f"[rereference] {velmodel}: re-referenced {n_files} SAC across {n_ev} events "
+    print(f"[rereference] {velmodel}: re-referenced {n_files} SAC / skipped {n_skip} "
+          f"already-referenced (tol {skip_tol_s*1e3:.0f} ms) across {n_ev} events "
           f"under {wf_root}")
     return n_ev

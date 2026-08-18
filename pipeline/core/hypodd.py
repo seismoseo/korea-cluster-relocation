@@ -602,6 +602,19 @@ def _bootstrap_meta(csv_path):
     return {k: v for k, v in re.findall(r"(\w+)=(\S+)", head)}
 
 
+def _event_set_tag(bdir):
+    """(nev, evhash) of the branch dir's event.dat — cuspid-set provenance for the bootstrap
+    cache, so augmenting a cluster (event set changes) auto-invalidates cached errors."""
+    import hashlib
+    cusps = []
+    try:
+        with open(os.path.join(bdir, "event.dat")) as f:
+            cusps = sorted(ln.split()[-1] for ln in f if ln.strip())
+    except OSError:
+        pass
+    return len(cusps), hashlib.md5(",".join(cusps).encode()).hexdigest()[:8]
+
+
 def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nboot=50, cache=True):
     """Bootstrap the **relative-location uncertainty** of a HypoDD relocation by resampling the
     differential-time data and re-inverting `n` times, then summarising the per-event scatter.
@@ -631,12 +644,14 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
     if not (os.path.exists(reloc0) and os.path.exists(inp0)):
         raise FileNotFoundError(
             f"need {branch} hypoDD.reloc + hypoDD.inp in {bdir} — run that relocation stage first")
+    nev, evhash = _event_set_tag(bdir)
     if cache and os.path.exists(out_csv):
         meta = _bootstrap_meta(out_csv)
         if (meta.get("n") == str(n) and meta.get("seed") == str(seed) and meta.get("branch") == branch
                 and meta.get("align") == "median" and meta.get("ci") == "percentile2.5-97.5"
-                and meta.get("init") == "solution"):
-            return pd.read_csv(out_csv, comment="#")          # align/ci/init tags invalidate old caches
+                and meta.get("init") == "solution"
+                and meta.get("nev") == str(nev) and meta.get("evhash") == evhash):
+            return pd.read_csv(out_csv, comment="#")          # any mismatched tag invalidates the cache
 
     dt_files = ["dt.ct"] + ([cfg.hypodd_dtcc_variants["default"].cc_file] if branch == "dtcc" else [])
     base_blocks = {fn: _parse_dt_blocks(os.path.join(bdir, fn)) for fn in dt_files}
@@ -779,7 +794,8 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
     if cache:
         with open(out_csv, "w") as f:
             f.write(f"# bootstrap_errors n={n} seed={seed} branch={branch} cluster={cfg.name} "
-                    f"resample=global ci=percentile2.5-97.5 align=median init=solution\n")
+                    f"resample=global ci=percentile2.5-97.5 align=median init=solution "
+                    f"nev={nev} evhash={evhash}\n")
             out.to_csv(f, index=False)
         np.savez(os.path.join(bdir, "bootstrap_samples.npz"),
                  data=np.asarray(samp_rows, dtype=float) if samp_rows else np.empty((0, 4)))

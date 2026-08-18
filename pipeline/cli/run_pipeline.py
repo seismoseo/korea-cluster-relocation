@@ -39,6 +39,9 @@ def main():
                          "cctorch_gpu_batched, auto-falls back to obspy without a usable GPU)")
     ap.add_argument("--fm-velmodel", default=None,
                     help="velocity model whose .sum the focal_mechanism stage uses (default cfg.fm_velmodel)")
+    ap.add_argument("--xcorr-resume", action="store_true",
+                    help="skip xcorr pairs whose per-pair dt.cc files already exist "
+                         "(checkpoint restart / augmentation reuse; combine still covers all pairs)")
     args = ap.parse_args()
 
     cfg = config.load_cluster(args.cluster)
@@ -52,7 +55,7 @@ def main():
                          velmodels=velmodels, arc_velmodel=args.arc_velmodel,
                          device=args.device, events=events,
                          dtcc_variant=args.dtcc_variant, cores=args.cores,
-                         fm_velmodel=args.fm_velmodel)
+                         fm_velmodel=args.fm_velmodel, xcorr_resume=args.xcorr_resume)
 
 
 if __name__ == "__main__":

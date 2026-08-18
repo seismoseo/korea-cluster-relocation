@@ -940,8 +940,32 @@ def probe_xcorr_backend(backend):
     return backend, f"{backend} on {torch.cuda.get_device_name(0)} (torch {torch.__version__})"
 
 
-def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy") -> dict:
+def invalidate_pairs(cfg, event_ids) -> int:
+    """Delete cached per-pair dt.cc_P/dt.cc_S files touching any of `event_ids`.
+
+    Used by augmentation when an existing event's origin moved beyond tolerance after a
+    whole-cluster re-location: its cached dt.cc values reference the old origin, so its
+    pairs must recompute (a resumed run then recomputes exactly the deleted pairs).
+    Returns the number of files deleted."""
+    out = config.dtcc_dir(cfg)
+    ids = {str(e) for e in event_ids}
+    n = 0
+    for sub in ("dt.cc_P", "dt.cc_S"):
+        for f in glob(os.path.join(out, sub, f"{sub}_*")):
+            e1_e2 = os.path.basename(f)[len(sub) + 1:]          # "<e1>_<e2>"
+            if set(e1_e2.split("_")) & ids:
+                os.remove(f)
+                n += 1
+    return n
+
+
+def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy",
+              resume=False) -> dict:
     """Measure dt.cc for all event pairs and build the threshold/combined/no_main files.
+
+    `resume=True` (or env XCORR_RESUME=1) skips pairs whose per-pair dt.cc_P/dt.cc_S
+    files both exist — the checkpoint/augmentation reuse path; the >=threshold combine
+    still covers ALL pairs, so reused pairs stay in the combined output.
 
     `xcorr_backend` ∈ {"obspy" (default — current CPU baseline, NEVER removed),
     "cctorch_cpu" (PyTorch on CPU, batched), "cctorch_gpu" (PyTorch on CUDA)}.
@@ -983,13 +1007,13 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy") -> dic
     pairs = list(combinations(events, 2))
     all_pairs = pairs                              # FULL pair set — combine must cover all, even on resume
 
-    # Resume (env XCORR_RESUME=1): skip pairs whose per-pair dt.cc files already exist. Each pair's
+    # Resume (resume=True or env XCORR_RESUME=1): skip pairs whose per-pair dt.cc files already exist. Each pair's
     # P and S files are written atomically at chunk end, so they are a durable checkpoint — a crash
     # or an OOM (e.g. collateral on a shared box) costs at most the in-flight chunk; relaunching with
     # resume continues from where it stopped instead of recomputing millions of finished pairs.
     # NOTE: this reduces `pairs` to the pairs still to COMPUTE; the ≥threshold COMBINE below must
     # iterate `all_pairs` (the full set) or a resumed run would drop every reused pair's cc links.
-    if os.environ.get("XCORR_RESUME"):
+    if resume or os.environ.get("XCORR_RESUME"):
         before = len(pairs)
         pairs = [p for p in pairs
                  if not (os.path.exists(os.path.join(out_p, f"dt.cc_P_{p[0]}_{p[1]}"))
