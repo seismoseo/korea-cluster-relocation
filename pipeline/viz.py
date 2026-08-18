@@ -803,7 +803,13 @@ def plot_cluster_similarity_gather(cfg, cid=None, event_ids=None, station=None, 
     if post is None:
         post = simil._auto_post(cfg, event_ids, station)
     kept, wins, sps = simil._cluster_windows(cfg, event_ids, station, comp, bandpass, pre, post)
-    fig, ax = plt.subplots(figsize=(9, max(3.0, 0.24 * min(len(kept), max_events) + 1.0)), dpi=130)
+    # Slide-friendly aspect: keep the panel wider than tall so the wiggles stay readable when
+    # the figure is scaled onto a 16:9 page. (The old 0.24 in/trace made a ~24 in tall strip for
+    # a 97-event cluster, which shrinks to an illegible sliver.) Height is capped at 7.5 in and
+    # the per-trace spacing grows the width instead.
+    _ntr = min(len(kept), max_events)
+    _h = min(7.5, max(3.0, 0.24 * _ntr + 1.0))
+    fig, ax = plt.subplots(figsize=(13, _h), dpi=130)
     if not kept:
         ax.set_title(f"{cfg.region}{tag}: no {comp} windows at {station}"); return fig
     kept, wins, sps = kept[:max_events], wins[:max_events], sps[:max_events]
@@ -1734,7 +1740,8 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
 def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
                        frame_from="auto", mech_select="highest_quality",
                        center_on="mainshock", show_bootstrap=False,
-                       fps=4, frames=None, out_path=None, return_html=False):
+                       fps=4, frames=None, out_path=None, return_html=False,
+                       time_window=None):
     """Cumulative time-lapse animation in the **same 4-panel fault-frame layout** as
     `fault_sections`. Each frame is the running set of events with origin time ≤ t,
     where t walks from the cluster's first origin to its last in `frames` equal
@@ -1774,6 +1781,25 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
     if "time" not in d.columns or not d.time.notna().any():
         raise RuntimeError("animate_seismicity needs origin time per event — `time` column missing or all NaN")
     d = d.sort_values("time").reset_index(drop=True)
+    # Optional (start, end) restriction — for a catalog spanning several distinct episodes a
+    # single time-lapse over the whole span wastes most frames on the quiet gap between them.
+    # Pass e.g. time_window=("2020-01-01", "2023-01-01") to animate one episode at its own pace.
+    # The fault frame/orientation is still computed from the FULL event set (below), so separate
+    # per-episode animations stay in one common reference frame and remain comparable.
+    if time_window is not None:
+        t0, t1 = (pd.Timestamp(x) if x is not None else None for x in time_window)
+        # d.time may hold obspy UTCDateTime (not directly convertible by pd.to_datetime);
+        # normalise via each element's own datetime before comparing.
+        sel = pd.to_datetime(pd.Series(
+            [getattr(t, "datetime", t) for t in d.time], index=d.index))
+        keep = pd.Series(True, index=d.index)
+        if t0 is not None:
+            keep &= sel >= t0
+        if t1 is not None:
+            keep &= sel <= t1
+        d = d[keep].reset_index(drop=True)
+        if not len(d):
+            raise RuntimeError(f"animate_seismicity: no events inside time_window={time_window}")
 
     ref = _fault_ref(cfg, velmodel, mech_select=mech_select)
 

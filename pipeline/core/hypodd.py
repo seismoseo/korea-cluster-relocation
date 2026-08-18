@@ -182,6 +182,17 @@ hypoDD.res
 """
 
 
+def getattr_isolv_is_svd(d):
+    """True when the hypoDD.inp in `d` selects SVD (ISOLV=1) — the only solver that can hit
+    the compiled MAXDATA0 array limit. Used to attribute a silent iteration-1 abort."""
+    try:
+        rows = [ln for ln in open(os.path.join(d, "hypoDD.inp"), errors="replace")
+                if ln.strip() and not ln.lstrip().startswith("*")]
+        return int(rows[10].split()[1]) == 1          # row 11: ISTART ISOLV NSET
+    except Exception:
+        return False
+
+
 class _MaxData0Overflow(RuntimeError):
     """Raised when hypoDD aborts with 'STOP >>> Increase MAXDATA0' — the SVD array
     limit has been exceeded. Caught by `_exec_hypodd` to auto-fallback to LSQR."""
@@ -202,6 +213,14 @@ def _exec_hypodd_once(d, timeout=None):
     (see `bootstrap_relocation._one`). Real calls keep `timeout=None` so a slow but
     valid run is never killed mid-iteration."""
     os.makedirs(os.path.join(d, "reloc"), exist_ok=True)
+    # Remove any hypoDD.reloc left by a PREVIOUS run before launching. hypoDD's
+    # "STOP >>> Increase MAXDATA0" aborts with exit code 0 and (depending on the build)
+    # may write the message straight to the terminal rather than the captured pipes, so
+    # a stale non-empty .reloc would otherwise satisfy the freshness check below and the
+    # overflow would be silently mistaken for a successful relocation.
+    _stale = os.path.join(d, "hypoDD.reloc")
+    if os.path.exists(_stale):
+        os.remove(_stale)
     proc = subprocess.run(["hypoDD", "hypoDD.inp"], cwd=d,
                           capture_output=True, text=True, errors="replace", timeout=timeout)
     # Capture BOTH stdout and stderr into hypoDD.sum — hypoDD's STOP/ERROR messages
@@ -221,7 +240,15 @@ def _exec_hypodd_once(d, timeout=None):
         # transparently retry with LSQR. The hypoDD source prints
         # "STOP >>> Increase MAXDATA0 in hypoDD.inc..." to **stderr** on that path,
         # and may also print a related complaint on stdout.
-        if "MAXDATA0" in combined:
+        # Some hypoDD builds write the STOP straight to the controlling terminal, so it
+        # reaches neither pipe. Fall back to the log: an SVD run that aborts on the array
+        # limit stops inside ITERATION 1 (right after "1D ray tracing"), leaving a log with
+        # no completed iteration. Treat that as the same overflow so the LSQR retry fires.
+        _log = os.path.join(d, "hypoDD.log")
+        _log_txt = open(_log, errors="replace").read() if os.path.exists(_log) else ""
+        _aborted_iter1 = ("1D ray tracing" in _log_txt
+                          and "Iteration 1 finished" not in _log_txt)
+        if "MAXDATA0" in combined or (_aborted_iter1 and getattr_isolv_is_svd(d)):
             raise _MaxData0Overflow(
                 "hypoDD SVD array overflow (MAXDATA0) — dt observations exceed the "
                 "compiled SVD limit for this binary")
@@ -263,16 +290,35 @@ def _parse_iteration_cnds(log_path):
     return out
 
 
+def _UNUSED(v):
+    """Is this weighting-column value hypoDD's 'unused' sentinel?
+
+    The inp uses -9; the .log prints the same column as an unparsable blank/dash (-> None)
+    or as -999. Treat all three as one equivalence class so a logged iteration can be matched
+    back to its iter_sets row. Without this, `_max_cnd_per_set` matches nothing, the adaptive
+    LSQR damping loop breaks on `if not cnds` and DAMP is left at the SVD defaults -- i.e. LSQR
+    runs under-damped (CND >> the 40-80 band) and the cluster centroid can drift kilometres.
+    """
+    return v is None or v <= -8.5
+
+
 def _max_cnd_per_set(log_path, iter_sets, tol=0.02):
     """Worst (max) condition number per weighting set, matching each logged iteration to its
     iter_sets row by weighting signature (row cols 1..8 = WTCCP..WDCT). Returns {row_idx: max_cnd}."""
     res = {}
     for sig, cnd in _parse_iteration_cnds(log_path):
-        if any(v is None for v in sig):
-            continue
         for i, row in enumerate(iter_sets):
             rsig = [float(x) for x in row[1:9]]
-            if all(abs(a - b) <= tol + tol * abs(b) for a, b in zip(sig, rsig)):
+            ok = True
+            for a, b in zip(sig, rsig):
+                if _UNUSED(b) or _UNUSED(a):        # sentinel column: must agree on being unused
+                    if not (_UNUSED(a) and _UNUSED(b)):
+                        ok = False
+                        break
+                elif abs(a - b) > tol + tol * abs(b):
+                    ok = False
+                    break
+            if ok:
                 res[i] = max(res.get(i, 0.0), cnd)
                 break
     return res

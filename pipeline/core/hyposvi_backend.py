@@ -125,6 +125,20 @@ def _resolve_eikonet_paths(cfg):
     return p, s
 
 
+class _MetaVelocity:
+    """Minimal stand-in VelocityClass for reloading a trained EikoNet at inference: carries only
+    `projection`/`xmin`/`xmax` (all `Model._projection` + normalisation read). `.eval()` is never
+    called at inference, so the full velocity model is not needed to *use* a trained network — this
+    lets non-1-D models (e.g. the 3-D `neasia`) reload without their training grid."""
+    def __init__(self, xmin, xmax, projection):
+        self.xmin = xmin
+        self.xmax = xmax
+        self.projection = projection
+
+    def eval(self, Xp):
+        raise RuntimeError("_MetaVelocity is inference-only; the training grid is not loaded.")
+
+
 def _load_eikonet(ckpt_path, device):
     """Reconstruct an EikoNet Model from a checkpoint + its sibling eikonet_meta.json."""
     # EikoNet / HypoSVI are external clones; make them importable.
@@ -142,19 +156,27 @@ def _load_eikonet(ckpt_path, device):
             f"missing {meta_path} — the EikoNet training domain (xmin/xmax/projection/csv) "
             "is required to reconstruct the model. Re-run training with the metadata writer.")
     meta = json.load(open(meta_path))
-    csv_path = meta["csv"]
-    if not os.path.isabs(csv_path):
-        # csv may sit next to the checkpoint (model_dir) or one level up (the
-        # <velmodel> dir holding both phase subdirs). Try both.
-        base = os.path.basename(csv_path)
-        for cand in (os.path.join(model_dir, base), os.path.join(os.path.dirname(model_dir), base)):
-            if os.path.isfile(cand):
-                csv_path = cand
-                break
-        else:
-            raise RuntimeError(f"EikoNet velocity csv {base!r} not found near {model_dir}")
-    vmodel = Graded1DVelocity(csv_path, xmin=meta["xmin"], xmax=meta["xmax"],
-                              projection=meta["projection"])
+    if "csv" in meta:
+        # 1-D model: rebuild the graded velocity from its CSV.
+        csv_path = meta["csv"]
+        if not os.path.isabs(csv_path):
+            # csv may sit next to the checkpoint (model_dir) or one level up (the
+            # <velmodel> dir holding both phase subdirs). Try both.
+            base = os.path.basename(csv_path)
+            for cand in (os.path.join(model_dir, base), os.path.join(os.path.dirname(model_dir), base)):
+                if os.path.isfile(cand):
+                    csv_path = cand
+                    break
+            else:
+                raise RuntimeError(f"EikoNet velocity csv {base!r} not found near {model_dir}")
+        vmodel = Graded1DVelocity(csv_path, xmin=meta["xmin"], xmax=meta["xmax"],
+                                  projection=meta["projection"])
+    else:
+        # 3-D (or any non-1-D) model: at INFERENCE the velocity comes from the trained network,
+        # not the VelocityClass — Model only reads .projection/.xmin/.xmax (for input
+        # normalisation). So a lightweight stub carrying those from the meta is sufficient to
+        # reload the model (the full 3-D grid is only needed for training).
+        vmodel = _MetaVelocity(meta["xmin"], meta["xmax"], meta["projection"])
     model = Model(model_dir, vmodel, device=device)
     model.load(ckpt_path)
     return model, meta
@@ -297,22 +319,123 @@ def _sum_row(cuspid, loc, picks, stations):
             f"{cuspid:10d},   ,     ,  ,     ,  ,     ,  ")
 
 
+def posterior_cov(loc):
+    """Full posterior covariance (km^2) of the HypoSVI solution, for oriented error ellipses.
+
+    Uses HypoSVI's own stored `loc['Covariance']` — the 3x3 KDE covariance of the SVGD
+    particle cloud, in the EikoNet's PROJECTED km (axis order [E, N, depth]), and the SAME
+    matrix the reported ERH/ERZ derive from (err = sqrt(diag(cov)) * z_0.95). Its off-diagonals
+    give the E-N orientation and the depth<->horizontal trade-off, so a 2-D ellipse can be
+    drawn in every plane (k=2.448 for 95% joint), exactly like the HYPOINVERSE .prt covariance.
+
+    NOTE: do NOT use loc['SVGD_points'] for this — after LocateEvents HypoSVI re-projects those
+    back to lon/lat DEGREES (mixed units with depth-km), so their np.cov is meaningless.
+
+    Returns (cov_ee, cov_nn, cov_en, cov_zz, cov_ez, cov_nz); NaN if unavailable."""
+    C = loc.get("Covariance") if loc else None
+    if C is None:
+        return (np.nan,) * 6
+    C = np.asarray(C, dtype=float)
+    if C.shape != (3, 3):
+        return (np.nan,) * 6
+    return (float(C[0, 0]), float(C[1, 1]), float(C[0, 1]),
+            float(C[2, 2]), float(C[0, 2]), float(C[1, 2]))
+
+
 def _write_sum(cfg, vmname, results, stations):
-    """Write 1.HypoInv/<vmname>/<Region>.sum from located events; return its path."""
+    """Write 1.HypoInv/<vmname>/<Region>.sum from located events; return its path.
+
+    Also writes a sibling `<Region>.svicov.csv` carrying the per-event posterior covariance
+    (cov_ee/cov_nn/cov_en/cov_zz, km^2) from the SVGD particle cloud, so a comparison notebook
+    can draw oriented posterior ellipses (the .sum only stores scalar ERH/ERZ)."""
     out_dir = config.assert_writable(config.velmodel_dir(cfg, vmname))
     os.makedirs(out_dir, exist_ok=True)
     sum_path = config.sum_file(cfg, vmname)
+    cov_path = os.path.join(out_dir, f"{cfg.region}.svicov.csv")
     n = 0
+    cov_rows = ["id,cov_ee,cov_nn,cov_en,cov_zz,cov_ez,cov_nz"]
     with open(sum_path, "w") as f:
         f.write(_SUM_HEADER + "\n")
         for cuspid, loc, picks in results:
             if loc is None or not np.isfinite(loc["Hypocentre"][0]):
                 continue
             f.write(_sum_row(cuspid, loc, picks, stations) + "\n")
+            ee, nn, en, zz, ez, nz = posterior_cov(loc)
+            cov_rows.append(f"{cuspid},{ee:.6g},{nn:.6g},{en:.6g},{zz:.6g},{ez:.6g},{nz:.6g}")
             n += 1
     if n == 0:
         raise RuntimeError(f"HypoSVI located 0 events — empty .sum at {sum_path}")
+    with open(cov_path, "w") as f:
+        f.write("\n".join(cov_rows) + "\n")
     return sum_path
+
+
+# --------------------------------------------------------------- locator (load once, reuse)
+def _resolve_device(cfg):
+    """cfg.hyposvi_device wins; "auto" smoke-tests a USABLE GPU and falls back to CPU
+    (e.g. a GPU NEWER than the installed CUDA wheel, where is_available() lies)."""
+    device = getattr(cfg, "hyposvi_device", None)
+    if not device or device == "auto":
+        device = _auto_device()
+    print(f"[hyposvi] device: {device}")
+    return device
+
+
+def make_locator(cfg, device=None) -> dict:
+    """Build the HypoSVI locator ONCE: load the EikoNet P/S pair and construct the SVGD
+    object. Returns a handle reusable across many LocateEvents() calls — this is the key
+    to batch throughput (loading the EikoNet is the dominant per-call cost, so a 10k-event
+    catalog run must load it once, not once per event). See `set_region_box` + `locate_batch`."""
+    device = device or _resolve_device(cfg)
+    p_ckpt, s_ckpt = _resolve_eikonet_paths(cfg)
+    _ensure_on_path("HYPOSVI_DIR", "/path/to/HypoSVI")
+    from HypoSVI.location import HypoSVI
+    mp, meta_p = _load_eikonet(p_ckpt, device)
+    ms, _ = _load_eikonet(s_ckpt, device)
+    H = HypoSVI([mp, ms], Phases=["P", "S"], device=device)
+    # RBF kernel width: a static value (km) curbs HypoSVI's dynamic over-dispersion of the
+    # reported location uncertainty (Smith et al. 2022 sec 4.3). None keeps the dynamic default.
+    rbf_sigma = getattr(cfg, "hyposvi_rbf_sigma", None)
+    if rbf_sigma is not None:
+        H.K.sigma = float(rbf_sigma)
+    return dict(H=H, mp=mp, ms=ms, device=device, meta_p=meta_p,
+                epochs=int(getattr(cfg, "hyposvi_epochs", 175)))
+
+
+def set_region_box(loc, region_bounds, margin=0.15, zmax=25.0):
+    """Restrict the SVGD initialisation box to a region (in the EikoNet's projected km).
+
+    CRITICAL: the EikoNet is trained over all of Korea (~600x700 km), but SVGD seeds
+    particles uniformly across H.xmin..H.xmax and cannot collapse a 600 km cloud onto a
+    few-km source in ~175 steps (symptom: ±20-30 km "uncertainty", biased depth). Seed
+    the box around the target region (+ margin) so particles start near the events. For a
+    PER-EVENT batch run, call this with a tight box around each event's epicenter before
+    every locate_batch() — the box is mutated in place on the shared locator."""
+    H = loc["H"]
+    lat0, lat1, lon0, lon1 = region_bounds
+    (x0, y0) = H.projection(lon0 - margin, lat0 - margin)
+    (x1, y1) = H.projection(lon1 + margin, lat1 + margin)
+    H.xmin = [min(x0, x1), min(y0, y1), 0.0]
+    H.xmax = [max(x0, x1), max(y0, y1), float(zmax)]
+
+
+def locate_batch(loc, evts, stations, scratch_dir) -> list:
+    """Locate a batch of events with a prepared locator. Returns [(cuspid_int, location, picks)].
+
+    The caller is responsible for the SVGD box (call set_region_box first). Origin time is
+    made self-consistent (org = pick - TT(hyp)) without touching the hypocentre."""
+    H, mp, ms, device = loc["H"], loc["mp"], loc["ms"], loc["device"]
+    os.makedirs(scratch_dir, exist_ok=True)
+    H.LocateEvents(evts, stations, scratch_dir, epochs=loc["epochs"])
+    results = []
+    for cuspid_str, ev in evts.items():
+        L = ev.get("location")
+        if L is not None and np.isfinite(L["Hypocentre"][0]):
+            ot = _consistent_origin_time(L["Hypocentre"], ev["Picks"], mp, ms, device)
+            if ot is not None:
+                L["OriginTime"] = str(ot)                # self-consistent OT (hypocentre unchanged)
+        results.append((int(cuspid_str), L, ev["Picks"]))
+    return results
 
 
 # --------------------------------------------------------------- driver
@@ -323,61 +446,19 @@ def run_hyposvi(cfg, velmodels=None) -> dict:
     The EikoNet pair already encodes one velocity model; we write the .sum under
     each requested velmodel name (default: the meta's velmodel) so downstream
     stages that key off a specific velmodel name find it. Returns {vmname: sum_path}."""
-    # Device: cfg.hyposvi_device wins; otherwise auto-detect a USABLE GPU (HypoSVI/EikoNet are
-    # pure torch, so the SVGD locate is far faster on CUDA). "auto" smoke-tests the GPU and
-    # falls back to CPU if torch can't actually run on it — e.g. a GPU NEWER than the installed
-    # CUDA wheel (RTX PRO 6000 Blackwell = sm_120 on a PyTorch that tops out at sm_90), where
-    # torch.cuda.is_available() is True but every kernel raises "no kernel image available".
-    device = getattr(cfg, "hyposvi_device", None)
-    if not device or device == "auto":
-        device = _auto_device()
-    print(f"[hyposvi] device: {device}")
-    epochs = int(getattr(cfg, "hyposvi_epochs", 175))
-    p_ckpt, s_ckpt = _resolve_eikonet_paths(cfg)
-
-    _ensure_on_path("HYPOSVI_DIR", "/path/to/HypoSVI")
-    from HypoSVI.location import HypoSVI
-
-    mp, meta_p = _load_eikonet(p_ckpt, device)
-    ms, _ = _load_eikonet(s_ckpt, device)
-
+    loc = make_locator(cfg)
     stations = _stations_df(cfg)
-    evts, idmap = _events_dict(cfg)
+    evts, _idmap = _events_dict(cfg)
     if not evts:
         raise RuntimeError("HypoSVI: no events with picks found under waveforms dir.")
-
-    H = HypoSVI([mp, ms], Phases=["P", "S"], device=device)
-
-    # CRITICAL: restrict the SVGD initialisation box to the cluster region. The
-    # EikoNet is trained over all of Korea (~600x700 km) so it's reusable, but
-    # HypoSVI seeds particles uniformly across H.xmin..H.xmax — and SVGD cannot
-    # collapse a 600 km-wide particle cloud onto a few-km cluster in ~175 steps
-    # (symptom: ±20-30 km horizontal "uncertainty", depth biased). Re-seed the box
-    # to the cluster's region_bounds (+ a margin) in the EikoNet's projected km, so
-    # particles start near the events and converge. The EikoNet stays valid over
-    # the sub-box. Depth search 0..hyposvi_depth_max km (default 25).
-    lat0, lat1, lon0, lon1 = cfg.region_bounds
-    margin = float(getattr(cfg, "hyposvi_box_margin_deg", 0.15))
-    (x0, y0) = H.projection(lon0 - margin, lat0 - margin)
-    (x1, y1) = H.projection(lon1 + margin, lat1 + margin)
-    zmax = float(getattr(cfg, "hyposvi_depth_max_km", 25.0))
-    H.xmin = [min(x0, x1), min(y0, y1), 0.0]
-    H.xmax = [max(x0, x1), max(y0, y1), zmax]
-
+    set_region_box(loc, cfg.region_bounds,
+                   margin=float(getattr(cfg, "hyposvi_box_margin_deg", 0.15)),
+                   zmax=float(getattr(cfg, "hyposvi_depth_max_km", 25.0)))
     out_scratch = os.path.join(config.hyp_dir(cfg), "_hyposvi")
-    os.makedirs(out_scratch, exist_ok=True)
-    H.LocateEvents(evts, stations, out_scratch, epochs=epochs)
-
-    results = []
-    for cuspid_str, ev in evts.items():
-        loc = ev.get("location")
-        if loc is not None and np.isfinite(loc["Hypocentre"][0]):
-            ot = _consistent_origin_time(loc["Hypocentre"], ev["Picks"], mp, ms, device)
-            if ot is not None:
-                loc["OriginTime"] = str(ot)              # self-consistent OT (hypocentre unchanged)
-        results.append((idmap[cuspid_str], loc, ev["Picks"]))
+    results = locate_batch(loc, evts, stations, out_scratch)
 
     # Which velocity-model name(s) to write the .sum under.
+    meta_p = loc["meta_p"]
     if velmodels is None:
         names = [meta_p.get("velmodel")] if meta_p.get("velmodel") else [v.name for v in cfg.velocity_models]
     else:

@@ -17,4 +17,8 @@ CONFIG = kma_cluster(
 )
 
 # AI-pick-probability HypoInverse weighting (PocketQuake v1.0.0+ default).
-CONFIG = replace(CONFIG, phs_weight_scheme="probability")
+# Set the .phs weight code (column 18) from the PhaseNet+ pick probability instead of
+# epicentral-distance bins -- the picker's own confidence is a more direct measure of
+# pick quality than distance. To revert to the source-cluster behavior, change to
+# `phs_weight_scheme="distance"`.
+CONFIG = replace(CONFIG, phs_weight_scheme="probability", loc_backend="hyposvi", reloc_backend="relocdd_py")

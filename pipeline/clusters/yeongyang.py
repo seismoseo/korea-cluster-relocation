@@ -10,8 +10,8 @@ CONFIG = mixed_cluster(
     name="yeongyang",
     region="Yeongyang",
     src_root=os.path.join(config.PROJECT_ROOT, "Yeongyang_cluster"),
-    epicenter=(36.767, 129.036),
-    region_bounds=(36.56, 36.97, 128.83, 129.24),
+    epicenter=(36.601, 129.076),
+    region_bounds=(36.39, 36.81, 128.87, 129.29),
     station_masters=("KS_station.csv", "KG_station.csv",),
     dtct_isolv=1,
 )
@@ -21,4 +21,4 @@ CONFIG = mixed_cluster(
 # epicentral-distance bins -- the picker's own confidence is a more direct measure of
 # pick quality than distance. To revert to the source-cluster behavior, change to
 # `phs_weight_scheme="distance"`.
-CONFIG = replace(CONFIG, phs_weight_scheme="probability")
+CONFIG = replace(CONFIG, phs_weight_scheme="probability", loc_backend="hyposvi", reloc_backend="relocdd_py")
