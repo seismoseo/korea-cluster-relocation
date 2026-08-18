@@ -666,9 +666,12 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
     # Per-replica wall-clock cap. A direct HypoDD inversion of a calibrated cluster runs in
     # seconds; some bootstrap resamples land on rank-deficient dt subsets where LSQR enters
     # an infinite damping loop. Without a cap, one such replica pins a worker thread forever
-    # and the whole bootstrap stalls. 120 s is ~50× the expected-good time for the largest
-    # cluster we run, so this only fires on the genuinely pathological cases the existing
-    # `except Exception: return {}` clause is already designed to absorb.
+    # and the whole bootstrap stalls. The cap must NOT be a fixed constant: on a heavily
+    # oversubscribed shared box a perfectly healthy replica can run many times slower than
+    # normal (observed: 41-event replicas at ~150 s under load ~176/64, silently zeroing
+    # n_boot for every event when the cap was a fixed 120 s). The un-resampled probe below
+    # is timed and the replica cap set to ~5× it (floor 120 s, ceiling 3600 s) — pathological
+    # resamples still die quickly relative to the machine's actual speed.
     boot_timeout_s = 120
     # When the seeded (converged) start packs more dt within the distance cutoffs than the raw-catalog
     # main run, the SVD array overflows MAXDATA0 here even if the main run fit SVD. Then every replica
@@ -691,12 +694,17 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
             f.write(seeded_event_dat)
         for fn, blk in base_blocks.items():
             _write_dt_blocks(os.path.join(_pd, fn), blk)        # un-resampled probe
+        import time as _time
+        _t_probe = _time.time()
         try:
-            _exec_hypodd_once(_pd, timeout=boot_timeout_s)
+            # generous probe cap: the probe is the calibrated, un-resampled set (already
+            # converged in the main run), so it cannot hit the resample pathology
+            _exec_hypodd_once(_pd, timeout=1800)
         except _MaxData0Overflow:
             use_lsqr = True
         except Exception:                                       # noqa: BLE001 — other issues handled per-replica
             pass
+        _probe_s = _time.time() - _t_probe
         if use_lsqr:
             try:
                 base_inp = (cfg.hypodd_dtcc_variants["default"] if branch == "dtcc" else cfg.hypodd_dtct)
@@ -707,11 +715,16 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
                 # not change which events are relocated). DAMP tuning alone conditions LSQR; full cutoffs keep
                 # every event's links, matching SVD.
                 inp_lsqr = dataclasses.replace(base_inp, isolv=2)
+                _t_cal = _time.time()
                 _exec_hypodd(_pd, inp_lsqr, adapt_damping=True)  # tunes DAMP, writes calibrated hypoDD.inp
+                _probe_s = max(_probe_s, _time.time() - _t_cal)  # LSQR path: calibration is the speed reference
                 with open(os.path.join(_pd, "hypoDD.inp")) as f:
                     calibrated_lsqr_inp = f.read()
             except Exception as e:                              # noqa: BLE001 — fall back to a plain isolv flip
                 print(f"  [bootstrap] LSQR damping calibration failed ({e!r}); using plain isolv flip")
+        boot_timeout_s = max(120.0, min(3600.0, 5 * _probe_s))
+        print(f"  [bootstrap] {branch}: replica timeout {boot_timeout_s:.0f}s "
+              f"(machine-speed probe {_probe_s:.0f}s)", flush=True)
     finally:
         shutil.rmtree(_pd, ignore_errors=True)
 
