@@ -1343,7 +1343,7 @@ def _center_row(cfg, d, ref, prefer):
 
 
 def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
-                   frame_from="auto", mech_select="highest_quality",
+                   frame_from="svd", mech_select="highest_quality",
                    center_on="mainshock", show_bootstrap=False,
                    drop_underconstrained=True, flag_underconstrained=False, lim_km=None,
                    point_colors=None, legend_handles=None,
@@ -1355,10 +1355,18 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     Orientation precedence:
       1. Explicit `strike` + `dip` args (always win).
       2. `frame_from` controls the automatic choice:
-         - "auto" (default): use the mainshock's nodal plane (NP1 or its auxiliary, whichever
+         - "svd" (**default** since v1.14.0): always use the SVD best-fit plane of the
+           relocated cloud. The section frame is then a property of the relocation itself —
+           every event constrains it, it needs no focal mechanism, and it does not inherit the
+           grade/size limitations of one reference event. The reference beachball is still
+           drawn on the map panel, so the mechanism-vs-seismicity comparison stays visible.
+           Caveat: for a near-equant cloud the SVD strike is weakly determined (compare the
+           along-/across-strike extents printed in the title); prefer "auto" or explicit
+           `strike=`/`dip=` there.
+         - "auto": use the mainshock's nodal plane (NP1 or its auxiliary, whichever
            is closer to the SVD strike — i.e. the plane that matches the seismicity elongation)
            when a high-confidence mechanism is available; otherwise fall back to SVD.
-         - "svd": always use the SVD best-fit plane (the v1.1.1 default behavior).
+           (The pre-v1.14.0 default.)
          - "mechanism": always use the mainshock's nodal plane (raises if no mechanism).
 
     `mech_select` controls which mechanism is treated as the "reference" — see `_fault_ref`.
@@ -1738,7 +1746,7 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
 
 
 def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
-                       frame_from="auto", mech_select="highest_quality",
+                       frame_from="svd", mech_select="highest_quality",
                        center_on="mainshock", show_bootstrap=False,
                        fps=4, frames=None, out_path=None, return_html=False,
                        time_window=None):
@@ -2335,15 +2343,17 @@ def _ellipsoid_points(center, samples, ngrid=14):
     return (sph * (r * np.sqrt(vals))) @ vecs.T + np.asarray(center, float)
 
 
-def plot_3d_plane(cfg, velmodel=None, color_by="time", error="bars", frame_from="auto",
+def plot_3d_plane(cfg, velmodel=None, color_by="time", error="bars", frame_from="svd",
                   mech_select="highest_quality"):
     """Interactive 3-D view (**plotly**) of the dt.cc-relocated hypocentres with a fault plane
     overlaid as a translucent patch — rotate/zoom in a notebook. Returns a plotly Figure.
 
     Hypocentres: relative E–N–depth (km), sized by magnitude. `frame_from` controls the plane:
-      - "auto" (default): mainshock's nodal plane through the mainshock hypocentre when a
+      - "svd" (**default** since v1.14.0): SVD best-fit plane through the cloud centroid —
+        a property of the relocation itself, constrained by every event and independent of
+        any focal mechanism.
+      - "auto": mainshock's nodal plane through the mainshock hypocentre when a
         high-confidence mechanism exists; otherwise the SVD plane through the cloud centroid.
-      - "svd": SVD best-fit plane through the cloud centroid (the v1.1.1 default).
       - "mechanism": mainshock's nodal plane through the mainshock hypocentre (raises if no
         mechanism, or the mainshock isn't in the reloc).
 
