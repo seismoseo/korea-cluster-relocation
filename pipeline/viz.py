@@ -1706,7 +1706,32 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
     # markers are coloured by `point_colors` (no meaningful continuous scale then).
     if point_colors is None:
         sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
-        cbar = fig.colorbar(sm, ax=axes.tolist(), shrink=0.85)
+        # Dedicated colourbar axis whose vertical extent is taken from the panel block's own
+        # bounding box, so the bar's top/bottom line up EXACTLY with the panels. (Letting
+        # colorbar(ax=...) place it leaves it slightly short and, under constrained_layout,
+        # free to shift as panel content changes.)
+        fig.canvas.draw()
+        try:                       # freeze the solved panel geometry before adding the bar
+            fig.set_layout_engine("none")
+        except AttributeError:     # matplotlib < 3.6
+            fig.set_constrained_layout(False)
+        # Freezing the engine also freezes the suptitle's reserved space, so shrink the
+        # panel block downward to keep a header band clear (otherwise the title, set after
+        # this point, overprints the top row of panels).
+        _bb0 = mpl.transforms.Bbox.union([a.get_position() for a in axes])
+        # Two-line title + panel titles need a header band; the title itself is written as
+        # fixed figure text below (a real suptitle cannot reserve space once the layout
+        # engine is frozen).
+        _hdr = 0.085
+        if _bb0.y1 > 1 - _hdr:
+            _sy = (1 - _hdr - _bb0.y0) / _bb0.height
+            for _a in axes:
+                _p = _a.get_position()
+                _a.set_position([_p.x0, _bb0.y0 + (_p.y0 - _bb0.y0) * _sy,
+                                 _p.width, _p.height * _sy])
+        _bb = mpl.transforms.Bbox.union([a.get_position() for a in axes])
+        cax = fig.add_axes([_bb.x1 + 0.015, _bb.y0, 0.018, _bb.height])
+        cbar = fig.colorbar(sm, cax=cax)
         cbar.set_label(cbar_label)
         if color_by == "time":
             ticks = np.linspace(norm.vmin, norm.vmax, 5)
@@ -1738,10 +1763,13 @@ def fault_sections(cfg, velmodel=None, strike=None, dip=None, color_by="time",
         ctxt = "  •  centred on cloud centroid"
     srtxt = ("  •  circles = source radius to scale" + (f" ({source_label})" if source_label else "")
              if _circ_km is not None else "")
-    fig.suptitle(f"{cfg.region} — relocated seismicity in fault coordinates ({branch}){btxt}\n"
-                 f"section: strike {used_strike:.0f}°, dip {used_dip:.0f}° [{used_source}]"
-                 f"{fmtxt}{ctxt}{srtxt}",
-                 fontsize=13)
+    _title = (f"{cfg.region} — relocated seismicity in fault coordinates ({branch}){btxt}\n"
+              f"section: strike {used_strike:.0f}°, dip {used_dip:.0f}° [{used_source}]"
+              f"{fmtxt}{ctxt}{srtxt}")
+    if point_colors is None:            # layout frozen for the colourbar -> fixed-position text
+        fig.text(0.5, 0.995, _title, fontsize=13, ha="center", va="top")
+    else:
+        fig.suptitle(_title, fontsize=13)
     return fig
 
 
@@ -1990,6 +2018,53 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
     for _lbl in ax_tm.get_xticklabels():
         _lbl.set_rotation(0)
 
+    # Origin-time colourbar spanning the four section panels — the scatter colour is the
+    # only encoding of WHEN each event happened, so without it the animation's central
+    # variable is unlabelled.
+    #
+    # It sits on a dedicated axis placed from the panel block's own bounding box, added
+    # AFTER the layout engine is frozen. Two reasons: the bar then lines up exactly with
+    # the panels' top and bottom, and it cannot drift between frames — constrained_layout
+    # re-solves the geometry on every draw, which made the bar visibly wander during the
+    # animation while the panel content changed.
+    fig.canvas.draw()
+    try:
+        fig.set_layout_engine("none")
+    except AttributeError:                       # matplotlib < 3.6
+        fig.set_constrained_layout(False)
+    # Reserve a header band for the 3-line frame title (written as fixed figure text in
+    # _update — a real suptitle can no longer claim space once the engine is frozen, and
+    # without this band the title overprints the top panels' titles). ALL axes, the
+    # time-magnitude strip included, are scaled down into the remaining space.
+    _all_ax = list(axes) + [ax_tm]
+    _bb0 = mpl.transforms.Bbox.union([a.get_position() for a in _all_ax])
+    _hdr = 0.075
+    if _bb0.y1 > 1 - _hdr:
+        _sy = (1 - _hdr - _bb0.y0) / _bb0.height
+        for _a in _all_ax:
+            _p = _a.get_position()
+            _a.set_position([_p.x0, _bb0.y0 + (_p.y0 - _bb0.y0) * _sy,
+                             _p.width, _p.height * _sy])
+    _sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    _sm.set_array([])
+    _bb = mpl.transforms.Bbox.union([a.get_position() for a in axes])
+    # Shrink the panel block to free a right-hand gutter, then put the bar in it — adding
+    # the bar outside the existing block would push it off the canvas (the panels already
+    # reach the figure edge under constrained_layout).
+    _cbw, _gap, _lab = 0.016, 0.012, 0.085       # bar width, gap, room for dated ticks
+    _sx = (_bb.width - (_cbw + _gap + _lab)) / _bb.width
+    for _a in axes:
+        _p = _a.get_position()
+        _a.set_position([_bb.x0 + (_p.x0 - _bb.x0) * _sx, _p.y0,
+                         _p.width * _sx, _p.height])
+    _cax = fig.add_axes([_bb.x0 + _bb.width * _sx + _gap, _bb.y0, _cbw, _bb.height])
+    _cb = fig.colorbar(_sm, cax=_cax)
+    _cb.set_label("Origin time", fontsize=11)
+    _cb_ticks = np.linspace(norm.vmin, norm.vmax, 5)
+    _cb.set_ticks(_cb_ticks)
+    _cb.set_ticklabels([mdates.num2date(t).strftime("%Y-%m-%d") for t in _cb_ticks])
+    _cb.ax.tick_params(labelsize=9)
+
     # Frame timeline + suptitle. d.time is obspy.UTCDateTime per cluster (not pandas);
     # normalise via the .datetime attribute (or .to_pydatetime() if pandas Timestamp).
     def _as_py(t):
@@ -2003,7 +2078,11 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
     span = t_max - t_min if t_max != t_min else (t_max - t_min)
     frame_times = [t_min + (t_max - t_min) * (i / max(frames - 1, 1)) for i in range(frames)]
 
-    title_text = fig.suptitle("", fontsize=13)
+    # Fixed-position title: the text changes every frame (clock + event count), and a real
+    # suptitle would let that re-flow the whole figure under constrained_layout — which
+    # made the panels and colourbar visibly jitter through the animation. Anchoring it in
+    # figure coordinates keeps every frame's geometry byte-identical.
+    title_text = fig.text(0.5, 0.985, "", fontsize=13, ha="center", va="top")
     fmtxt = (f"   |   mechanism {ref['strike']:.0f}°/{ref['dip']:.0f}° ({ref['quality']})"
              if ref else "")
 
@@ -2046,7 +2125,24 @@ def animate_seismicity(cfg, velmodel=None, *, strike=None, dip=None,
     if out_path is None:
         os.makedirs(cfg.output_root, exist_ok=True)
         out_path = os.path.join(cfg.output_root, f"{cfg.name}_seismicity.gif")
-    anim.save(out_path, writer=PillowWriter(fps=fps))
+    # Render the frames ourselves and quantise them against ONE shared palette.
+    # PillowWriter quantises every frame independently (per-frame adaptive palettes +
+    # dithering), so static regions — the colourbar gradient, axes, title band — re-dither
+    # differently frame to frame and visibly shimmer in the loop; a post-hoc re-encode
+    # cannot undo that damage. Capturing raw RGB straight off the canvas and quantising
+    # all frames with the last frame's palette (the cumulative animation's superset of
+    # colours) makes every static pixel byte-identical across frames.
+    from PIL import Image as _PILImage
+    _rgb = []
+    for _i in range(frames):
+        _update(_i)
+        fig.canvas.draw()
+        _buf = np.asarray(fig.canvas.buffer_rgba())
+        _rgb.append(_PILImage.fromarray(_buf[..., :3].copy()))
+    _pal = _rgb[-1].quantize(colors=255, method=_PILImage.MEDIANCUT)
+    _q = [f.quantize(palette=_pal, dither=_PILImage.Dither.NONE) for f in _rgb]
+    _q[0].save(out_path, save_all=True, append_images=_q[1:],
+               duration=int(1000 / fps), loop=0, optimize=False)
     print(f"wrote {out_path}  ({frames} frames at {fps} fps, {frames/fps:.1f} s)")
 
     if return_html:
