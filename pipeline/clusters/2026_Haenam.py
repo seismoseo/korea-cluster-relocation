@@ -14,6 +14,7 @@ CONFIG = kma_cluster(
     region_bounds=(34.46, 34.87, 126.2, 126.61),
     station_masters=("KS_station.csv",),
     dtct_isolv=1,
+    mainshock_event_id="20260821192129",
 )
 
 # AI-pick-probability HypoInverse weighting (PocketQuake v1.0.0+ default).
@@ -22,3 +23,21 @@ CONFIG = kma_cluster(
 # pick quality than distance. To revert to the source-cluster behavior, change to
 # `phs_weight_scheme="distance"`.
 CONFIG = replace(CONFIG, phs_weight_scheme="probability")
+
+# Bootstrap/xcorr worker count. The template default is 10, which on this 64-core box
+# left ~50 cores idle through a 1000-replica bootstrap. 24 keeps well clear of the
+# other jobs sharing the machine (load has been ~28) while cutting the bootstrap
+# wall-clock proportionally.
+CONFIG = replace(CONFIG, num_cores=24)
+
+
+from dataclasses import replace
+CONFIG = replace(CONFIG, xcorr_pair_overrides={
+    # BOTH mainshocks share ONE key. _window() matches with a set intersection
+    # (`if s & set(key)`), so this applies to every pair either event takes part in --
+    # including the M3.1-M2.7 pair itself. A wider band and longer window suit their
+    # larger, longer sources; the rest of the cluster keeps the default.
+    frozenset({"20260821192129",      # M2.7  2026-08-22 04:21:29 KST
+               "20260822214301"}):    # M3.1  2026-08-23 06:43:01 KST
+        dict(pre=0.05, post=0.05, bandpass=(1, 40)),
+})
