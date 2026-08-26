@@ -32,11 +32,23 @@ from matplotlib.figure import Figure  # noqa: E402
 from pipeline import config, viz  # noqa: E402
 from pipeline.core import sumio  # noqa: E402
 
-_TECTONIC = (
-    os.environ.get("TECTONIC_BIN")
-    or shutil.which("tectonic")
-    or "/home/msseo/miniforge3/envs/tex/bin/tectonic"
-)
+def _find_tectonic():
+    """$TECTONIC_BIN -> PATH -> known conda tex-env locations that actually exist.
+
+    The last-resort path used to be a hard-coded dev-machine string; on other
+    machines it silently produced a nonexistent binary and a confusing subprocess
+    error (github issue #1). Now only existing candidates are returned, and the
+    caller gets a clear message when none is found."""
+    cand = [os.environ.get("TECTONIC_BIN"), shutil.which("tectonic"),
+            os.path.expanduser("~/miniforge3/envs/tex/bin/tectonic"),
+            os.path.expanduser("~/miniconda3/envs/tex/bin/tectonic")]
+    for c in cand:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+_TECTONIC = _find_tectonic()
 
 
 def _pq_version():
@@ -334,6 +346,10 @@ def make_run_summary(cluster, velmodel="kim1983", fm_velmodel=None,
     print(f"[summary] wrote {tex_path} ({len(slides)} figure slides"
           f"{', +animation' if anim else ''}); compiling with tectonic ...")
 
+    if _TECTONIC is None:
+        print("[summary] tectonic not found (set $TECTONIC_BIN or install tectonic) "
+              "-- skipping PDF compile; the .tex is written")
+        return tex_path
     r = subprocess.run([_TECTONIC, os.path.basename(tex_path)], cwd=summ,
                        capture_output=True, text=True)
     pdf_path = os.path.join(summ, f"{cluster}_summary.pdf")
