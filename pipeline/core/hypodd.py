@@ -615,6 +615,12 @@ def _event_set_tag(bdir):
     return len(cusps), hashlib.md5(",".join(cusps).encode()).hexdigest()[:8]
 
 
+# Probe wall-clock above which the bootstrap abandons SVD for adaptive-damped LSQR.
+# A calibrated small-cluster SVD probe runs in seconds; 30 s means the replicas would
+# cost hours, and LSQR gives the same error bars for this purpose at a fraction of it.
+_SVD_PROBE_SLOW_S = 30.0
+
+
 def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nboot=50, cache=True):
     """Bootstrap the **relative-location uncertainty** of a HypoDD relocation by resampling the
     differential-time data and re-inverting `n` times, then summarising the per-event scatter.
@@ -705,6 +711,23 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
         except Exception:                                       # noqa: BLE001 — other issues handled per-replica
             pass
         _probe_s = _time.time() - _t_probe
+        # SLOW SVD IS AS FATAL AS AN OVERFLOWING ONE, JUST QUIETLY.
+        #
+        # use_lsqr used to be set only on _MaxData0Overflow. But SVD is dense and
+        # scales ~O(n_events^3): on a 56-event / 80k-dt dt.ct branch the probe takes
+        # ~280 s, so 1000 replicas on 10 workers is 7.8 HOURS -- while the dt.cc
+        # branch, which runs LSQR, does the same 1000 replicas in 7 MINUTES. Same
+        # cluster, same machine, 64x apart, purely from the solver.
+        #
+        # So switch on COST as well as on failure. The threshold is generous (a
+        # healthy small-cluster SVD probe is a few seconds) and the switch reuses the
+        # SAME adaptive-damping calibration the overflow path uses -- a naive isolv
+        # 1->2 flip would leave SVD's tiny DAMP and drop weakly-tied events.
+        if not use_lsqr and _probe_s > _SVD_PROBE_SLOW_S:
+            print(f"  [bootstrap] SVD probe took {_probe_s:.0f} s (> {_SVD_PROBE_SLOW_S} s): "
+                  f"{n} replicas would cost ~{_probe_s*n/max(int(cores or 4),1)/3600:.1f} h. "
+                  f"Switching to adaptive-damped LSQR for the replicas.")
+            use_lsqr = True
         if use_lsqr:
             try:
                 base_inp = (cfg.hypodd_dtcc_variants["default"] if branch == "dtcc" else cfg.hypodd_dtct)
