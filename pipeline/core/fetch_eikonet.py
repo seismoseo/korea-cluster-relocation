@@ -107,9 +107,21 @@ def main(argv=None):
     vms = _bundled_velmodels() if args.velmodel == "all" else [args.velmodel]
     if not vms:
         raise SystemExit("no bundled EikoNet velocity models found (need eikonet_<vm>/ dirs with meta.json)")
+    ok, missing = [], []
     for vm in vms:
-        fetch(vm, repo=args.repo, tag=args.tag, force=args.force)
-    print(f"[fetch_eikonet] done: {', '.join(vms)}")
+        try:
+            fetch(vm, repo=args.repo, tag=args.tag, force=args.force)
+            ok.append(vm)
+        except subprocess.CalledProcessError:
+            # A bundled model dir without release assets (e.g. the 3-D `neasia` grid,
+            # whose weights are not published) must not fail the whole 'all' fetch --
+            # kim1983/kim2011 are what the pipeline needs (github issue reports).
+            if args.velmodel != "all":
+                raise
+            missing.append(vm)
+            print(f"[fetch_eikonet] WARN: no release asset for '{vm}' at {args.repo}@{args.tag} -- skipped")
+    print(f"[fetch_eikonet] done: {', '.join(ok)}"
+          + (f"   (skipped, no assets: {', '.join(missing)})" if missing else ""))
 
 
 if __name__ == "__main__":
