@@ -62,11 +62,30 @@ def gather_event(cfg, used_table, ev) -> list[str]:
     written = []
     for sensor in cfg.sensor_priority:
         pat = stations.wf_glob(cfg, sensor, "*", layout=layout)
+        # Group raw files by destination channel FIRST. NECIS event archives can split
+        # one station-channel into MULTIPLE segment files (e.g. -120..+301 s covering
+        # the event, plus a +300..+350 s tail); the old per-file loop wrote them all to
+        # the SAME destination, so the LAST segment silently overwrote the one holding
+        # the event -- healthy stations then "disappeared" downstream (observed on
+        # 2026_Haenam event 20260815183944: 15 stations reduced to +300 s fragments).
+        # Now: of the candidate segments, keep the one that covers the origin; if none
+        # does, keep the longest.
+        by_chan = {}
         for src in glob(os.path.join(raw_dir, pat)):
             net, code, chan = stations.parse_sac_name(cfg, os.path.basename(src), layout=layout)
             if sensor_of.get(code) != sensor:
                 continue
-            tr = read(src)[0]
+            by_chan.setdefault((net, code, chan), []).append(src)
+        for (net, code, chan), srcs in by_chan.items():
+            if len(srcs) > 1:
+                def _score(f):
+                    st = read(f, headonly=True)[0].stats
+                    covers = st.starttime <= o and st.endtime > o
+                    return (covers, float(st.endtime - st.starttime))
+                srcs = sorted(srcs, key=_score)
+                print(f"  [gather] {code}.{chan}: {len(srcs)} segments -> using "
+                      f"{os.path.basename(srcs[-1])}")
+            tr = read(srcs[-1])[0]
             s = tr.stats.sac
             s.evla, s.evlo = ev["lat"], ev["lon"]
             s.stla, s.stlo = coord_of[code]
