@@ -24,25 +24,38 @@ from pipeline.core import stations
 
 # ------------------------------------------------------------------- catalog
 def load_catalog(cfg) -> list[dict]:
-    """KMA catalog rows -> [{event_id, origin(UTC), lat, lon, depth, mag, index}].
+    """Catalog rows -> [{event_id, origin(UTC), lat, lon, depth, mag, index}].
 
-    Column names vary by cluster (Year vs year, BOM, ...) so they're normalised.
-    origin_utc = catalog time (KST) - kst_offset_hours.
+    Two formats (column names are normalised: case, BOM, spaces):
+      - KMA: Year,Month,Day,Hour,Minute,Second (local time); origin_utc = local - kst_offset_hours.
+      - UTC: an ISO 8601 `time` column (e.g. USGS `2015-10-19T23:21:17.680Z`), used as is, with
+        `magnitude` or `mag`.
+    event_id is the origin's UTC second, YYYYMMDDHHMMSS (= the raw archive's event-dir name).
     """
     df = pd.read_csv(cfg.event_catalog_csv, encoding="utf-8-sig")
     df.columns = [c.strip().lower() for c in df.columns]
+    iso = "time" in df.columns and "year" not in df.columns
+    mag_col = "magnitude" if "magnitude" in df.columns else "mag"
     out = []
     for i, r in df.iterrows():
-        kst = UTCDateTime(int(r["year"]), int(r["month"]), int(r["day"]),
-                          int(r["hour"]), int(r["minute"]), int(r["second"]))
-        origin = kst - cfg.kst_offset_hours * 3600
+        if iso:
+            origin = UTCDateTime(str(r["time"]))
+        else:
+            kst = UTCDateTime(int(r["year"]), int(r["month"]), int(r["day"]),
+                              int(r["hour"]), int(r["minute"]), int(r["second"]))
+            origin = kst - cfg.kst_offset_hours * 3600
         out.append(dict(
             event_id=origin.strftime("%Y%m%d%H%M%S"),
             origin=origin,
             lat=float(r["latitude"]), lon=float(r["longitude"]),
-            depth=float(r["depth"]), mag=float(r["magnitude"]),
+            depth=float(r["depth"]), mag=float(r[mag_col]),
             index=int(i),
         ))
+    from collections import Counter
+    dup = sorted(k for k, n in Counter(e["event_id"] for e in out).items() if n > 1)
+    if dup:
+        print(f"[{cfg.name}] WARNING: {len(dup)} event_id(s) shared by events in the same UTC second "
+              f"(they share one waveform dir): {dup[:5]}")
     return out
 
 
@@ -56,8 +69,10 @@ def gather_event(cfg, used_table, ev) -> list[str]:
     out_dir = config.assert_writable(config.event_wf_dir(cfg, ev["event_id"]))
     os.makedirs(out_dir, exist_ok=True)
 
-    sensor_of = dict(zip(used_table["Code"], used_table["Sensor"]))
-    coord_of = {r.Code: (r.Latitude, r.Longitude) for r in used_table.itertuples()}
+    # stations are (Network, Code): the same code in two networks is two stations (KS.CHS, KG.CHS)
+    key = stations.station_key(used_table)
+    sensor_of = dict(zip(zip(used_table["Network"], used_table["Code"]), used_table["Sensor"]))
+    coord_of = {(r.Network, r.Code): (r.Latitude, r.Longitude) for r in used_table.itertuples()}
     o = ev["origin"]
     written = []
     for sensor in cfg.sensor_priority:
@@ -73,7 +88,8 @@ def gather_event(cfg, used_table, ev) -> list[str]:
         by_chan = {}
         for src in glob(os.path.join(raw_dir, pat)):
             net, code, chan = stations.parse_sac_name(cfg, os.path.basename(src), layout=layout)
-            if sensor_of.get(code) != sensor:
+            k = key(net, code)
+            if k is None or sensor_of.get(k) != sensor:
                 continue
             by_chan.setdefault((net, code, chan), []).append(src)
         for (net, code, chan), srcs in by_chan.items():
@@ -88,7 +104,7 @@ def gather_event(cfg, used_table, ev) -> list[str]:
             tr = read(srcs[-1])[0]
             s = tr.stats.sac
             s.evla, s.evlo = ev["lat"], ev["lon"]
-            s.stla, s.stlo = coord_of[code]
+            s.stla, s.stlo = coord_of[key(net, code)]
             s.nzyear, s.nzjday = o.year, o.julday
             s.nzhour, s.nzmin, s.nzsec = o.hour, o.minute, o.second
             dst = os.path.join(out_dir, f"{ev['event_id']}.{net}.{code}.{chan}.sac")

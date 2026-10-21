@@ -381,6 +381,11 @@ class HypControl:
     H71: tuple = (4, 1, 3)          # hypo71 summary format
     KPR: int = 3
     LST: tuple = (2, 0, 1)
+    # letters of site / network / component / location / location(other files) that must match
+    # between the station file and the phases. HYPOINVERSE's default (4 0 0 0 0) matches only the
+    # first 4 letters of the site code, which merges KS.CHS with KG.CHS and POHM2/3/5/7 into one
+    # station; the full 5-letter code + network keeps every station distinct.
+    LET: tuple = (5, 2, 0, 0, 0)
 
 
 @dataclass(frozen=True)
@@ -405,10 +410,12 @@ class HypoDDInp:
     istart: int = 1                 # 1 single source, 2 network
     isolv: int = 1                  # 1 SVD, 2 lsqr
     iter_sets: tuple = ()           # rows: (NITER,WTCCP,WTCCS,WRCC,WDCC,WTCTP,WTCTS,WRCT,WDCT,DAMP)
-    nlay: int = 3
+    # 1-D layers. None = take them from the velocity model the run locates with (--arc-velmodel),
+    # so HypoDD and HYPOINVERSE use the same model; explicit tuples override (e.g. gwangyang).
+    nlay: Optional[int] = None
     ratio: float = 1.73
-    top: tuple = (0.0, 15.0, 32.0)
-    vel: tuple = (5.98, 6.38, 7.95)
+    top: Optional[tuple] = None
+    vel: Optional[tuple] = None
     cc_file: Optional[str] = None   # cross-correlation dt.cc file (None => catalog only)
     event_file: str = "event.dat"   # event.sel to drop excluded events (e.g. mainshock)
 
@@ -436,7 +443,13 @@ class ClusterConfig:
     # placeholder, e.g. {"HH": "HH/*HH{comp}*.sac", ...}.
     stp_sac_root: Optional[str] = None
     stp_sac_glob: dict = field(default_factory=dict)
-    sensor_priority: tuple = ("HH", "HG", "EL")
+    sensor_priority: tuple = ("HH", "HG", "EL")    # sensors gathered (keys of the archive globs)
+    sensor_precedence: tuple = ("HH", "EL", "HG")  # one sensor per station: the first it has
+    # one Code in two networks near the cluster: "warn" (existing clusters, e.g. KS.CHS/KG.CHS) or
+    # "error" (stop: stages key stations by Code alone, so the two would be mixed)
+    station_code_collisions: str = "warn"
+    # what the catalog magnitude is, for figure/notebook text
+    magnitude_label: str = "KMA local magnitude"
     target_sampling_hz: float = 100.0
 
     # AI picking (SeisBench PhaseNet)
@@ -469,6 +482,9 @@ class ClusterConfig:
     # HYPOINVERSE
     hyp_control: HypControl = field(default_factory=HypControl)
     velocity_models: tuple = ()             # tuple[VelModel]
+    # models a run locates with when none are named (None = all of velocity_models); the location
+    # model (--arc-velmodel) defaults to the first of velocity_models
+    default_velmodels: Optional[tuple] = None
     # COP3 P/S weight code by epicentral distance: ((max_km, Pcode, Scode), ...)
     # P: <20->0, <50->1, <70->2, <100->3, else 4 ; S: <20->1, <50->2, else 3.
     # Used when phs_weight_scheme == "distance".

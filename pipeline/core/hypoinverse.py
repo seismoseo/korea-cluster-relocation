@@ -25,8 +25,15 @@ from pipeline.core import waveforms
 
 # ---------------------------------------------------------- small formatters
 def _deg_min_hundredths(angle):
-    """NB01 degreetominute: integer degrees + minutes*100 (truncated)."""
-    return int(angle), int(100 * 60 * (angle - int(angle)))
+    """NB01 degreetominute: integer degrees + minutes*100 (truncated), of |angle| (the sign goes
+    in the hemisphere letter)."""
+    a = abs(angle)
+    return int(a), int(100 * 60 * (a - int(a)))
+
+
+def _hemi(angle, pos, neg):
+    """Hemisphere letter for HYPOINVERSE fixed-column formats: N/S for latitude, E/W for longitude."""
+    return pos if angle >= 0 else neg
 
 
 def _weight(bins, epi_km, phase):
@@ -50,54 +57,68 @@ def _weight_prob(prob, bins):
 
 
 def _load_picks_csv(cfg, event_id):
-    """Return {(station, phase): probability} for one event, or {} if the CSV is absent
-    or unreadable. Picks CSVs are written by `pipeline/core/picking.py:pick_event*`
-    alongside the SAC headers (columns: Event_ID, Network, Station, Phase, Time,
-    Probability, Polarity, Amplitude)."""
+    """Return {(network, station, phase): probability} for one event, plus (station, phase) keys
+    for codes that only one network uses in the event; {} if the CSV is absent or unreadable.
+    Picks CSVs are written by `pipeline/core/picking.py:pick_event*` alongside the SAC headers
+    (columns: Event_ID, Network, Station, Phase, Time, Probability, Polarity, Amplitude)."""
     csv_path = config.picks_csv(cfg, event_id)
     if not os.path.exists(csv_path):
         return {}
     try:
         import pandas as pd
         df = pd.read_csv(csv_path)
-        out = {}
+        out, nets = {}, {}
         for r in df.itertuples(index=False):
             try:
                 p = float(r.Probability)
             except (TypeError, ValueError):
                 continue
             if p == p:                                            # filter NaN
+                out[(str(r.Network), str(r.Station), str(r.Phase))] = p
+                nets.setdefault((str(r.Station), str(r.Phase)), set()).add(str(r.Network))
                 out[(str(r.Station), str(r.Phase))] = p
+        for k, ns in nets.items():                                # an ambiguous code has no code-only key
+            if len(ns) > 1:
+                del out[k]
         return out
     except Exception:                                              # noqa: BLE001
         return {}
 
 
+def _pick_prob(lookup, net, sta, phase):
+    """Probability of a pick by (network, station, phase), else by an unambiguous station code."""
+    p = lookup.get((net, sta, phase))
+    return p if p is not None else lookup.get((sta, phase))
+
+
 # --------------------------------------------------------------------- STA
 def write_sta(cfg):
     """Write STA/<Region>.sta (CSV) and STA/<Region>_hyp.sta (HYPOINVERSE fmt 2)."""
-    coords = {}  # sta -> (net, stla, stlo)
+    coords = {}  # (sta, file network) -> (net, stla, stlo); a code in two networks = two stations
     for f in glob(os.path.join(config.waveforms_dir(cfg), "20*", "*.sac")):
-        sta = os.path.basename(f).split(".")[2]
-        if sta in coords:
+        p = os.path.basename(f).split(".")
+        k = (p[2], p[1])
+        if k in coords:
             continue
         tr = read(f)[0]
-        coords[sta] = (tr.stats.network or "KS", tr.stats.sac.stla, tr.stats.sac.stlo)
+        coords[k] = (tr.stats.network or "KS", tr.stats.sac.stla, tr.stats.sac.stlo)
 
     sta_dir = config.assert_writable(config.sta_dir(cfg))
     os.makedirs(sta_dir, exist_ok=True)
 
     with open(config.sta_file(cfg), "w") as fh:
-        for sta in sorted(coords):
-            net, la, lo = coords[sta]
+        for k in sorted(coords):
+            sta = k[0]
+            net, la, lo = coords[k]
             fh.write(f"{net}.{sta},{la},{lo},0.0,100.0\n")
 
     with open(config.sta_hyp_file(cfg), "w") as fh:
-        for sta in sorted(coords):
-            net, la, lo = coords[sta]
+        for k in sorted(coords):
+            sta = k[0]
+            net, la, lo = coords[k]
             la_a, lo_a = abs(la), abs(lo)
-            lat = "{:2} {:7.4f}{}".format(int(la_a), 60 * (la_a - int(la_a)), "N")
-            lon = "{:3} {:7.4f}{}".format(int(lo_a), 60 * (lo_a - int(lo_a)), "E")
+            lat = "{:2} {:7.4f}{}".format(int(la_a), 60 * (la_a - int(la_a)), _hemi(la, "N", "S"))
+            lon = "{:3} {:7.4f}{}".format(int(lo_a), 60 * (lo_a - int(lo_a)), _hemi(lo, "E", "W"))
             fh.write("{:<5} {}  HHZ  {}{}{:4}\n".format(sta, net, lat, lon, 0))
     return config.sta_hyp_file(cfg)
 
@@ -137,20 +158,22 @@ def write_phs(cfg):
             picks_lookup = _load_picks_csv(cfg, eid) if scheme == "probability" else {}
             la_d, la_m = _deg_min_hundredths(ev["lat"])
             lo_d, lo_m = _deg_min_hundredths(ev["lon"])
-            f.write(f"{eid}00{la_d}N{str(la_m).zfill(4)}{lo_d}E{str(lo_m).zfill(4)}\n")
+            f.write(f"{eid}00{la_d:2d}{_hemi(ev['lat'], 'N', 'S')}{str(la_m).zfill(4)}"
+                    f"{lo_d:3d}{_hemi(ev['lon'], 'E', 'W')}{str(lo_m).zfill(4)}\n")
 
             seen_p, seen_s = set(), set()
             for sac in sorted(glob(ed + "/*.sac"))[::-1]:
                 tr = read(sac)[0]
                 s = tr.stats.sac
-                sta = os.path.basename(sac).split(".")[2]
+                fnet, sta = os.path.basename(sac).split(".")[1:3]
+                sid = (fnet, sta)                          # a code in two networks = two stations
                 net = (tr.stats.network or "KS")
                 chan3 = tr.stats.channel[:3]
                 comp = tr.stats.channel[-1]
-                if comp == "Z" and sta not in seen_p and s.get("a", -12345.0) != -12345.0:
+                if comp == "Z" and sid not in seen_p and s.get("a", -12345.0) != -12345.0:
                     epi = gps2dist_azimuth(s.evla, s.evlo, s.stla, s.stlo)[0] / 1000.0
                     if scheme == "probability":
-                        prob = picks_lookup.get((sta, "P"))
+                        prob = _pick_prob(picks_lookup, fnet, sta, "P")
                         if prob is not None:
                             pw = _weight_prob(prob, prob_bins); n_prob_p += 1
                         else:
@@ -162,11 +185,11 @@ def write_phs(cfg):
                             f"{ot.year}{str(ot.month).zfill(2)}{str(ot.day).zfill(2)}"
                             f"{str(ot.hour).zfill(2)}{str(ot.minute).zfill(2).ljust(3)}"
                             f"{str(ot.second).zfill(2)}{str(ot.microsecond).zfill(6)[:2]}\n")
-                    seen_p.add(sta)
-                if comp in ("N", "E") and sta not in seen_s and s.get("t0", -12345.0) != -12345.0:
+                    seen_p.add(sid)
+                if comp in ("N", "E") and sid not in seen_s and s.get("t0", -12345.0) != -12345.0:
                     epi = gps2dist_azimuth(s.evla, s.evlo, s.stla, s.stlo)[0] / 1000.0
                     if scheme == "probability":
-                        prob = picks_lookup.get((sta, "S"))
+                        prob = _pick_prob(picks_lookup, fnet, sta, "S")
                         if prob is not None:
                             sw = _weight_prob(prob, prob_bins); n_prob_s += 1
                         else:
@@ -179,7 +202,7 @@ def write_phs(cfg):
                             f"{str(ot.hour).zfill(2)}{str(ot.minute).zfill(2).ljust(15)}"
                             f"{str(ot.second).zfill(2)}{str(ot.microsecond).zfill(6)[:2]}"
                             f"{'ES'.ljust(3)}{sw}\n")
-                    seen_s.add(sta)
+                    seen_s.add(sid)
             # Cuspid from the canonical evmap: legacy = offset + sorted-dir index (byte-identical
             # to the old scheme, incl. >999-event clusters); manifest = offset + caller event_idx.
             f.write(" " * 66 + str(cuspid) + "\n")
@@ -237,6 +260,7 @@ TOP F
 LST {LST}
 KPR {KPR}
 H71 {H71}
+LET {LET}
 STA 'STA/{region}_hyp.sta'
 CRH 1 '{model}/{model}_p.crh'
 CRH 2 '{model}/{model}_s.crh'
@@ -259,6 +283,7 @@ def run_hypoinverse_model(cfg, vmodel):
         CON=hc.CON, MIN=hc.MIN, ZTR0=hc.ZTR[0], ZTR1=hc.ZTR[1],
         DIS=" ".join(map(str, hc.DIS)), RMS=" ".join(map(str, hc.RMS)),
         LST=" ".join(map(str, hc.LST)), KPR=hc.KPR, H71=" ".join(map(str, hc.H71)),
+        LET=" ".join(map(str, getattr(hc, "LET", (5, 2, 0, 0, 0)))),
         region=cfg.region, model=vmodel.name,
     )
     hyp = config.hyp_dir(cfg)

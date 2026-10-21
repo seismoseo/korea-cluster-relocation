@@ -131,40 +131,67 @@ def select_nearby(cfg) -> pd.DataFrame:
         lambda r: gps2dist_azimuth(evla, evlo, r["Latitude"], r["Longitude"])[0] / 1000.0,
         axis=1,
     )
-    return master[dist_km <= cfg.radius_km].reset_index(drop=True)
+    near = master[dist_km <= cfg.radius_km].reset_index(drop=True)
+    # picking, location and relocation tell stations apart by (Network, Code); a few single-station
+    # figures (viz / similarity) still label by Code alone, so flag a Code shared by two networks
+    nets = near.groupby("Code")["Network"].nunique()
+    shared = sorted(nets[nets > 1].index)
+    if shared:
+        msg = (f"[{cfg.name}] station code(s) used by more than one network within "
+               f"{cfg.radius_km:g} km: {shared} — kept apart by network in picking, location and "
+               f"relocation, but single-station figures label them by code alone")
+        if cfg.station_code_collisions == "error":
+            raise ValueError(msg)
+        print("WARNING: " + msg, flush=True)
+    return near
 
 
 # ------------------------------------------------------------------- stage 1
 def discover_used(cfg, nearby: pd.DataFrame) -> pd.DataFrame:
     """Restrict `nearby` to stations with Z-component data in the raw archive and
-    assign one sensor per station (precedence HH > EL > HG)."""
-    codes = set(nearby["Code"])
+    assign one sensor per station: the first of `cfg.sensor_precedence` it has (default
+    HH > EL > HG), then any other `cfg.sensor_priority` sensor in that order."""
+    key = station_key(nearby)
     avail = {s: set() for s in cfg.sensor_priority}
     for ed in _event_dirs(cfg):
         layout = event_layout(cfg, ed)  # "stp_sac" or "kma_archive"; identity for non-mixed
         for sensor in cfg.sensor_priority:
             for f in glob(os.path.join(ed, wf_glob(cfg, sensor, "Z", layout=layout))):
-                c = parse_sac_name(cfg, os.path.basename(f), layout=layout)[1]
-                if c in codes:
-                    avail[sensor].add(c)
+                net, c = parse_sac_name(cfg, os.path.basename(f), layout=layout)[:2]
+                k = key(net, c)
+                if k is not None:
+                    avail[sensor].add(k)
 
-    HH = avail.get("HH", set())
-    HG = avail.get("HG", set())
-    EL = avail.get("EL", set())
-    el_only = {c for c in EL if c not in HH}                 # EL not in HH
-    hg_only = {c for c in HG if c not in HH and c not in EL}  # HG not in HH/EL
-    used = HH | el_only | hg_only
+    order = list(cfg.sensor_precedence)
+    order += [s for s in cfg.sensor_priority if s not in order]
+    label = {}
+    for sensor in order:
+        for k in avail.get(sensor, ()):
+            label.setdefault(k, sensor)
 
-    def _label(code):
-        if code in HH:
-            return "HH"
-        if code in hg_only:
-            return "HG"
-        return "EL"
-
-    table = nearby[nearby["Code"].isin(used)].reset_index(drop=True)
-    table["Sensor"] = table["Code"].map(_label)
+    keys = list(zip(nearby["Network"], nearby["Code"]))
+    table = nearby[[k in label for k in keys]].reset_index(drop=True)
+    table["Sensor"] = [label[k] for k in zip(table["Network"], table["Code"])]
     return table
+
+
+def station_key(table: pd.DataFrame):
+    """Resolver (net, code) of an archive file -> the station-table key (Network, Code), or None.
+
+    A station is identified by network AND code (KS.CHS and KG.CHS are different stations). A file
+    whose network label is not in the table for that code still resolves when the code is unique in
+    the table (as it always did); an ambiguous code with no network match resolves to nothing."""
+    pairs = set(zip(table["Network"], table["Code"]))
+    nets_of = {}
+    for n, c in pairs:
+        nets_of.setdefault(c, []).append(n)
+
+    def key(net, code):
+        if (net, code) in pairs:
+            return (net, code)
+        nets = nets_of.get(code, ())
+        return (nets[0], code) if len(nets) == 1 else None
+    return key
 
 
 # --------------------------------------------------------------- orchestration

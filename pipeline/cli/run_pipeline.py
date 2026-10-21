@@ -21,10 +21,12 @@ def main():
     ap.add_argument("--cluster", required=True)
     ap.add_argument("--stage-from", default="stations", choices=pipeline.STAGES)
     ap.add_argument("--through", default="dtct", choices=pipeline.STAGES)
-    ap.add_argument("--velmodels", default="kim1983,kim2011")
-    ap.add_argument("--arc-velmodel", default="kim1983",
+    ap.add_argument("--velmodels", default=None,
+                    help="comma-separated models to locate with (default: the cluster's "
+                         "default_velmodels, else all of its velocity models)")
+    ap.add_argument("--arc-velmodel", default=None,
                     help="velocity model whose HYPOINVERSE .arc feeds ph2dt AND whose "
-                         ".sum the rereference/xcorr stages use")
+                         ".sum the rereference/xcorr stages use (default: the cluster's first model)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--events", default=None, help="comma-separated event_ids (default all)")
     ap.add_argument("--dtcc-variant", default="default",
@@ -50,7 +52,7 @@ def main():
     if args.xcorr_backend:
         cfg = config.tune(cfg, xcorr_backend=args.xcorr_backend)
     events = args.events.split(",") if args.events else None
-    velmodels = tuple(v for v in args.velmodels.split(",") if v)
+    velmodels = tuple(v for v in args.velmodels.split(",") if v) if args.velmodels else None
     pipeline.run_cluster(cfg, stage_from=args.stage_from, through=args.through,
                          velmodels=velmodels, arc_velmodel=args.arc_velmodel,
                          device=args.device, events=events,

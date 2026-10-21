@@ -101,13 +101,8 @@ def _event_magnitudes(cfg):
     `id` IS the cuspid). The reloc `mag` column is 0, so this catalog lookup is the magnitude source.
     Returns {} on any failure (callers fall back to a default marker size)."""
     try:
-        cat = pd.read_csv(cfg.event_catalog_csv)
-        cat.columns = [c.lower() for c in cat.columns]   # catalogs vary in case (Year vs year); normalise
-        eid2mag = {}
-        for r in cat.itertuples():
-            t = UTCDateTime(int(r.year), int(r.month), int(r.day), int(r.hour), int(r.minute),
-                            int(r.second)) - cfg.kst_offset_hours * 3600
-            eid2mag[t.strftime("%Y%m%d%H%M%S")] = float(r.magnitude)
+        from pipeline.core import waveforms               # the one catalog reader (KMA or UTC/ISO)
+        eid2mag = {e["event_id"]: e["mag"] for e in waveforms.load_catalog(cfg)}
         from pipeline.core import evmap
         return {c: eid2mag[e] for c, e in evmap.dir_of_cuspid(cfg).items() if e in eid2mag}
     except Exception:                                # noqa: BLE001

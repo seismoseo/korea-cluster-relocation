@@ -113,7 +113,8 @@ def _full_trace(eid, station, comp, fmin, fmax):
     if tr is not None:
         _CACHE.move_to_end(key)             # LRU touch
         return tr
-    fs = glob(os.path.join(_COMMON, eid, f"{eid}.*.{station}.*{comp}.sac"))
+    net, code = station.split(".", 1)               # station ids are NET.CODE (codes repeat across networks)
+    fs = glob(os.path.join(_COMMON, eid, f"{eid}.{net}.{code}.*{comp}.sac"))
     if not fs:
         raise FileNotFoundError(f"{eid}/{station}/{comp}")
     src = fs[0]
@@ -514,9 +515,16 @@ def _gpu_correlate_batch(refs, cands, valids, n_ref, nlag, slides, sr, device):
     Reference FFT broadcasts over slides (no replication). Bit-exact-equivalent to the
     obspy per-slide correlate/xcorr_max, then max over (slide, lag)."""
     import torch
-    L = n_ref + 2 * nlag
     R = torch.from_numpy(refs).to(device)
     C = torch.from_numpy(cands).to(device)
+    return _gpu_correlate_tensors(R, C, valids, n_ref, nlag, slides, sr, device)
+
+
+def _gpu_correlate_tensors(R, C, valids, n_ref, nlag, slides, sr, device):
+    """The batched FFT xcorr on tensors already on `device`: R (B,n_ref), C (B,n_slides,n_ref),
+    both contiguous float64. Shared by both task builders, so their arithmetic is the same code."""
+    import torch
+    L = n_ref + 2 * nlag
     R = _znorm_t(R)                                          # (B, n_ref)
     C = _znorm_t(C)                                          # (B, n_slides, n_ref)
     A = torch.fft.rfft(R, n=L).unsqueeze(1)                  # (B, 1, Lf)
@@ -538,6 +546,131 @@ def _gpu_correlate_batch(refs, cands, valids, n_ref, nlag, slides, sr, device):
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return out_shift, out_cc
+
+
+# ---- slice-store task builder (default gpu_batched path) ---------------------------------------
+# Every number a task needs from one trace sits within ~(pre + post + 2*margin) s of that trace's
+# own pick: the reference window (event as e1) and the slid candidate windows (event as e2). The
+# store keeps exactly those samples, cut from the same interpolated+filtered trace with the same
+# index arithmetic as `_build_one_task`, plus the pick/origin/network the dt.cc writer reads. Tasks
+# then need no full traces (no reloads), and the candidate windows are cut on the GPU from one short
+# segment per task instead of being stacked on the host (8 MB -> ~24 KB per task). The tensors
+# reaching `_gpu_correlate_tensors` hold the same values in the same layout, so dt.cc is unchanged.
+def _slice_entry(eid, sta, comp, hdr, fmin, fmax, pre, post, slides):
+    """Store entry for one (event, station, comp, pick header, band, window), or None when the
+    trace or its pick is missing (the tasks that need it are skipped, as before)."""
+    try:
+        tr = _full_trace(eid, sta, comp, fmin, fmax)
+        p = _pick_time(tr, hdr)
+    except Exception:                                       # noqa: BLE001 — missing trace / pick
+        return None
+    sr = float(_XC["interp_hz"])
+    data = np.asarray(tr.data, dtype=np.float64)
+    off = float(p - tr.stats.starttime)
+    i0 = int(round((off - pre) * sr))                       # as _build_one_task (event as e1)
+    i1 = int(round((off + post) * sr))
+    starts = np.round((off - pre + slides) * sr).astype(np.int64)   # (event as e2)
+    d = np.diff(starts)
+    stride = int(d[0]) if (len(d) and np.all(d == d[0]) and d[0] != 0) else None
+    n = len(data)
+    nmax = int(round((pre + post) * sr)) + 2                # n_ref of any pair is <= this
+    g0 = max(0, min(i0, int(starts[0])))
+    g1 = min(n, max(i1 + 1, int(starts[-1]) + nmax))
+    return dict(seg=data[g0:g1].copy() if g1 > g0 else data[:0].copy(), g0=g0, n=n, i0=i0,
+                i1=i1, s0=int(starts[0]), stride=stride,
+                starts=None if stride is not None else starts,
+                p=p, ot=tr.stats.starttime - tr.stats.sac.b, net=tr.stats.network)
+
+
+def _entry_one(key):
+    """Prep-pool worker: (key, store entry). Warms the on-disk interp cache as a side effect and
+    returns only the small entry; the full trace is dropped from the worker's RAM."""
+    eid, sta, comp, hdr, fmin, fmax, pre, post = key
+    slides = np.arange(-_XC["margin"], _XC["margin"], _XC["slide_step"])
+    e = _slice_entry(eid, sta, comp, hdr, fmin, fmax, pre, post, slides)
+    _CACHE.pop((eid, sta, comp, fmin, fmax), None)
+    return key, e
+
+
+def _build_task_from_store(E1, E2, n_slides):
+    """(ref, n_ref, valid, cand spec) for one task from two store entries; the same checks,
+    windows and validity as `_build_one_task`. Returns None where it would."""
+    if E1 is None or E2 is None:
+        return None
+    i0, i1 = E1["i0"], E1["i1"]
+    if i0 < 0 or i1 >= E1["n"]:
+        return None
+    ref = E1["seg"][i0 - E1["g0"]:i1 + 1 - E1["g0"]]
+    n_ref = len(ref)
+    starts = (E2["s0"] + E2["stride"] * np.arange(n_slides, dtype=np.int64)
+              if E2["stride"] is not None else E2["starts"])
+    valid = (starts >= 0) & (starts + n_ref <= E2["n"])
+    if not valid.any():
+        return None
+    seg, g0 = E2["seg"], E2["g0"]
+    if E2["stride"] is not None:                            # uniform stride: one segment
+        vi = np.where(valid)[0]
+        a, b = int(vi[0]), int(vi[-1]) + 1
+        lo = int(starts[a]) - g0
+        hi = lo + (b - a - 1) * E2["stride"] + n_ref
+        return dict(ref=ref, n_ref=n_ref, valid=valid, a=a, b=b, stride=E2["stride"],
+                    seg=seg[lo:hi])
+    cands = np.zeros((n_slides, n_ref), dtype=np.float64)    # rare: non-uniform -> explicit rows
+    for k in np.where(valid)[0]:
+        cands[k] = seg[int(starts[k]) - g0:int(starts[k]) - g0 + n_ref]
+    return dict(ref=ref, n_ref=n_ref, valid=valid, cands=cands)
+
+
+def _gpu_correlate_store_batch(batch, nlag, slides, sr, device):
+    """Batched xcorr for tasks from `_build_task_from_store`: candidate windows are cut on the
+    device (unfold of each task's short segment) and made contiguous, then the shared math."""
+    import torch
+    n_slides, n_ref = len(slides), batch[0]["n_ref"]
+    refs = np.stack([t["ref"] for t in batch])
+    valids = np.stack([t["valid"] for t in batch])
+    width = n_slides - 1 + n_ref
+    S = np.zeros((len(batch), width), dtype=np.float64)     # stride-1 tasks: row k = S[i, k:k+n_ref]
+    explicit = {}
+    for i, t in enumerate(batch):
+        if "seg" in t and t["stride"] == 1:
+            S[i, t["a"]:t["a"] + len(t["seg"])] = t["seg"]
+        elif "seg" in t:                                    # uniform stride != 1: host rows
+            c = np.zeros((n_slides, n_ref), dtype=np.float64)
+            for k in range(t["a"], t["b"]):
+                o = (k - t["a"]) * t["stride"]
+                c[k] = t["seg"][o:o + n_ref]
+            explicit[i] = c
+        else:
+            explicit[i] = t["cands"]
+    R = torch.from_numpy(refs).to(device)
+    C = torch.from_numpy(S).to(device).unfold(1, n_ref, 1).contiguous()   # (B, n_slides, n_ref)
+    for i, c in explicit.items():
+        C[i] = torch.from_numpy(c).to(device)
+    return _gpu_correlate_tensors(R, C, valids, n_ref, nlag, slides, sr, device)
+
+
+def _process_store_batch_safe(batch, nlag, slides, sr, device, stats):
+    """`_process_batch_safe` for store-built tasks: OOM -> empty_cache, halve, retry; one task
+    that still OOMs runs on the CPU. Returns {key: (shift_s, cc)}."""
+    import torch
+    if not batch:
+        return {}
+    try:
+        shifts, ccs = _gpu_correlate_store_batch(batch, nlag, slides, sr, device)
+        stats["batches"] += 1
+        return {batch[i]["key"]: (float(np.round(shifts[i], 3)), float(ccs[i]))
+                for i in range(len(batch))}
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        if len(batch) == 1:
+            stats["cpu_fallback_tasks"] += 1
+            shifts, ccs = _gpu_correlate_store_batch(batch, nlag, slides, sr, torch.device("cpu"))
+            return {batch[0]["key"]: (float(np.round(shifts[0], 3)), float(ccs[0]))}
+        stats["oom_retries"] += 1
+        mid = len(batch) // 2
+        out = _process_store_batch_safe(batch[:mid], nlag, slides, sr, device, stats)
+        out.update(_process_store_batch_safe(batch[mid:], nlag, slides, sr, device, stats))
+        return out
 
 
 def _process_batch_safe(batch, nlag, slides, sr, device, stats):
@@ -585,7 +718,162 @@ def _interp_one_trace(key):
 
 
 def run_xcorr_gpu_batched(common, stations, eid, xc, overrides, out_p, out_s, pairs,
-                          cores=None, vram_fraction=_VRAM_SAFE_FRACTION, interp_cache_dir=None):
+                          cores=None, vram_fraction=_VRAM_SAFE_FRACTION, interp_cache_dir=None,
+                          store=None):
+    """Cross-pair-batched GPU xcorr. Default: the slice-store builder (same dt.cc, no full-trace
+    reloads, candidate windows cut on the GPU). XCORR_GPU_IMPL=legacy runs the previous builder.
+    `store` (a dict) is shared across the pair chunks of one run so entries are built once."""
+    impl = (os.environ.get("XCORR_GPU_IMPL") or "store").strip().lower()
+    if impl == "legacy":
+        return _run_xcorr_gpu_batched_legacy(common, stations, eid, xc, overrides, out_p, out_s,
+                                             pairs, cores=cores, vram_fraction=vram_fraction,
+                                             interp_cache_dir=interp_cache_dir)
+    return _run_xcorr_gpu_batched_store(common, stations, eid, xc, overrides, out_p, out_s, pairs,
+                                        cores=cores, vram_fraction=vram_fraction,
+                                        interp_cache_dir=interp_cache_dir, store=store)
+
+
+def _run_xcorr_gpu_batched_store(common, stations, eid, xc, overrides, out_p, out_s, pairs,
+                                 cores=None, vram_fraction=_VRAM_SAFE_FRACTION,
+                                 interp_cache_dir=None, store=None):
+    """Slice-store version of the legacy executor: same tasks in the same order, same batch
+    boundaries, same GPU math, same per-pair files."""
+    import time as _time
+    import torch
+    _init_worker(common, stations, eid, xc, dict(overrides), out_p, out_s,
+                 "cctorch_gpu_batched", interp_cache_dir)
+    device = torch.device("cuda:0")
+    _install_vram_guard(device)
+    sr = float(xc["interp_hz"]); nlag = int(xc["shift_samp"])
+    slides = np.arange(-xc["margin"], xc["margin"], xc["slide_step"])
+    n_slides = len(slides)
+    stats = {"oom_retries": 0, "cpu_fallback_tasks": 0, "batches": 0, "tasks": 0,
+             "peak_vram_gb": 0.0}
+    results = {p: {"P": {}, "S": {}} for p in pairs}
+    win = {p: _window(p) for p in pairs}
+    phases = (("P", "a", ("Z",)), ("S", "t0", tuple(xc["s_comps"])))
+
+    # ---- the store: one small entry per (event, station, comp, pick header, band, window) ----
+    keys = set()
+    for pair in pairs:
+        pre, post, fmin, fmax = win[pair]
+        for sta in stations:
+            for _, hdr, comps in phases:
+                for comp in comps:
+                    for e in pair:
+                        keys.add((e, sta, comp, hdr, fmin, fmax, pre, post))
+    store = {} if store is None else store                 # entries of earlier chunks are reused
+    n_all = len(keys)
+    keys = sorted(k for k in keys if k not in store)
+    t0 = _time.time()
+    ncores = cores or min(32, max(1, len(os.sched_getaffinity(0)) - 1))
+    if ncores > 1 and keys:
+        import multiprocessing as _mp                       # Pool, not ProcessPoolExecutor (see legacy)
+        with _mp.get_context("spawn").Pool(processes=ncores, initializer=_init_worker,
+                                           initargs=(common, stations, eid, xc, dict(overrides),
+                                                     out_p, out_s, "obspy", interp_cache_dir)) as pool:
+            for key, e in pool.imap_unordered(_entry_one, keys, chunksize=16):
+                store[key] = e
+    else:
+        for key in keys:
+            store[key] = _entry_one(key)[1]
+    _CACHE.clear()
+    print(f"[xcorr] gpu_batched: {len(keys)} new trace slices ({n_all - len(keys)} reused; "
+          f"{sum(e is not None for e in store.values())} usable in the store) on {ncores} workers "
+          f"in {_time.time() - t0:.1f}s"
+          + (f" (cache {os.path.basename(interp_cache_dir)})" if interp_cache_dir else ""),
+          flush=True)
+
+    # ---- tasks in the legacy order and batching -------------------------------------------
+    def _specs():
+        for pair in pairs:
+            for sta in stations:
+                yield (pair, "P", "a", sta, "Z")
+                for comp in xc["s_comps"]:
+                    yield (pair, "S", "t0", sta, comp)
+
+    torch.cuda.reset_peak_memory_stats(device)
+    batch, batch_nref, cap = [], None, None
+    t0, n_pairs_seen, last_pair = _time.time(), 0, None
+    for (pair, phase, hdr, sta, comp) in _specs():
+        if pair != last_pair:
+            n_pairs_seen += 1
+            last_pair = pair
+            if n_pairs_seen % 500 == 0:
+                print(f"[xcorr] gpu_batched: pair {n_pairs_seen:,}/{len(pairs):,}, "
+                      f"{stats['tasks']:,} tasks, {_time.time() - t0:.0f}s", flush=True)
+        pre, post, fmin, fmax = win[pair]
+        t = _build_task_from_store(store.get((pair[0], sta, comp, hdr, fmin, fmax, pre, post)),
+                                   store.get((pair[1], sta, comp, hdr, fmin, fmax, pre, post)),
+                                   n_slides)
+        if t is None:
+            continue
+        n_ref = t["n_ref"]
+        if batch_nref is None:
+            batch_nref = n_ref
+            cap = _max_tasks(device, n_slides, n_ref, nlag, vram_fraction)
+        if n_ref != batch_nref or len(batch) >= cap:        # flush on size/shape change
+            for k, v in _process_store_batch_safe(batch, nlag, slides, sr, device, stats).items():
+                results[k[0]][k[1]][(k[2], k[3])] = v
+            stats["tasks"] += len(batch)
+            batch, batch_nref = [], n_ref
+            cap = _max_tasks(device, n_slides, n_ref, nlag, vram_fraction)
+        t["key"] = (pair, phase, sta, comp)
+        batch.append(t)
+    for k, v in _process_store_batch_safe(batch, nlag, slides, sr, device, stats).items():
+        results[k[0]][k[1]][(k[2], k[3])] = v
+    stats["tasks"] += len(batch)
+    stats["peak_vram_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
+
+    # ---- per-pair files: the legacy writer's lines, from the store's picks and origins ----
+    for pair in pairs:
+        e1, e2 = pair
+        pre, post, fmin, fmax = win[pair]
+        plines = [_header(e1, e2)]
+        for sta in stations:
+            r = results[pair]["P"].get((sta, "Z"))
+            if r is None:
+                continue
+            E1 = store.get((e1, sta, "Z", "a", fmin, fmax, pre, post))
+            E2 = store.get((e2, sta, "Z", "a", fmin, fmax, pre, post))
+            if E1 is None or E2 is None:
+                continue
+            shift, coeff = r
+            diff = (E1["p"] + shift - E1["ot"]) - (E2["p"] - E2["ot"])
+            plines.append(_fmt(E1["net"] or sta[:0], sta, diff, coeff, "P"))
+        with open(os.path.join(out_p, f"dt.cc_P_{e1}_{e2}"), "w") as f:
+            f.writelines(plines)
+        slines = [_header(e1, e2)]
+        for sta in stations:
+            best = None
+            for comp in xc["s_comps"]:
+                r = results[pair]["S"].get((sta, comp))
+                if r is None:
+                    continue
+                shift, coeff = r
+                if best is None or coeff >= best[0]:
+                    best = (coeff, shift, comp)
+            if best is None:
+                continue
+            coeff, shift, comp = best
+            E1 = store.get((e1, sta, comp, "t0", fmin, fmax, pre, post))
+            E2 = store.get((e2, sta, comp, "t0", fmin, fmax, pre, post))
+            if E1 is None or E2 is None:
+                continue
+            diff = (E1["p"] + shift - E1["ot"]) - (E2["p"] - E2["ot"])
+            slines.append(_fmt(E1["net"] or sta[:0], sta, diff, coeff, "S"))
+        with open(os.path.join(out_s, f"dt.cc_S_{e1}_{e2}"), "w") as f:
+            f.writelines(slines)
+
+    print(f"[xcorr] gpu_batched: {stats['tasks']} tasks in {stats['batches']} batches | "
+          f"peak VRAM {stats['peak_vram_gb']:.1f} GB | OOM retries {stats['oom_retries']} | "
+          f"CPU fallbacks {stats['cpu_fallback_tasks']} | {_time.time() - t0:.0f}s")
+    return stats
+
+
+def _run_xcorr_gpu_batched_legacy(common, stations, eid, xc, overrides, out_p, out_s, pairs,
+                                  cores=None, vram_fraction=_VRAM_SAFE_FRACTION,
+                                  interp_cache_dir=None):
     """Single-process, memory-bounded, cross-pair-batched FFT xcorr executor. Writes the
     SAME per-pair dt.cc_{P,S}_<e1>_<e2> files as the obspy path (station order, S best-comp
     selection identical), so `_filter_combine`/combine/`_drop_mainshock` are unchanged.
@@ -748,7 +1036,8 @@ def _window(pair):
 
 
 def _fmt(net, station, diff, coeff, phase):
-    return (f"{net}{station}".ljust(6) + " " * 5 + str(np.round(diff, 5)).ljust(9)
+    code = station.split(".", 1)[-1]                # station id NET.CODE -> the HypoDD label NETCODE
+    return (f"{net}{code}".ljust(6) + " " * 5 + str(np.round(diff, 5)).ljust(9)
             + " " * 3 + str(np.round(coeff, 5)).ljust(11) + " " * 4 + phase + "\n")
 
 
@@ -1002,8 +1291,11 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy",
         if e is not None:
             events.append(e)
             eid[e] = int(r.id)
-    stations = sorted({os.path.basename(f).split(".")[2]
-                       for e in events for f in glob(os.path.join(common, e, "*.sac"))})
+    # station ids NET.CODE, ordered by (code, net): the same order as the former code-only list
+    # wherever codes are unique, so dt.cc lines keep their order
+    stations = [f"{n}.{c}" for c, n in sorted(
+        {(p[2], p[1]) for e in events for p in
+         (os.path.basename(f).split(".") for f in glob(os.path.join(common, e, "*.sac")))})]
     pairs = list(combinations(events, 2))
     all_pairs = pairs                              # FULL pair set — combine must cover all, even on resume
 
@@ -1068,12 +1360,14 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy",
         chunk = int(os.environ.get("XCORR_PAIR_CHUNK", "200000") or "200000")
         ovr = dict(cfg.xcorr_pair_overrides)
         nchunks = (len(pairs) + chunk - 1) // chunk
+        shared_store = {}                                   # slice entries, built once per run
         for ci in range(0, len(pairs), chunk):
             sub = pairs[ci:ci + chunk]
             if nchunks > 1:
                 print(f"[xcorr] gpu_batched chunk {ci // chunk + 1}/{nchunks}: {len(sub):,} pairs", flush=True)
             run_xcorr_gpu_batched(common, stations, eid, xc, ovr,
-                                  out_p, out_s, sub, cores=cores, interp_cache_dir=ic)
+                                  out_p, out_s, sub, cores=cores, interp_cache_dir=ic,
+                                  store=shared_store)
     else:
         # CUDA + 'fork' is unsafe — child can't inherit GPU state cleanly. Use 'spawn'
         # for GPU mode; 'fork' (default) is fine for ObsPy and CCTorch-CPU.

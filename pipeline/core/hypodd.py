@@ -43,12 +43,16 @@ def _patch_arc_es(src_arc, dst_arc):
                 f.write(line)
 
 
-def _fix_pha_longitude(pha_path):
+def _fix_pha_longitude(pha_path, east=True):
     """ncsn2pha is a USGS NorCal tool that assumes WEST longitude, so it writes
     Korean EAST longitudes as negative (e.g. -127.7273). The original workflow
     flipped the sign by hand; we automate it here by turning the longitude's minus
     into a space (preserving column width) in each '#' event header. Without this,
-    every station sits >MAXDIST away and ph2dt produces an empty dt.ct."""
+    every station sits >MAXDIST away and ph2dt produces an empty dt.ct.
+    For a WEST-longitude cluster (east=False) ncsn2pha's negative sign is already
+    right, so nothing is changed (flipping it would relocate a mirror image)."""
+    if not east:
+        return
     lines = open(pha_path).readlines()
     with open(pha_path, "w") as f:
         for line in lines:
@@ -60,7 +64,8 @@ def _fix_pha_longitude(pha_path):
 
 
 def _sta_to_stationdat(hyp_sta, station_dat):
-    """Convert <Region>_hyp.sta (HYPOINVERSE) -> HypoDD station.dat (NETSTA lat lon)."""
+    """Convert <Region>_hyp.sta (HYPOINVERSE) -> HypoDD station.dat (NETSTA lat lon), signed by the
+    hemisphere letters (col 26 N/S, col 38 E/W)."""
     with open(hyp_sta) as f:
         lines = f.readlines()
     with open(station_dat, "w") as f:
@@ -68,6 +73,10 @@ def _sta_to_stationdat(hyp_sta, station_dat):
             net, sta = line[6:8], line[0:5].replace(" ", "")
             lat = round(int(line[15:17]) + float(line[18:25]) / 60, 5)
             lon = round(int(line[26:29]) + float(line[30:37]) / 60, 5)
+            if line[25:26] == "S":
+                lat = -lat
+            if line[37:38] == "W":
+                lon = -lon
             f.write(f"{net}{sta} {lat} {lon}\n")
 
 
@@ -93,7 +102,7 @@ def prep_ph2dt(cfg, velmodel="kim1983"):
 
     subprocess.run(["ncsn2pha", f"{region}_dd.arc", f"{region}.pha"],
                    cwd=d, check=True, stdout=subprocess.DEVNULL)
-    _fix_pha_longitude(os.path.join(d, f"{region}.pha"))   # East-longitude sign fix
+    _fix_pha_longitude(os.path.join(d, f"{region}.pha"), east=cfg.epicenter[1] >= 0)
     shutil.copyfile(os.path.join(d, f"{region}.pha"), os.path.join(d, f"{region}_mod.pha"))
 
     _sta_to_stationdat(config.sta_hyp_file(cfg), os.path.join(d, "station.dat"))
@@ -113,6 +122,39 @@ def run_ph2dt(cfg):
 
 
 # ------------------------------------------------------------- hypoDD.inp
+def _velmodel(cfg, name=None):
+    """The cluster's VelModel called `name` (default: its first model)."""
+    models = cfg.velocity_models
+    if name is None:
+        return models[0]
+    for m in models:
+        if m.name == name:
+            return m
+    raise ValueError(f"velocity model {name!r} not in cluster {cfg.name}: {[m.name for m in models]}")
+
+
+def resolve_layers(cfg, inp, velmodel=None):
+    """`inp` with its 1-D layers filled from the P rows of `velmodel` when it has none of its own,
+    so the relocation uses the same model as the location. Explicit nlay/top/vel are kept."""
+    if inp.top and inp.vel:
+        return inp if inp.nlay else dataclasses.replace(inp, nlay=len(inp.top))
+    p_rows = _velmodel(cfg, velmodel).p_rows
+    return dataclasses.replace(inp, nlay=len(p_rows), top=tuple(r[1] for r in p_rows),
+                               vel=tuple(r[0] for r in p_rows))
+
+
+def _layers_from_inp_file(inp, path):
+    """`inp` with the 1-D layers read from an existing hypoDD.inp (the main run's), if it has none."""
+    if inp.top and inp.vel:
+        return inp
+    lines = [l.strip() for l in open(path)]
+    i = next(k for k, l in enumerate(lines) if l.startswith("*--- 1D model"))
+    nlay, ratio = lines[i + 1].split()[:2]
+    top = tuple(float(x) for x in lines[i + 3].split())
+    vel = tuple(float(x) for x in lines[i + 5].split())
+    return dataclasses.replace(inp, nlay=int(nlay), ratio=float(ratio), top=top, vel=vel)
+
+
 def _inp_force_lsqr(inp_path):
     """Flip the solution-control line of an existing hypoDD.inp to ISOLV=2 (LSQR) in place. Used by the
     bootstrap when the resampled dt set would overflow the binary's compiled SVD MAXDATA0 limit, so the
@@ -139,6 +181,8 @@ def build_hypodd_inp(inp, iter_sets=None) -> str:
     src = ""
     rows = inp.iter_sets if iter_sets is None else iter_sets
     iters = "\n".join("    " + "  ".join(str(x) for x in row) for row in rows)
+    if not (inp.nlay and inp.top and inp.vel):
+        raise ValueError("hypoDD.inp has no 1-D layers: pass the HypoDDInp through resolve_layers()")
     top = "  ".join(str(x) for x in inp.top)
     vel = "  ".join(str(x) for x in inp.vel)
     return f"""* RELOC.INP
@@ -449,7 +493,7 @@ def run_dtct(cfg, velmodel="kim1983"):
         if os.path.exists(s):
             shutil.copyfile(s, os.path.join(d, fn))
     # dt.ct is a hard regression baseline — keep its damping fixed (no adaptive tuning).
-    return _exec_hypodd(d, cfg.hypodd_dtct, adapt_damping=False)
+    return _exec_hypodd(d, resolve_layers(cfg, cfg.hypodd_dtct, velmodel), adapt_damping=False)
 
 
 def _event_cuspid(cfg, event_id, velmodel="kim1983"):
@@ -460,8 +504,9 @@ def _event_cuspid(cfg, event_id, velmodel="kim1983"):
     return cusp if cusp is not None and cusp in set(sumdf.id.astype(int)) else None
 
 
-def run_dtcc(cfg, variant="default"):
+def run_dtcc(cfg, variant="default", velmodel=None):
     """Cross-correlation (dt.cc) HypoDD relocation for one variant; returns hypoDD.reloc.
+    `velmodel` (the --arc-velmodel) supplies the 1-D layers when the variant has none of its own.
 
     Dispatches on cfg.reloc_backend: "hypodd" (legacy Fortran) or "relocdd_py".
     Requires `core.xcorr.run_xcorr` to have written the cc file (e.g. dt.cc_0.7_combined)
@@ -486,9 +531,9 @@ def run_dtcc(cfg, variant="default"):
             raise FileNotFoundError(
                 f"cross-correlation file {cc_path} not found — run the xcorr stage first.")
         return relocdd_py_backend.run_relocdd_py_full(
-            cfg, velmodel=cfg.fm_velmodel, cc_file=cc_path,
+            cfg, velmodel=velmodel or cfg.fm_velmodel, cc_file=cc_path,
             out_dir_override=out_dir, dtcc_variant=variant)
-    inp = cfg.hypodd_dtcc_variants[variant]
+    inp = resolve_layers(cfg, cfg.hypodd_dtcc_variants[variant], velmodel)
     base = config.dtcc_dir(cfg)
     d = config.assert_writable(base if variant == "default" else os.path.join(base, variant))
     os.makedirs(d, exist_ok=True)
@@ -731,6 +776,7 @@ def bootstrap_relocation(cfg, branch="dtcc", n=1000, seed=0, cores=None, min_nbo
         if use_lsqr:
             try:
                 base_inp = (cfg.hypodd_dtcc_variants["default"] if branch == "dtcc" else cfg.hypodd_dtct)
+                base_inp = _layers_from_inp_file(base_inp, os.path.join(bdir, "hypoDD.inp"))  # main run's model
                 # isolv=2 + adaptive DAMP ONLY. Deliberately do NOT apply run_dtcc's _scale_distance_cutoffs:
                 # that lever exists to drop spatially-peripheral events for a stable *point* solution, but the
                 # bootstrap must estimate errors for EXACTLY the events the main (SVD) reloc kept — tightening

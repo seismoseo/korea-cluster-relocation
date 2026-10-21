@@ -93,6 +93,7 @@ CONFIG = ClusterConfig(
                  source_dir=os.path.join(_HYP, "kim2011")),
         *[VelModel(m, source_dir=os.path.join(_HYP, "Seo2022", m)) for m in _SEO2022],
     ),
+    default_velmodels=("kim1983", "kim2011"),     # the Seo2022 models run only when named
 
     # HypoDD
     ph2dt=Ph2dtParams(MINWGHT=0, MAXDIST=200, MAXSEP=10, MAXNGH=200,

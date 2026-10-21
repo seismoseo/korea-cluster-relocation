@@ -218,46 +218,64 @@ def _stations_df(cfg):
 
     Built from the same SAC headers write_sta() reads, so the roster matches the
     Fortran path exactly."""
-    coords = {}
+    coords = {}   # (sta, file network) -> ...; a code in two networks = two stations
     for f in glob(os.path.join(config.waveforms_dir(cfg), "20*", "*.sac")):
-        sta = os.path.basename(f).split(".")[2]
-        if sta in coords:
+        p = os.path.basename(f).split(".")
+        k = (p[2], p[1])
+        if k in coords:
             continue
         tr = read(f)[0]
         s = tr.stats.sac
         elev = float(getattr(s, "stel", 0.0) or 0.0)
-        coords[sta] = (tr.stats.network or "KS", float(s.stla), float(s.stlo), elev)
-    rows = [(net, sta, lo, la, -elev / 1000.0)        # Z is depth (km), down-positive
-            for sta, (net, la, lo, elev) in sorted(coords.items())]
+        coords[k] = (tr.stats.network or "KS", float(s.stla), float(s.stlo), elev)
+    lab = _station_labels(coords)
+    rows = [(net, lab[k], lo, la, -elev / 1000.0)        # Z is depth (km), down-positive
+            for k, (net, la, lo, elev) in sorted(coords.items())]
     return pd.DataFrame(rows, columns=["Network", "Station", "X", "Y", "Z"])
+
+
+def _station_labels(keys):
+    """{(sta, net): label}: the code, or NET+code for a code that two networks share."""
+    nets = {}
+    for sta, net in keys:
+        nets.setdefault(sta, set()).add(net)
+    return {(sta, net): (sta if len(nets[sta]) == 1 else f"{net}{sta}") for sta, net in keys}
 
 
 def _events_dict(cfg):
     """Build HypoSVI EVTS = {cuspid: {'Picks': DataFrame}} from SAC a/t0 headers.
 
-    cuspid = 200000+idx over sorted event dirs — identical to write_phs()'s id
-    scheme, so .sum ID-NUM lines up with the Fortran path and with ph2dt later.
+    cuspid from the canonical evmap (the --augment manifest when it exists, else cuspid_offset+idx
+    over sorted event dirs) — the same ids write_phs() uses, so .sum ID-NUM lines up with the
+    Fortran path and with ph2dt later. A dir with no cuspid (not in the manifest) is skipped.
     Picks columns: Network, Station, PhasePick('P'|'S'), DT(UTCDateTime), PickError(s)."""
+    from pipeline.core import evmap
+    cusp_of = evmap.cuspid_of_dir(cfg)
     evts, meta = {}, {}
     event_dirs = sorted(glob(os.path.join(config.waveforms_dir(cfg), "20*")))
-    for idx, ed in enumerate(event_dirs):
-        cuspid = 200000 + idx
+    lab = _station_labels({(p[2], p[1]) for p in (os.path.basename(f).split(".") for f in
+                           glob(os.path.join(config.waveforms_dir(cfg), "20*", "*.sac")))})
+    for ed in event_dirs:
+        cuspid = cusp_of.get(os.path.basename(ed))
+        if cuspid is None:
+            continue
         rows = []
         seen_p, seen_s = set(), set()
         for sac in sorted(glob(ed + "/*.sac"))[::-1]:
             tr = read(sac)[0]
             s = tr.stats.sac
-            sta = os.path.basename(sac).split(".")[2]
+            fnet, code = os.path.basename(sac).split(".")[1:3]
+            sid, sta = (fnet, code), lab[(code, fnet)]      # sta: the label _stations_df uses
             net = tr.stats.network or "KS"
             comp = tr.stats.channel[-1]
-            if comp == "Z" and sta not in seen_p and s.get("a", -12345.0) != -12345.0:
+            if comp == "Z" and sid not in seen_p and s.get("a", -12345.0) != -12345.0:
                 t = tr.stats.starttime - s.b + s.a
                 rows.append((net, sta, "P", pd.Timestamp(t.datetime), 0.1))
-                seen_p.add(sta)
-            if comp in ("N", "E") and sta not in seen_s and s.get("t0", -12345.0) != -12345.0:
+                seen_p.add(sid)
+            if comp in ("N", "E") and sid not in seen_s and s.get("t0", -12345.0) != -12345.0:
                 t = tr.stats.starttime - s.b + s.t0
                 rows.append((net, sta, "S", pd.Timestamp(t.datetime), 0.2))
-                seen_s.add(sta)
+                seen_s.add(sid)
         if len(rows) < 2:
             # HypoSVI's log-likelihood forms differential times between observation
             # PAIRS (location.py: T_obs[:,pairs]), so it needs >=2 observations; a

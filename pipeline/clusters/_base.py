@@ -61,14 +61,15 @@ def _kim_models(hyp_dir):
 def _dtct_inp(isolv=1):
     # isolv: 1 = SVD (small clusters, full error estimates; limited array size),
     #        2 = LSQR (scales to large datasets; use when SVD overflows MAXDATA0).
+    # layers (nlay/top/vel) left unset: HypoDD uses the P layers of the --arc-velmodel model
+    # (core/hypodd.resolve_layers); RATIO stays the configured 1.73
     return HypoDDInp(idat=2, ipha=3, dist=500, istart=1, isolv=isolv, iter_sets=DTCT_ITERS,
-                     nlay=3, ratio=1.73, top=(0.0, 15.0, 32.0), vel=(5.98, 6.38, 7.95),
-                     cc_file=None, event_file="event.dat")
+                     ratio=1.73, cc_file=None, event_file="event.dat")
 
 
 def _dtcc_variants(isolv=1):
     base = dict(idat=3, ipha=3, dist=500, obscc=4, istart=1, isolv=isolv, iter_sets=DTCC_ITERS,
-                nlay=3, ratio=1.73, top=(0.0, 15.0, 32.0), vel=(5.98, 6.38, 7.95))
+                ratio=1.73)
     return {
         "default": HypoDDInp(cc_file="dt.cc_0.7_combined", event_file="event.dat", **base),
         "no_main": HypoDDInp(cc_file="dt.cc_0.7_combined_no_main", event_file="event.sel", **base),
@@ -166,5 +167,53 @@ def mixed_cluster(name, region, src_root, epicenter, region_bounds,
         velocity_models=(*_kim_models(hyp), *extra_velmodels),
         ph2dt=STD_PH2DT, hypodd_dtct=_dtct_inp(dtct_isolv),
         hypodd_dtcc_variants=_dtcc_variants(dtct_isolv),
+        mainshock_event_id=mainshock_event_id, cuspid_offset=200000, num_cores=10,
+    )
+
+
+# ------------------------------------------------------------- clusters anywhere (FDSN)
+def layered_velmodel(name, tops_km, vp_km_s, vpvs):
+    """VelModel from layer tops (km, starting at 0, increasing; the last layer is the half-space),
+    their P velocities (km/s) and one Vp/Vs ratio for the S model."""
+    tops = tuple(float(t) for t in tops_km)
+    vp = tuple(float(v) for v in vp_km_s)
+    if len(tops) != len(vp) or tops[0] != 0.0 or list(tops) != sorted(set(tops)):
+        raise ValueError(f"{name}: need equal-length tops/vp with tops starting at 0 and increasing")
+    return VelModel(name, p_rows=tuple(zip(vp, tops)),
+                    s_rows=tuple((round(v / vpvs, 4), t) for v, t in zip(vp, tops)))
+
+
+def global_cluster(name, region, src_root, epicenter, region_bounds, velocity_models,
+                   sensors=("HH", "EH", "HN"), station_masters=("FDSN_station.csv",),
+                   radius_km=100.0, hypodd_vpvs=1.73, mainshock_event_id=None, dtct_isolv=1,
+                   magnitude_label="catalog magnitude"):
+    """Cluster built from FDSN data anywhere (PocketQuake-global).
+
+    Same processing as kma_cluster except: the catalog is UTC (ISO `time` column, no KST offset);
+    per-event SAC sit in the same `<src_root>/kma_waveforms/<event_id>/<dir>.{v,a}/SAC/<band>/`
+    layout for any sensor bands, `.a` for accelerometers (instrument code N or G); one sensor per
+    station in the order of `sensors`; the given velocity models (the first locates, relocates and
+    feeds the focal mechanisms; HypoDD Vp/Vs = `hypodd_vpvs`); a station code used by two networks
+    stops the run instead of warning."""
+    import dataclasses
+    glob = {s: f"*.{'a' if s[1:2] in ('N', 'G') else 'v'}/SAC/{s}/*{s}{{comp}}*SAC" for s in sensors}
+    models = tuple(velocity_models)
+    return ClusterConfig(
+        name=name, region=region, src_root=src_root,
+        event_catalog_csv=os.path.join(src_root, "event_catalog", "event_catalog.csv"),
+        station_master_csvs=tuple(os.path.join(src_root, "station_table", m)
+                                  for m in station_masters),
+        epicenter=epicenter, radius_km=radius_km, region_bounds=region_bounds, kst_offset_hours=0,
+        wf_source="kma_archive", kma_archive_glob=glob,
+        sensor_priority=tuple(sensors), sensor_precedence=tuple(sensors), target_sampling_hz=100.0,
+        picker_weights="stead", p_threshold=0.2, s_threshold=0.2, sp_max_gap_s=15.0,
+        pick_window=dict(evdp=15.0, vp=5.9, vs=3.0),
+        hyp_control=STD_HYP,
+        velocity_models=models, default_velmodels=(models[0].name,), fm_velmodel=models[0].name,
+        ph2dt=STD_PH2DT,
+        hypodd_dtct=dataclasses.replace(_dtct_inp(dtct_isolv), ratio=hypodd_vpvs),
+        hypodd_dtcc_variants={k: dataclasses.replace(v, ratio=hypodd_vpvs)
+                              for k, v in _dtcc_variants(dtct_isolv).items()},
+        station_code_collisions="error", magnitude_label=magnitude_label,
         mainshock_event_id=mainshock_event_id, cuspid_offset=200000, num_cores=10,
     )

@@ -689,33 +689,39 @@ def _packed_sec(sec: float) -> str:
 
 def _station_coords(cfg):
     """{(net, sta): (lat, lon)} from the SAC headers (same source as write_sta)."""
-    coords = {}
+    coords, seen = {}, set()
     for f in glob(os.path.join(config.waveforms_dir(cfg), "20*", "*.sac")):
-        sta = os.path.basename(f).split(".")[2]
-        if sta in coords:
+        p = os.path.basename(f).split(".")
+        if (p[1], p[2]) in seen:                     # one read per (network, station)
             continue
+        seen.add((p[1], p[2]))
         tr = read(f)[0]
-        coords[(tr.stats.network or "KS", sta)] = (float(tr.stats.sac.stla), float(tr.stats.sac.stlo))
+        coords[(tr.stats.network or "KS", p[2])] = (float(tr.stats.sac.stla), float(tr.stats.sac.stlo))
     return coords
 
 
 def _event_picks(cfg):
     """{cuspid: [(net, sta, phase, UTCDateTime)]} from SAC a (P) / t0 (S) headers.
-    cuspid = 200000+idx over sorted event dirs — matches write_phs / the .sum ID-NUM."""
+    cuspid from the canonical evmap (manifest-aware) — matches write_phs / the .sum ID-NUM."""
+    from pipeline.core import evmap
+    cusp_of = evmap.cuspid_of_dir(cfg)
     out = {}
-    for idx, ed in enumerate(sorted(glob(os.path.join(config.waveforms_dir(cfg), "20*")))):
-        cuspid = 200000 + idx
+    for ed in sorted(glob(os.path.join(config.waveforms_dir(cfg), "20*"))):
+        cuspid = cusp_of.get(os.path.basename(ed))
+        if cuspid is None:
+            continue
         rows, seen_p, seen_s = [], set(), set()
         for sac in sorted(glob(ed + "/*.sac"))[::-1]:
             tr = read(sac)[0]
             s = tr.stats.sac
-            sta = os.path.basename(sac).split(".")[2]
+            fnet, sta = os.path.basename(sac).split(".")[1:3]
+            sid = (fnet, sta)                            # a code in two networks = two stations
             net = tr.stats.network or "KS"
             comp = tr.stats.channel[-1]
-            if comp == "Z" and sta not in seen_p and s.get("a", -12345.0) != -12345.0:
-                rows.append((net, sta, "P", tr.stats.starttime - s.b + s.a)); seen_p.add(sta)
-            if comp in ("N", "E") and sta not in seen_s and s.get("t0", -12345.0) != -12345.0:
-                rows.append((net, sta, "S", tr.stats.starttime - s.b + s.t0)); seen_s.add(sta)
+            if comp == "Z" and sid not in seen_p and s.get("a", -12345.0) != -12345.0:
+                rows.append((net, sta, "P", tr.stats.starttime - s.b + s.a)); seen_p.add(sid)
+            if comp in ("N", "E") and sid not in seen_s and s.get("t0", -12345.0) != -12345.0:
+                rows.append((net, sta, "S", tr.stats.starttime - s.b + s.t0)); seen_s.add(sid)
         if rows:
             out[cuspid] = rows
     return out

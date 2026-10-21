@@ -41,10 +41,19 @@ def _count_located_events(cfg, velmodel: str) -> int:
         return sum(1 for ln in f if ln.strip() and not ln.lstrip().startswith("DATE"))
 
 
+def resolve_velmodels(cfg, velmodels=None, arc_velmodel=None):
+    """(models to locate with, location model): the cluster's defaults when not given."""
+    names = [m.name for m in cfg.velocity_models]
+    velmodels = tuple(velmodels) if velmodels else tuple(cfg.default_velmodels or names)
+    arc_velmodel = arc_velmodel or names[0]
+    return velmodels, arc_velmodel
+
+
 def run_cluster(cfg, stage_from="stations", through="dtct",
-                velmodels=("kim1983", "kim2011"), arc_velmodel="kim1983",
+                velmodels=None, arc_velmodel=None,
                 device="cpu", events=None, dtcc_variant="default", cores=None,
                 fm_velmodel=None, xcorr_resume=False, verbose=True) -> dict:
+    velmodels, arc_velmodel = resolve_velmodels(cfg, velmodels, arc_velmodel)
     i0, i1 = STAGES.index(stage_from), STAGES.index(through)
     todo = set(STAGES[i0:i1 + 1])
     res = {}
@@ -156,7 +165,7 @@ def run_cluster(cfg, stage_from="stations", through="dtct",
             f"({timings['xcorr']:.1f}s)")
     if "dtcc" in todo:
         with _time("dtcc"):
-            res["dtcc"] = hypodd.run_dtcc(cfg, variant=dtcc_variant)
+            res["dtcc"] = hypodd.run_dtcc(cfg, variant=dtcc_variant, velmodel=arc_velmodel)
         log(f"dtcc[{dtcc_variant}]: {res['dtcc'].split('/pipeline/')[-1]}  ({timings['dtcc']:.1f}s)")
     if "focal_mechanism" in todo:
         with _time("focal_mechanism"):

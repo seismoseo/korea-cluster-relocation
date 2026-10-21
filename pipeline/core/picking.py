@@ -180,12 +180,12 @@ def pick_event_pnplus(cfg, model, used_table, ev) -> list[dict]:
 # ------------------------------------------------- write picks into SAC headers
 def write_sac_picks(cfg, used_table, picks_df):
     """Set sac.a (P) / sac.t0 (S) on all 3 components for each pick."""
-    sensor_of = dict(zip(used_table["Code"], used_table["Sensor"]))
+    sensor_of = dict(zip(zip(used_table["Network"], used_table["Code"]), used_table["Sensor"]))
     for eid, grp in picks_df.groupby("Event_ID"):
         wf = config.event_wf_dir(cfg, eid)
         for _, row in grp.iterrows():
             net, sta = row["Network"], row["Station"]
-            chan = sensor_of.get(sta)
+            chan = sensor_of.get((net, sta))
             pick_time = UTCDateTime(row["Time"])
             for c in ("Z", "N", "E"):
                 f = f"{wf}/{eid}.{net}.{sta}.{chan}{c}.sac"
