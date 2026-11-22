@@ -564,6 +564,12 @@ class ClusterConfig:
         )
     )
     xcorr_pair_overrides: dict = field(default_factory=dict)
+    # Opt-in S-on-T rotation, prepared from common-waveform N/E before correlation.
+    # With no table, T uses nominal axes. A configured table is strict by default.
+    orientation_csv: Optional[str] = None
+    orientation_missing: str = "error"       # "error" | "zero" | "skip"
+    rotation_reference: Optional[tuple] = None  # fixed source (latitude, longitude), else per event
+    rotate_for_xcorr: bool = False          # derive R/T; False preserves legacy precomputed T
     mainshock_event_id: Optional[str] = None
 
     cuspid_offset: int = 200000             # HypoDD cuspid = offset + catalog index

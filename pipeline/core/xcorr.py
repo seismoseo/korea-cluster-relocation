@@ -6,7 +6,7 @@ Stage — cross-correlation differential times `dt.cc` for HypoDD (ports
 For every event pair and shared station it measures a sub-sample differential time by
 cross-correlating the re-referenced waveforms (run `core.rereference` first):
 
-  * P on the Z component, S as the higher-CC of N / E;
+  * P on Z, S as the higher-CC of N / E, or opt-in orientation-corrected T;
   * each trace is interpolated to `interp_hz` (lanczos a=20), demeaned/tapered, bandpass
     filtered, demeaned/tapered again, then sliced `±(pre, post)` s around the SAC pick
     (`a` for P, `t0` for S) and normalised;
@@ -95,7 +95,8 @@ def _interp_cache_path(src, fmin, fmax):
         return None
     import hashlib
     try:
-        sig = f"{src}|{os.path.getmtime(src):.0f}|{os.path.getsize(src)}|{_XC['interp_hz']}|{fmin}|{fmax}"
+        st = os.stat(src)
+        sig = f"{src}|{st.st_mtime_ns}|{st.st_size}|{_XC['interp_hz']}|{fmin}|{fmax}"
     except OSError:
         return None
     return os.path.join(_INTERP_CACHE_DIR, hashlib.md5(sig.encode()).hexdigest() + ".pkl")
@@ -1291,6 +1292,25 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy",
         if e is not None:
             events.append(e)
             eid[e] = int(r.id)
+    xc = dict(interp_hz=1000, bandpass=(5, 20), pre=0.5, post=0.5, margin=0.5,
+              cc_threshold=0.7, p_comp="Z", s_comps=("N", "E"), shift_samp=500,
+              slide_step=0.001)
+    xc.update(cfg.xcorr)                       # cluster overrides (keeps defaults above)
+    xc["bandpass"] = tuple(xc["bandpass"])
+    xc["s_comps"] = tuple(xc["s_comps"])
+
+    # Build transverse inputs before checkpoint selection. The source N/E and Z
+    # remain untouched; P continues to use Z in every correlation backend.
+    from pipeline.core import orientation
+    rotation = None
+    if "T" in xc["s_comps"]:
+        derive = (getattr(cfg, "rotate_for_xcorr", False) or
+                  getattr(cfg, "orientation_csv", None) is not None or
+                  getattr(cfg, "rotation_reference", None) is not None)
+        rotation = (orientation.prepare_rotation(cfg, common, events, out) if derive else
+                    orientation.precomputed_signature(common, events, xc["s_comps"]))
+    orientation.sync_pair_signature(out, xc, dict(cfg.xcorr_pair_overrides), rotation)
+
     # station ids NET.CODE, ordered by (code, net): the same order as the former code-only list
     # wherever codes are unique, so dt.cc lines keep their order
     stations = [f"{n}.{c}" for c, n in sorted(
@@ -1312,13 +1332,6 @@ def run_xcorr(cfg, velmodel="kim1983", cores=None, xcorr_backend="obspy",
                          and os.path.exists(os.path.join(out_s, f"dt.cc_S_{p[0]}_{p[1]}")))]
         print(f"[xcorr] resume: {before - len(pairs):,} pairs already done, {len(pairs):,} remain "
               f"of {before:,}", flush=True)
-
-    xc = dict(interp_hz=1000, bandpass=(5, 20), pre=0.5, post=0.5, margin=0.5,
-              cc_threshold=0.7, p_comp="Z", s_comps=("N", "E"), shift_samp=500,
-              slide_step=0.001)
-    xc.update(cfg.xcorr)                       # cluster overrides (keeps defaults above)
-    xc["bandpass"] = tuple(xc["bandpass"])
-    xc["s_comps"] = tuple(xc["s_comps"])
 
     ncores = max(1, min(cores or cfg.num_cores, len(os.sched_getaffinity(0))))
     # For GPU mode, multiple workers contend for the single GPU — auto-cap at 1
