@@ -66,6 +66,45 @@ origins to the kim1983 `.sum`) -> `xcorr` (build `dt.cc`) -> `dtcc` are appended
 requested. From JupyterLab, open `notebooks/00_run_and_inspect.ipynb` (or `01_qc.ipynb`
 for misorientation/ZRT/similarity), set `CLUSTER`, Run-All.
 
+## Time-dependent orientation and S on T
+
+The default correlation uses P on Z and the better S correlation of N/E. To use
+the transverse component, add this to the cluster module:
+
+```python
+CONFIG = config.tune(CONFIG, xcorr={"s_comps": ("T",)}, rotate_for_xcorr=True,
+                     orientation_csv="/absolute/path/to/orientation.csv",
+                     orientation_missing="error",
+                     rotation_reference=(34.6611, 126.4049))
+```
+
+Omit `rotation_reference` to use each event's source coordinates; the example
+point is Haenam's shared reference. Omit `orientation_csv` for nominal zero
+misorientation with `rotate_for_xcorr=True`. Existing callers that select T
+without that flag, a table, or a rotation reference continue to consume their
+precomputed R/T unchanged. CSV columns are `network,station,sensor,start,end,theta_deg`;
+`net`, `sta`, and `theta_M_apply` are accepted aliases. Epochs use UTC event
+origins from SAC: date-only ends include the whole day, timestamp ends are
+exclusive. Angles and coverage are validated; no measured epoch is extrapolated.
+Optional `location` distinguishes instruments (blank or `*` matches any), and
+optional boolean `swap_ne`, `flip_n`, `flip_e` repair wiring in that order before
+`rotate_ne_rt(N, E, (station_to_source_baz - theta_deg) % 360)`.
+
+With a configured table, missing epochs raise by default. `orientation_missing`
+may instead be `"zero"` (warn and assume nominal) or `"skip"` (omit that T).
+FDSN inputs already rotated into geographic N/E require **residual** corrections.
+The older `core.misorientation`/`core.rotation` helpers remain auxiliary QC tools;
+the correlation path uses `core.orientation`.
+
+Run `xcorr` through `dtcc` again with the original velocity model. R/T are derived
+beside the run's N/E without replacing them. The dt.cc directory contains
+`orientation/rotation.csv`, `orientation/rotation.json`, and `xcorr_inputs.json`
+for provenance and checkpoint validation. Changing the table, components,
+reference, or relevant source records invalidates incompatible pair checkpoints
+before `--xcorr-resume`. Recompute downstream uncertainties/reports for the new
+relocation. Offline regressions: `python -m pytest -q tests/test_orientation.py`
+from the repository root.
+
 ## Controlled, stage-by-stage workflow + `config.tune()`
 
 `notebooks/02_controlled_run.ipynb` runs each stage individually so you can inspect the intermediate
