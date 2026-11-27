@@ -172,15 +172,19 @@ def mixed_cluster(name, region, src_root, epicenter, region_bounds,
 
 
 # ------------------------------------------------------------- clusters anywhere (FDSN)
-def layered_velmodel(name, tops_km, vp_km_s, vpvs):
+def layered_velmodel(name, tops_km, vp_km_s, vpvs, hyp_lines=(), hyp_files=(), takeoff_models=()):
     """VelModel from layer tops (km, starting at 0, increasing; the last layer is the half-space),
-    their P velocities (km/s) and one Vp/Vs ratio for the S model."""
+    their P velocities (km/s) and one Vp/Vs ratio for the S model. Optional: HYPOINVERSE model
+    commands + their files (VelModel.hyp_lines/hyp_files) and further takeoff models for SKHASH,
+    each ((tops_km), (vp_km_s))."""
     tops = tuple(float(t) for t in tops_km)
     vp = tuple(float(v) for v in vp_km_s)
     if len(tops) != len(vp) or tops[0] != 0.0 or list(tops) != sorted(set(tops)):
         raise ValueError(f"{name}: need equal-length tops/vp with tops starting at 0 and increasing")
     return VelModel(name, p_rows=tuple(zip(vp, tops)),
-                    s_rows=tuple((round(v / vpvs, 4), t) for v, t in zip(vp, tops)))
+                    s_rows=tuple((round(v / vpvs, 4), t) for v, t in zip(vp, tops)),
+                    hyp_lines=tuple(hyp_lines), hyp_files=tuple(hyp_files),
+                    takeoff_rows=tuple(tuple(zip(map(float, v), map(float, t))) for t, v in takeoff_models))
 
 
 def global_cluster(name, region, src_root, epicenter, region_bounds, velocity_models,
