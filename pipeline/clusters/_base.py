@@ -172,21 +172,25 @@ def mixed_cluster(name, region, src_root, epicenter, region_bounds,
 
 
 # ------------------------------------------------------------- clusters anywhere (FDSN)
-def layered_velmodel(name, tops_km, vp_km_s, vpvs):
+def layered_velmodel(name, tops_km, vp_km_s, vpvs, hyp_lines=(), hyp_files=(), takeoff_models=()):
     """VelModel from layer tops (km, starting at 0, increasing; the last layer is the half-space),
-    their P velocities (km/s) and one Vp/Vs ratio for the S model."""
+    their P velocities (km/s) and one Vp/Vs ratio for the S model. Optional: HYPOINVERSE model
+    commands + their files (VelModel.hyp_lines/hyp_files) and further takeoff models for SKHASH,
+    each ((tops_km), (vp_km_s))."""
     tops = tuple(float(t) for t in tops_km)
     vp = tuple(float(v) for v in vp_km_s)
     if len(tops) != len(vp) or tops[0] != 0.0 or list(tops) != sorted(set(tops)):
         raise ValueError(f"{name}: need equal-length tops/vp with tops starting at 0 and increasing")
     return VelModel(name, p_rows=tuple(zip(vp, tops)),
-                    s_rows=tuple((round(v / vpvs, 4), t) for v, t in zip(vp, tops)))
+                    s_rows=tuple((round(v / vpvs, 4), t) for v, t in zip(vp, tops)),
+                    hyp_lines=tuple(hyp_lines), hyp_files=tuple(hyp_files),
+                    takeoff_rows=tuple(tuple(zip(map(float, v), map(float, t))) for t, v in takeoff_models))
 
 
 def global_cluster(name, region, src_root, epicenter, region_bounds, velocity_models,
                    sensors=("HH", "EH", "HN"), station_masters=("FDSN_station.csv",),
                    radius_km=100.0, hypodd_vpvs=1.73, mainshock_event_id=None, dtct_isolv=1,
-                   magnitude_label="catalog magnitude"):
+                   magnitude_label="catalog magnitude", xcorr_pair_overrides=None):
     """Cluster built from FDSN data anywhere (PocketQuake-global).
 
     Same processing as kma_cluster except: the catalog is UTC (ISO `time` column, no KST offset);
@@ -194,7 +198,9 @@ def global_cluster(name, region, src_root, epicenter, region_bounds, velocity_mo
     layout for any sensor bands, `.a` for accelerometers (instrument code N or G); one sensor per
     station in the order of `sensors`; the given velocity models (the first locates, relocates and
     feeds the focal mechanisms; HypoDD Vp/Vs = `hypodd_vpvs`); a station code used by two networks
-    stops the run instead of warning."""
+    stops the run instead of warning. `xcorr_pair_overrides` ({frozenset(event ids): window}) gives event pairs
+    that include one of the listed events their own cross-correlation window, e.g. the onset window
+    dict(pre=0.05, post=0.05, bandpass=(1, 40)) for the larger events."""
     import dataclasses
     glob = {s: f"*.{'a' if s[1:2] in ('N', 'G') else 'v'}/SAC/{s}/*{s}{{comp}}*SAC" for s in sensors}
     models = tuple(velocity_models)
@@ -216,4 +222,5 @@ def global_cluster(name, region, src_root, epicenter, region_bounds, velocity_mo
                               for k, v in _dtcc_variants(dtct_isolv).items()},
         station_code_collisions="error", magnitude_label=magnitude_label,
         mainshock_event_id=mainshock_event_id, cuspid_offset=200000, num_cores=10,
+        xcorr_pair_overrides=dict(xcorr_pair_overrides or {}),
     )

@@ -435,8 +435,11 @@ def _measure_dispatch(tr1, tr2, hdr, pre, post, shift_samp, margin, step):
 # fallback so a run ALWAYS completes. This replaces the per-pair grouped-conv1d path
 # whose cuDNN workspace was unbounded (the cause of the prior OOMs). The obspy CPU
 # baseline and the existing cctorch_cpu/cctorch_gpu paths are untouched.
-_VRAM_SAFE_FRACTION = 0.4    # size each FFT batch to <= this * FREE vram
-_VRAM_HARD_FRACTION = 0.9    # set_per_process_memory_fraction guard
+# size each FFT batch to <= this * FREE vram, and cap the process at this fraction of the card
+# (set_per_process_memory_fraction guard); on a GPU shared with other jobs lower both, e.g.
+# XCORR_VRAM_FRACTION=0.1 XCORR_VRAM_CAP=0.15 (the dt.cc values do not depend on the batch size)
+_VRAM_SAFE_FRACTION = float(os.environ.get("XCORR_VRAM_FRACTION") or 0.4)
+_VRAM_HARD_FRACTION = float(os.environ.get("XCORR_VRAM_CAP") or 0.9)
 # Measured peak ≈ 1.8× the naive tensor sum (cuFFT workspace + transient intermediates), so the
 # per-task cost model carries a 2× safety factor; the OOM-retry path covers any residual misfit.
 _VRAM_TASK_OVERHEAD = 2.0

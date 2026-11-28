@@ -245,6 +245,11 @@ def _provision_crh(cfg, vmodel):
             os.symlink(src, dst)
         else:
             _write_crh(dst, f"{vmodel.name} {lbl} wave velocity", rows)
+    for src in vmodel.hyp_files:                      # files read by the model's own hyp_lines
+        dst = os.path.join(d, os.path.basename(src))
+        if os.path.lexists(dst):
+            os.remove(dst)
+        os.symlink(os.path.abspath(src), dst)
 
 
 # --------------------------------------------------------- hyp1.40 control
@@ -262,9 +267,7 @@ KPR {KPR}
 H71 {H71}
 LET {LET}
 STA 'STA/{region}_hyp.sta'
-CRH 1 '{model}/{model}_p.crh'
-CRH 2 '{model}/{model}_s.crh'
-SAL 1 2
+{MODEL_LINES}
 PHS 'PHS/{region}.phs'
 FIL
 PRT '{model}/{region}.prt'
@@ -273,6 +276,14 @@ ARC '{model}/{region}.arc'
 LOC
 STO
 """
+
+
+def _model_lines(vmodel):
+    """The HYPOINVERSE model commands: the default CRH P/S pair, or the model's own `hyp_lines`."""
+    if vmodel.hyp_lines:
+        return "\n".join(line.replace("{dir}", vmodel.name) for line in vmodel.hyp_lines)
+    m = vmodel.name
+    return f"CRH 1 '{m}/{m}_p.crh'\nCRH 2 '{m}/{m}_s.crh'\nSAL 1 2"
 
 
 def run_hypoinverse_model(cfg, vmodel):
@@ -284,7 +295,7 @@ def run_hypoinverse_model(cfg, vmodel):
         DIS=" ".join(map(str, hc.DIS)), RMS=" ".join(map(str, hc.RMS)),
         LST=" ".join(map(str, hc.LST)), KPR=hc.KPR, H71=" ".join(map(str, hc.H71)),
         LET=" ".join(map(str, getattr(hc, "LET", (5, 2, 0, 0, 0)))),
-        region=cfg.region, model=vmodel.name,
+        region=cfg.region, model=vmodel.name, MODEL_LINES=_model_lines(vmodel),
     )
     hyp = config.hyp_dir(cfg)
     subprocess.run(["hyp1.40"], input=cmds.encode(), cwd=hyp, check=True,

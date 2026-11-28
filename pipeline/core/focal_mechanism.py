@@ -161,13 +161,22 @@ def run_focal_mechanism(cfg, velmodel=None, num_cpus=1) -> dict:
         f.write("# Depth (km), Vp (km/s)\n")
         for d, v in _vmodel_depth_vp(cfg, velmodel):
             f.write(f"{d}, {v}\n")
+    vm = next(v for v in cfg.velocity_models if v.name == velmodel)
+    vmfiles = [vmfile]
+    for k, rows in enumerate(vm.takeoff_rows, start=1):     # further takeoff models, if any
+        fk = os.path.join(in_dir, f"{velmodel}_takeoff{k}.txt")
+        with open(fk, "w") as f:
+            f.write("# Depth (km), Vp (km/s)\n")
+            for d, v in sorted((float(d), float(v)) for v, d in rows):
+                f.write(f"{d}, {v}\n")
+        vmfiles.append(fk)
 
     # ---- control file (absolute paths so cwd=SKHASH_DIR is irrelevant for I/O) ----
     outfile1 = os.path.join(out_dir, "out.csv")
     ctl = os.path.join(config.fm_dir(cfg, velmodel), "control_file.txt")
     params = {
         "input_format": "skhash", "catfile": catfile, "fpfile": polfile,
-        "stfile": stfile, "vmodel_paths": vmfile,
+        "stfile": stfile, "vmodel_paths": "\n".join(vmfiles),
         "outfile1": outfile1, "outfile_pol_info": os.path.join(out_dir, "out_polinfo.csv"),
         "outfolder_plots": out_dir,
         "npolmin": cfg.fm_npolmin, "min_polarity_weight": cfg.fm_min_polarity_weight,
